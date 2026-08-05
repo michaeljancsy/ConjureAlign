@@ -33,6 +33,12 @@ Sub-sample precision, automatic polarity detection, and support for *negative* s
 Captures made during silence, or where the two signals don't actually correlate, are rejected
 and the previous alignment is kept.
 
+**A note on null tests**: if you verify alignment by inverting and summing, whole-sample
+offsets null below −80 dB, but *fractional* offsets only null to around −20…−30 dB broadband —
+the residual is entirely above ~19 kHz, where fractional delay is mathematically impossible for
+any plugin. In the audible band the null is −70 dB or deeper (measured in
+`tests/null_depth.rs`). A lowpass at ~19 kHz on the null bus shows the true audible-band depth.
+
 **Logic Pro is not supported yet** — Logic only loads Audio Units. An AU build via
 [clap-wrapper](https://github.com/free-audio/clap-wrapper) is planned.
 

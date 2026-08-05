@@ -105,8 +105,15 @@ All other validator tests pass; re-run after bumping the nih_plug rev to see if 
 - Logic Pro: NOT SUPPORTED yet (Logic only loads AU; planned via clap-wrapper's AUv2 target).
 - Null test recipe: duplicate a track, nudge the copy by a known amount (track delay or clip
   nudge), sidechain the original into AudioAlign on the copy, play a few seconds, toggle
-  Capture; after the crossfade the two tracks should null (invert one and sum) well below
-  −60 dB. Session save/reload must preserve the correction.
+  Capture; after the crossfade, invert one track and sum. Expected depths (measured in
+  `tests/null_depth.rs`): integer-sample offsets null below −80 dB broadband; FRACTIONAL
+  offsets are floored at only −20…−30 dB broadband because no real filter can fractionally
+  delay content near Nyquist — but the audible band (<0.44·fs, ≈19 kHz) nulls at −69 dB
+  (white noise) to −86 dB (dark material). A shallow broadband null with a fractional nudge
+  is EXPECTED and inaudible; put a ~19 kHz lowpass on the null bus to see the audible-band
+  depth, or nudge by whole samples to see the deep null. Gain/pan mismatches (e.g., a
+  post-fader sidechain tap) also cap the null. Session save/reload must preserve the
+  correction.
 - macOS Gatekeeper only affects downloaded bundles; locally built ones load fine.
 
 ## Licensing
