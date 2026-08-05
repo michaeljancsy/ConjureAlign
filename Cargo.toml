@@ -1,0 +1,31 @@
+[package]
+name = "audio_align"
+version = "0.1.0"
+edition = "2021"
+authors = ["Michael Jancsy <michaeljancsy@gmail.com>"]
+license = "GPL-3.0-or-later"
+homepage = "https://github.com/michaeljancsy/AudioAlign"
+description = "Time-aligns a mic signal to a sidechain reference with sub-sample precision"
+
+[workspace]
+members = ["xtask"]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
+realfft = "3.5"
+atomic_refcell = "0.1"
+# Must track the version nih_plug uses: its AtomicF32 implements nih_plug's
+# PersistentField, which our #[persist] fields rely on.
+atomic_float = "0.1"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
