@@ -1472,6 +1472,22 @@ bool WrapAsAUV2::ValidFormat(AudioUnitScope inScope, AudioUnitElement inElement,
     return true;
   }
 
+  // AudioAlign patch: sidechain busses may be WIDER than the selected config's port — a
+  // mono instance fed from a stereo reference bus is an ordinary host setup, and the strict
+  // equality above would refuse it. Wider is safe: the process loop sizes its buffer list
+  // from the AU element, and the plugin only ever reads as many channels as its own layout
+  // declares. Narrower is not safe and stays rejected.
+  if (inScope == kAudioUnitScope_Input && inElement > 0)
+  {
+    auto ap = _plugin->_ext._audioports;
+    clap_audio_port_info inf;
+    if (ap && inElement < ap->count(pl, true) && ap->get(pl, inElement, true, &inf) &&
+        inNewFormat.mChannelsPerFrame > inf.channel_count)
+    {
+      return true;
+    }
+  }
+
   //LOGINFO("False");
   return false;
 }

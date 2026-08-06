@@ -5,6 +5,12 @@ use std::{
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // AudioAlign patch: upstream only watches build.rs, so edits to the vendored C++
+    // silently do not rebuild — you keep testing the previous binary. We patch these
+    // sources (see deps/PATCHES.md), so watch them too.
+    println!("cargo:rerun-if-changed=external/clap-wrapper/src");
+    println!("cargo:rerun-if-changed=external/clap-wrapper/include");
+    println!("cargo:rerun-if-changed=src/auv2-cpp");
 
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
     let debug = std::env::var("DEBUG").unwrap() == "true";

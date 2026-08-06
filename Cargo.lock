@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "audio_align"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "atomic_float",
  "atomic_refcell",

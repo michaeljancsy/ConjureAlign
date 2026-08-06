@@ -40,7 +40,20 @@ track.** That was the reported symptom.
 | `src/clap_proxy.h` | Hold `_audioports_config` in `ClapPluginExtensions`. |
 | `src/clap_proxy.cpp` | Fetch it with `getExtension(..., CLAP_EXT_AUDIO_PORTS_CONFIG)`. |
 | `src/detail/auv2/auv2_base_classes.h` | Declare `WrapAsAUV2::selectAudioPortsConfigForMain`. |
-| `src/wrapasauv2.cpp` | `SupportedNumChannels` builds `AUChannelInfo` from *every* config; `ValidFormat` also accepts a main-bus width belonging to any config; `ChangeStreamFormat` and `Initialize` select the matching config. |
+| `src/wrapasauv2.cpp` | `SupportedNumChannels` builds `AUChannelInfo` from *every* config; `ValidFormat` also accepts a main-bus width belonging to any config, and allows sidechain busses to be wider than the selected config; `ChangeStreamFormat` and `Initialize` select the matching config. |
+| `build.rs` | Add `rerun-if-changed` for the vendored C++ (see below). |
+
+The sidechain clause matters in practice: a mono instance fed from a **stereo** reference bus
+is an ordinary Logic setup, and upstream's strict channel-count equality refuses it. Wider is
+safe — the process loop sizes its buffer list from the AU element, and the plugin only reads
+as many channels as its own layout declares. Narrower stays rejected, because that *would* be
+an out-of-bounds read.
+
+**`build.rs` only declared `rerun-if-changed=build.rs`.** Editing the vendored C++ therefore
+did not rebuild anything: cargo reported `Finished` in 0.1s and you kept testing the previous
+binary. Since the whole point of vendoring is to patch these sources, the build script now
+watches `external/clap-wrapper/src`, `external/clap-wrapper/include` and `src/auv2-cpp` too.
+If you ever re-vendor from upstream, re-apply that or you will chase ghosts.
 
 Two anonymous-namespace helpers (`forEachAudioPortsConfig`, `mainChannelsFor`) sit above
 `ValidFormat` because that is the first use site — C++ needs them declared before all three
