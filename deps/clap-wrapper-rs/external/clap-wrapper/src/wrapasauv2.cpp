@@ -1379,14 +1379,37 @@ int mainChannelsFor(const clap_audio_ports_config_t &cfg, AudioUnitScope inScope
 }
 }  // namespace
 
-// Switches the CLAP plugin to the first audio-ports-config whose main bus on `inScope` has
-// `channels` channels. Only legal while the plugin is deactivated, which is the case for
-// every caller here (AU format negotiation happens before Initialize()). Returns true if a
-// config was selected, meaning the plugin's port layout may have changed.
+// Switches the CLAP plugin to the audio-ports-config whose main bus on `inScope` has
+// `channels` channels. Only legal while the plugin is deactivated: AU format negotiation
+// happens before Initialize(), and StreamFormatWritable() refuses format changes once the
+// unit is initialized. Returns true if the plugin ends up on a config that matches.
 bool WrapAsAUV2::selectAudioPortsConfigForMain(AudioUnitScope inScope, uint32_t channels)
 {
   auto apc = _plugin->_ext._audioports_config;
   if (!apc || !apc->select) return false;
+
+  // CLAP requires the calls below on the main thread; Logic negotiates formats from other
+  // threads. This has to cover the audio-ports-config enumeration too, not just select():
+  // ChangeStreamFormat() reaches us with no guard of its own.
+  auto guarantee_mainthread = _plugin->AlwaysMainThread();
+
+  // Nothing to do when the plugin already presents this width. Re-selecting is NOT a no-op:
+  // it re-runs setupAudioBusses(), which rewrites every AU element's stream format straight
+  // through SetStreamFormat with no PropertyChanged — silently reverting widths the host
+  // negotiated, including a sidechain bus ValidFormat() deliberately accepted at a width the
+  // config does not carry. Initialize() and sample-rate-only sets both land here with the
+  // config already correct.
+  if (auto ap = _plugin->_ext._audioports)
+  {
+    const bool isInput = (inScope == kAudioUnitScope_Input);
+    clap_audio_port_info cur;
+    if (ap->count(_plugin->_plugin, isInput) > 0 &&
+        ap->get(_plugin->_plugin, 0, isInput, &cur) && (cur.flags & CLAP_AUDIO_PORT_IS_MAIN) &&
+        cur.channel_count == channels)
+    {
+      return true;
+    }
+  }
 
   clap_id target{};
   bool found = forEachAudioPortsConfig(
@@ -1399,8 +1422,6 @@ bool WrapAsAUV2::selectAudioPortsConfigForMain(AudioUnitScope inScope, uint32_t 
       });
   if (!found) return false;
 
-  // CLAP requires this on the main thread; Logic negotiates formats from other threads.
-  auto guarantee_mainthread = _plugin->AlwaysMainThread();
   if (!apc->select(_plugin->_plugin, target)) return false;
 
   // The port layout may now differ (channel counts, and for us the sidechain's width), so
@@ -1472,20 +1493,20 @@ bool WrapAsAUV2::ValidFormat(AudioUnitScope inScope, AudioUnitElement inElement,
     return true;
   }
 
-  // AudioAlign patch: sidechain busses may be WIDER than the selected config's port — a
-  // mono instance fed from a stereo reference bus is an ordinary host setup, and the strict
-  // equality above would refuse it. Wider is safe: the process loop sizes its buffer list
-  // from the AU element, and the plugin only ever reads as many channels as its own layout
-  // declares. Narrower is not safe and stays rejected.
-  if (inScope == kAudioUnitScope_Input && inElement > 0)
+  // AudioAlign patch: a sidechain bus may be any width, not just the selected config's port
+  // width. A mono instance fed from a stereo reference bus and a stereo instance fed from a
+  // mono one are both ordinary host setups, and the strict equality above refuses each of
+  // them. Either direction is safe, because nothing sizes a buffer from the CLAP port: the
+  // process loop re-reads the channel count from the AU element's buffer list every block
+  // (detail/auv2/process.cpp), and a CLAP plugin is required to honour that count — nih-plug
+  // copies with `.take(n)` and zero-fills the channels the host did not supply. The element
+  // width cannot change behind the process adapter's back either, since
+  // StreamFormatWritable() refuses format changes once the unit is initialized, which is
+  // before setupProcessing() sizes its pointer arrays. Out-of-range elements were already
+  // rejected by the input branch above.
+  if (inScope == kAudioUnitScope_Input && inElement > 0 && inNewFormat.mChannelsPerFrame > 0)
   {
-    auto ap = _plugin->_ext._audioports;
-    clap_audio_port_info inf;
-    if (ap && inElement < ap->count(pl, true) && ap->get(pl, inElement, true, &inf) &&
-        inNewFormat.mChannelsPerFrame > inf.channel_count)
-    {
-      return true;
-    }
+    return true;
   }
 
   //LOGINFO("False");

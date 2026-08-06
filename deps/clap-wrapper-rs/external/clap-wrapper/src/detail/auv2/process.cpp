@@ -61,11 +61,16 @@ void ProcessAdapter::setupProcessing(ausdk::AUScope &audioInputs, ausdk::AUScope
   // setup silent streaming
   if (numMaxSamples > 0)
   {
+    // AudioAlign patch: value-initialize (`()`), so these really are silent. An unconnected
+    // input bus points every channel at _silent_input when PullInput fails, which for us is
+    // the default state of the "Reference" sidechain until the user picks a source — and a
+    // plugin that analyses that buffer would otherwise be reading whatever the allocator
+    // last left there. The VST3 sibling path already zeroes its equivalent buffer.
     delete[] _silent_input;
-    _silent_input = new float[numMaxSamples];
+    _silent_input = new float[numMaxSamples]();
 
     delete[] _silent_output;
-    _silent_output = new float[numMaxSamples];
+    _silent_output = new float[numMaxSamples]();
   }
 
   _numInputs = _audioInputScope->GetNumberOfElements();

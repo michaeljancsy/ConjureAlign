@@ -51,9 +51,15 @@ repository = "https://github.com/blepfx/clap-wrapper-rs"
 
 [features]
 auv2 = []
+# AudioAlign patch: `vst3` removed from the default set. This vendored copy has no
+# `external/vst3sdk/` (see deps/PATCHES.md), and because the crate lives inside the workspace
+# directory Cargo treats it as an implicit workspace member — so with `vst3` on by default,
+# `cargo build --workspace`, `-p clap-wrapper`, or any cargo command run from this directory
+# would panic in build.rs on the missing SDK, and feature unification could turn `vst3` on for
+# the copy audio_align links (duplicate GetPluginFactory/bundleEntry/bundleExit). Turning
+# `vst3` back on means restoring the SDK first.
 default = [
     "parallel",
-    "vst3",
     "auv2",
 ]
 parallel = ["cc/parallel"]

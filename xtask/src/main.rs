@@ -156,11 +156,13 @@ fn bundle_auv2(package: &str, config: &PackageConfig) -> Result<()> {
         .join(&bundle_name);
     if !source.exists() {
         bail!(
-            "Expected a CLAP bundle at '{}' to build the AudioUnit from. Does the plugin \
-             still export `clap_entry`?",
+            "Expected a CLAP bundle at '{}' to build the AudioUnit from — either the plugin \
+             no longer exports `clap_entry`, or nih_plug_xtask changed where it puts the \
+             bundle.",
             source.display()
         );
     }
+    check_exports_au_factory(&source)?;
 
     let home = bundled.join(format!("{bundle_name}.component"));
     // Rebuild from scratch: a `_CodeSignature` left over from an earlier run describes
@@ -188,6 +190,38 @@ fn bundle_auv2(package: &str, config: &PackageConfig) -> Result<()> {
 
     codesign(&home);
     eprintln!("Created an AUv2 bundle at '{}'", home.display());
+
+    Ok(())
+}
+
+/// The Info.plist below names `GetPluginFactoryAUV2` as the AU entry point, and nothing else
+/// in the build fails when the binary does not have it: `clap_wrapper::export_auv2!()`
+/// expands over an empty module when the crate's `auv2` feature is off, so it still compiles.
+/// The bundle would then install and sign cleanly and fail only inside `auval` or Logic, with
+/// an error that says nothing about the missing symbol. nih_plug_xtask sniffs exports to
+/// decide which bundles to write; do the same here.
+fn check_exports_au_factory(binary: &Path) -> Result<()> {
+    let symbols = match Command::new("nm").arg("-gU").arg(binary).output() {
+        Ok(output) if output.status.success() => output.stdout,
+        // No usable `nm`: warn rather than fail a build over a missing developer tool.
+        _ => {
+            eprintln!(
+                "WARNING: Could not run `nm` on '{}' to check that it exports \
+                 GetPluginFactoryAUV2",
+                binary.display()
+            );
+            return Ok(());
+        }
+    };
+
+    if !String::from_utf8_lossy(&symbols).contains("_GetPluginFactoryAUV2") {
+        bail!(
+            "'{}' does not export `GetPluginFactoryAUV2`, which the .component's Info.plist \
+             names as its factory function. Is `clap_wrapper::export_auv2!()` still in \
+             src/lib.rs, and is the `clap-wrapper` dependency's `auv2` feature enabled?",
+            binary.display()
+        );
+    }
 
     Ok(())
 }
@@ -221,6 +255,29 @@ fn au_version(major: u64, minor: u64, patch: u64) -> Result<u32> {
     Ok((((major as u32) << 16) | ((minor as u32) << 8) | patch as u32).max(1))
 }
 
+/// The plist is assembled by hand below, so every value out of `bundler.toml` has to be
+/// escaped. An unescaped `&` in a name or description produces XML CoreFoundation cannot
+/// parse, and the symptom is not a build error — it is the plugin silently never registering.
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// `type`, `subtype` and `manufacturer` are OSTypes: exactly four ASCII characters, packed
+/// into a `UInt32` by the system. A typo'd or over-long code is written verbatim into the
+/// plist and fails the same silent way an unescaped metacharacter does.
+fn check_four_cc(field: &str, value: &str) -> Result<()> {
+    if value.chars().count() != 4 || !value.is_ascii() {
+        bail!("`{field}` must be exactly four ASCII characters, got '{value}'");
+    }
+
+    Ok(())
+}
+
 fn info_plist(
     bundle_name: &str,
     auv2: &Auv2Config,
@@ -237,6 +294,24 @@ fn info_plist(
         description,
         tags,
     } = auv2;
+    check_four_cc("type", au_type)?;
+    check_four_cc("subtype", subtype)?;
+    check_four_cc("manufacturer", manufacturer)?;
+    if !manufacturer.chars().any(|c| c.is_ascii_uppercase()) {
+        bail!(
+            "`manufacturer` must contain an uppercase character, got '{manufacturer}': Apple \
+             reserves all-lowercase manufacturer codes"
+        );
+    }
+
+    let bundle_name = xml_escape(bundle_name);
+    let au_type = xml_escape(au_type);
+    let subtype = xml_escape(subtype);
+    let manufacturer = xml_escape(manufacturer);
+    let manufacturer_name = xml_escape(manufacturer_name);
+    let bundle_id = xml_escape(bundle_id);
+    let description = xml_escape(description);
+
     let short_version = format!("{major}.{minor}.{patch}");
     let packed_version = au_version(major, minor, patch)?;
     let tags = if tags.is_empty() {
@@ -244,7 +319,7 @@ fn info_plist(
     } else {
         let entries = tags
             .iter()
-            .map(|tag| format!("          <string>{tag}</string>\n"))
+            .map(|tag| format!("          <string>{}</string>\n", xml_escape(tag)))
             .collect::<String>();
         format!("        <key>tags</key>\n        <array>\n{entries}        </array>\n")
     };

@@ -1,10 +1,12 @@
 // Minimal AU host: instantiate AudioAlign, force a MONO stream format on the main busses,
 // initialise, and render. Verifies that clap-wrapper's audio-ports-config selection really
 // reached the CLAP plugin — if it did not, the wrapped plugin still believes it is stereo
-// while the buffers are mono, which is an out-of-bounds read on the audio thread.
+// while the buffers are mono, and processes a shape it did not agree to.
 //
-// Prints the negotiated bus formats after Initialize; the sidechain ("Reference") bus
-// collapsing to 1 channel is the proof that select() propagated.
+// Asserts the negotiated bus formats after Initialize: every bus, including the sidechain
+// ("Reference"), must report the requested width. The sidechain collapsing to 1 channel in
+// the mono run is the proof that select() propagated, so it is a hard failure (exit 1), not
+// just something printed — the recipe below chains the two runs on their exit codes.
 //
 // Not a cargo test: it needs the .component installed in ~/Library/Audio/Plug-Ins/Components/.
 //   clang -O1 -framework AudioToolbox -framework CoreFoundation -o /tmp/au_mono_host tests/au_mono_host.c
@@ -30,12 +32,23 @@ static OSStatus inputCallback(void *inRefCon, AudioUnitRenderActionFlags *ioActi
   return noErr;
 }
 
-static void describe(AudioUnit au, AudioUnitScope scope, UInt32 elem, const char *label) {
+// Prints the negotiated format and returns its channel count, or 0 if it could not be read.
+static UInt32 describe(AudioUnit au, AudioUnitScope scope, UInt32 elem, const char *label) {
   AudioStreamBasicDescription asbd;
   UInt32 sz = sizeof(asbd);
   OSStatus e = AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, scope, elem, &asbd, &sz);
-  if (e != noErr) { printf("  %-22s <error %d>\n", label, (int)e); return; }
+  if (e != noErr) { printf("  %-22s <error %d>\n", label, (int)e); return 0; }
   printf("  %-22s %u ch @ %.0f Hz\n", label, (unsigned)asbd.mChannelsPerFrame, asbd.mSampleRate);
+  return asbd.mChannelsPerFrame;
+}
+
+// The load-bearing check: a bus that did not follow the requested width means select() never
+// reached the CLAP plugin, so the AU is feeding it buffers of a shape it does not expect.
+static int expect_channels(UInt32 got, UInt32 want, const char *label) {
+  if (got == want) return 1;
+  printf("FAIL: %s reports %u ch, expected %u — audio-ports-config select() did not reach "
+         "the plugin\n", label, (unsigned)got, (unsigned)want);
+  return 0;
 }
 
 static int setFormat(AudioUnit au, AudioUnitScope scope, UInt32 elem, UInt32 ch, double sr) {
@@ -85,19 +98,30 @@ int main(int argc, char **argv) {
   AudioUnitSetProperty(au, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0,
                        &maxFrames, sizeof(maxFrames));
 
+  // Feed both the main bus and the sidechain, so the reference path actually carries data
+  // instead of falling back to the wrapper's substitute silent buffer.
   AURenderCallbackStruct cb = { inputCallback, NULL };
   if (AudioUnitSetProperty(au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0,
                            &cb, sizeof(cb)) != noErr) {
     printf("FAIL: could not attach input callback\n"); return 1;
+  }
+  if (AudioUnitSetProperty(au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 1,
+                           &cb, sizeof(cb)) != noErr) {
+    printf("FAIL: could not attach Reference (bus 1) callback\n"); return 1;
   }
 
   OSStatus e = AudioUnitInitialize(au);
   if (e != noErr) { printf("FAIL: AudioUnitInitialize -> %d\n", (int)e); return 1; }
 
   printf("Negotiated after Initialize:\n");
-  describe(au, kAudioUnitScope_Input, 0, "input bus 0 (main)");
-  describe(au, kAudioUnitScope_Input, 1, "input bus 1 (Reference)");
-  describe(au, kAudioUnitScope_Output, 0, "output bus 0");
+  UInt32 in0 = describe(au, kAudioUnitScope_Input, 0, "input bus 0 (main)");
+  UInt32 in1 = describe(au, kAudioUnitScope_Input, 1, "input bus 1 (Reference)");
+  UInt32 out0 = describe(au, kAudioUnitScope_Output, 0, "output bus 0");
+
+  ok &= expect_channels(in0, g_channels, "input bus 0 (main)");
+  ok &= expect_channels(in1, g_channels, "input bus 1 (Reference)");
+  ok &= expect_channels(out0, g_channels, "output bus 0");
+  if (!ok) return 1;
 
   Float64 latency = 0; UInt32 lsz = sizeof(latency);
   AudioUnitGetProperty(au, kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0, &latency, &lsz);

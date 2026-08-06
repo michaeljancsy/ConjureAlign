@@ -7,10 +7,12 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     // AudioAlign patch: upstream only watches build.rs, so edits to the vendored C++
     // silently do not rebuild — you keep testing the previous binary. We patch these
-    // sources (see deps/PATCHES.md), so watch them too.
-    println!("cargo:rerun-if-changed=external/clap-wrapper/src");
-    println!("cargo:rerun-if-changed=external/clap-wrapper/include");
-    println!("cargo:rerun-if-changed=src/auv2-cpp");
+    // sources (see deps/PATCHES.md), so watch them too. Emitting any rerun-if-changed also
+    // switches off cargo's default whole-package watch, which makes a hand-picked list of
+    // directories a trap: name the whole vendored tree instead, so the AudioUnitSDK, clap
+    // and filesystem sources build_auv2() compiles and includes are covered as well.
+    println!("cargo:rerun-if-changed=external");
+    println!("cargo:rerun-if-changed=src");
 
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
     let debug = std::env::var("DEBUG").unwrap() == "true";

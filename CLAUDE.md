@@ -36,8 +36,10 @@ from the host's generic parameter UI.
   free-audio/clap-validator GitHub releases)
 - VST3 validation: `pluginval --strictness-level 10 target/bundled/AudioAlign.vst3`
 - AU validation: install the `.component`, then
-  `killall -9 AudioComponentRegistrar && auval -v aufx ALGN CONJ` (add `-strict` for the
-  pedantic pass). A rebuild at an unchanged version needs the `killall` to be re-scanned,
+  `killall -9 AudioComponentRegistrar; auval -v aufx ALGN CONJ` (add `-strict` for the
+  pedantic pass). The `;` is deliberate — `AudioComponentRegistrar` is an on-demand daemon,
+  so `killall` exits non-zero whenever it happens to be idle, and `&&` would skip `auval`
+  without printing anything that looks like a failure. A rebuild at an unchanged version needs the `killall` to be re-scanned,
   and the host must be restarted; `rm -rf ~/Library/Caches/AudioUnitCache` is the
   sledgehammer. Note `auval` renders the main bus only, so it never exercises the
   sidechain, and it loads the plugin in-process without building the Cocoa view — a green
@@ -206,14 +208,19 @@ clap-wrapper 0.14.0 (vendored by the `clap-wrapper` 0.3.1 crate) has these AUv2 
 all verified against the vendored sources, none worth patching for us:
 - `WrapAsAUV2::PostConstructor` calls `SetNumberOfElements`, which resets each bus's stream
   format, and then only re-applies the *name*, never the channel count (upstream PR #496,
-  merged to `next` only). Harmless here: AUSDK's default element format is stereo and every
-  one of our ports is stereo, so `auval` reports the correct `[2, 2]` and both input busses
-  come up 2-channel. It would bite if a port were ever mono or >2 channels.
+  merged to `next` only). Harmless here: AUSDK's default element format is stereo and matches
+  our *layout-0* ports, which are the ones current at `PostConstructor` time, so both input
+  busses come up 2-channel and `auval`'s default pass reports `[2, 2]`. The mono layout is
+  reached later, through `select()` + `setupAudioBusses()`, which sets every element's channel
+  count explicitly — that is what stops the missing re-apply from biting. It would bite if
+  layout 0 were ever mono or >2 channels.
 - `SaveState`/`RestoreState` both early-return `kAudioUnitErr_Uninitialized` when
   `!IsInitialized()` (upstream issue #490; the guards are still present on every branch).
   If a Logic project ever fails to restore the detected offset, this is the first suspect —
-  the escape hatch is `CLAP_WRAPPER_CPP_DIR=<patched checkout> cargo build`, which builds
-  the crate against your own clap-wrapper tree.
+  patch it directly in `deps/clap-wrapper-rs/external/clap-wrapper/`, which is a path
+  dependency, so an edit there rebuilds. (Upstream's `CLAP_WRAPPER_CPP_DIR` hook would be the
+  tidier route, but it landed after 0.3.1 and the vendored `build.rs` ignores the variable —
+  see `deps/PATCHES.md`.)
 - `auval` warns `AU implements MusicDeviceMIDIEvent but is of type 'aufx'`. Cosmetic:
   clap-wrapper registers every AU type through `AUSDK_COMPONENT_ENTRY(AUMusicDeviceFactory,
   …)`. Validation still succeeds.

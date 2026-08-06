@@ -1,7 +1,7 @@
 # Vendored `clap-wrapper-rs`
 
 `deps/clap-wrapper-rs` is [blepfx/clap-wrapper-rs](https://github.com/blepfx/clap-wrapper-rs)
-**0.3.1**, exactly as published to crates.io, with two deliberate differences:
+**0.3.1**, exactly as published to crates.io, with three deliberate differences:
 
 1. `external/vst3sdk/` is deleted. We never compile it — the crate's `vst3` feature is off
    (see `Cargo.toml`: enabling it would export `GetPluginFactory`, `bundleEntry` and
@@ -9,7 +9,14 @@
    references those paths inside `build_vst3()`, which never runs. Dropping it takes the
    vendored tree from 5.5 MB to 2.0 MB. **If the `vst3` feature is ever turned on, the SDK
    has to come back.**
-2. The AUv2 mono patch, below.
+2. `vst3` is removed from the vendored crate's own `default` feature set. Turning the feature
+   off on the dependency edge in the root `Cargo.toml` is not enough: the crate lives inside
+   the workspace directory, so Cargo makes it an implicit workspace member, and a member is
+   built with *its own* defaults. With `vst3` still in that list, `cargo build --workspace`,
+   `cargo clippy --workspace`, `-p clap-wrapper`, or any cargo command run from inside
+   `deps/clap-wrapper-rs` panics in `build.rs` on the `external/vst3sdk` tree that difference 1
+   deleted — and feature unification can hand the linked copy a `vst3` it must not have.
+3. The AUv2 mono patch, below.
 
 It is a path dependency rather than a crates.io one because upstream's
 `CLAP_WRAPPER_CPP_DIR` escape hatch — which exists precisely so you can build against your
@@ -40,42 +47,76 @@ track.** That was the reported symptom.
 | `src/clap_proxy.h` | Hold `_audioports_config` in `ClapPluginExtensions`. |
 | `src/clap_proxy.cpp` | Fetch it with `getExtension(..., CLAP_EXT_AUDIO_PORTS_CONFIG)`. |
 | `src/detail/auv2/auv2_base_classes.h` | Declare `WrapAsAUV2::selectAudioPortsConfigForMain`. |
-| `src/wrapasauv2.cpp` | `SupportedNumChannels` builds `AUChannelInfo` from *every* config; `ValidFormat` also accepts a main-bus width belonging to any config, and allows sidechain busses to be wider than the selected config; `ChangeStreamFormat` and `Initialize` select the matching config. |
+| `src/wrapasauv2.cpp` | `SupportedNumChannels` builds `AUChannelInfo` from *every* config; `ValidFormat` also accepts a main-bus width belonging to any config, and accepts any width on a sidechain bus; `ChangeStreamFormat` and `Initialize` select the matching config, and selection is skipped when the plugin already presents that width. |
+| `src/detail/auv2/auv2_base_classes.h` | `StreamFormatWritable` returns `!IsInitialized()` (was unconditional `true`), so formats cannot change on a running unit. |
+| `src/detail/auv2/process.cpp` | Value-initialize the substitute silent buffers, so an unconnected bus really does read as silence. |
 | `build.rs` | Add `rerun-if-changed` for the vendored C++ (see below). |
 
 The sidechain clause matters in practice: a mono instance fed from a **stereo** reference bus
-is an ordinary Logic setup, and upstream's strict channel-count equality refuses it. Wider is
-safe — the process loop sizes its buffer list from the AU element, and the plugin only reads
-as many channels as its own layout declares. Narrower stays rejected, because that *would* be
-an out-of-bounds read.
+is an ordinary Logic setup, and upstream's strict channel-count equality refuses it. So is the
+mirror image — a stereo instance fed from a **mono** bus — so the clause accepts any width on
+an aux input element, in either direction. Nothing sizes a buffer from the CLAP port: the
+process loop re-reads the channel count from the AU element's buffer list every block
+(`detail/auv2/process.cpp`), and a CLAP plugin has to honour that count, which nih-plug does by
+copying with `.take(n)` and zero-filling the channels the host did not supply. What makes that
+safe is that the element width is frozen before `ProcessAdapter::setupProcessing()` sizes its
+pointer arrays — see the `StreamFormatWritable` change below.
+
+`WrapAsAUV2::StreamFormatWritable` returned an unconditional `true`, where AUSDK's own
+`AUEffectBase` returns `!IsInitialized()`; it now does the same. `AUBase`'s
+`kAudioUnitProperty_StreamFormat` / `_SampleRate` cases carry no initialized-state gate of
+their own, so without this a host could change a stream format on a running unit — which under
+this patch meant `select()` on an *active* plugin (CLAP marks it `[main-thread &
+plugin-deactivated]`, and nih-plug swaps the layout without rebuilding its buffers), an element
+growing past the pointer array `setupProcessing()` already sized, and `ReallocateBuffers()`
+freeing element buffers under a live render thread.
+
+`selectAudioPortsConfigForMain` returns early when the plugin already presents the requested
+main width. Re-selecting the current config is not a no-op: it re-runs `setupAudioBusses()`,
+which rewrites every element's stream format through `SetStreamFormat` without a
+`PropertyChanged`, so it would silently revert a sidechain width the host set and was told was
+accepted. `Initialize()` and sample-rate-only sets both arrive with the config already correct.
 
 **`build.rs` only declared `rerun-if-changed=build.rs`.** Editing the vendored C++ therefore
 did not rebuild anything: cargo reported `Finished` in 0.1s and you kept testing the previous
 binary. Since the whole point of vendoring is to patch these sources, the build script now
-watches `external/clap-wrapper/src`, `external/clap-wrapper/include` and `src/auv2-cpp` too.
-If you ever re-vendor from upstream, re-apply that or you will chase ghosts.
+watches `external` and `src` — the whole vendored tree, deliberately, rather than the handful
+of directories the patch happens to touch today. Emitting *any* `rerun-if-changed` turns off
+cargo's default whole-package watch, so a hand-picked list leaves the same trap open for
+everything it omits, and `build_auv2()` also compiles all twelve `external/AudioUnitSDK/src`
+translation units and includes `external/clap` and `external/filesystem`. If you ever
+re-vendor from upstream, re-apply this or you will chase ghosts.
 
 Two anonymous-namespace helpers (`forEachAudioPortsConfig`, `mainChannelsFor`) sit above
 `ValidFormat` because that is the first use site — C++ needs them declared before all three
 users.
 
-`audio-ports-config::select` is only legal while the plugin is deactivated. Both call sites
-satisfy that: AU stream-format negotiation happens before `Initialize()`, and the
-`Initialize()` call is placed before `activateCLAP()`. After selecting, `setupAudioBusses()`
-is re-run so the AU elements agree with the plugin's new port layout — this is what makes
-the sidechain bus follow the main bus down to 1 channel.
+`audio-ports-config::select` is only legal on the main thread while the plugin is deactivated.
+Both call sites satisfy that, and it is now enforced rather than assumed: stream-format
+negotiation happens before `Initialize()` *because* `StreamFormatWritable` refuses it
+afterwards, and the `Initialize()` call is placed before `activateCLAP()`. The main-thread
+guard is taken before the config enumeration, not just before `select()` — Logic drives
+`ChangeStreamFormat` from other threads, and that call site holds no guard of its own. After
+selecting, `setupAudioBusses()` is re-run so the AU elements agree with the plugin's new port
+layout — this is what makes the sidechain bus follow the main bus down to 1 channel.
 
-Everything degrades to upstream behaviour when the extension is absent: `SupportedNumChannels`
-falls through to the original `audio-ports` path, `ValidFormat`'s extra clause matches
-nothing, and `selectAudioPortsConfigForMain` returns false immediately.
+Most of this degrades to upstream behaviour when the extension is absent: `SupportedNumChannels`
+falls through to the original `audio-ports` path, `ValidFormat`'s *main-bus* clause matches
+nothing, and `selectAudioPortsConfigForMain` returns false immediately. The sidechain clause is
+the exception, and worth knowing when you audit this patch: it reads only `audio-ports`, never
+`audio-ports-config`, so it relaxes upstream's strict channel-count equality on aux input
+elements for every plugin and every host, extension or no extension.
 
 ## Verifying the patch after a change
 
 ```bash
 cargo xtask bundle audio_align --release   # see CLAUDE.md for the worktree caveat
 # install to ~/Library/Audio/Plug-Ins/Components/, then:
-killall -9 AudioComponentRegistrar && auval -v aufx ALGN CONJ
+killall -9 AudioComponentRegistrar; auval -v aufx ALGN CONJ
 ```
+
+(`;`, not `&&`: `AudioComponentRegistrar` is an on-demand daemon, so `killall` exits non-zero
+whenever it is idle and `&&` would silently skip the `auval` run below.)
 
 `auval` must report **`Reported Channel Capabilities (explicit): [2, 2]  [1, 1]`** and mark
 both `1-1` and `2-2` in its channel-handling grid. `auval` only ever *renders* the default
@@ -88,9 +129,10 @@ clang -O1 -framework AudioToolbox -framework CoreFoundation -o /tmp/au_mono_host
 ```
 
 The load-bearing assertion is that **in the mono run, input bus 1 ("Reference") reports 1
-channel**. If it still reports 2, `select()` did not reach the plugin: the AU would be
-handing mono buffers to a plugin that believes it is stereo, which is an out-of-bounds read
-on the audio thread rather than a visible failure.
+channel**. The harness checks it (and the main busses) and exits non-zero on a mismatch, so
+the `&&` chain above really does gate on it. If it reports 2, `select()` did not reach the
+plugin, and the AU is handing mono buffers to a plugin that believes it is stereo — a silent
+wrong-shape read on the audio thread rather than a visible failure.
 
 ## Upstream
 

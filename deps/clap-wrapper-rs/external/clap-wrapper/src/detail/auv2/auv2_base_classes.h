@@ -255,9 +255,16 @@ class WrapAsAUV2 : public ausdk::AUBase,
     return false;
   }
 
+  // AudioAlign patch (see deps/PATCHES.md): match AUSDK's own AUEffectBase, which returns
+  // !IsInitialized() here. Upstream returned an unconditional true, and AUBase's
+  // kAudioUnitProperty_StreamFormat / _SampleRate cases have no initialized-state gate of
+  // their own, so a host could change a stream format on a running unit. That reached
+  // ChangeStreamFormat() -> audio-ports-config::select() on an ACTIVE plugin (which CLAP
+  // marks [main-thread & plugin-deactivated]) and let an element grow wider than the
+  // pointer arrays ProcessAdapter::setupProcessing() sized at Initialize().
   bool StreamFormatWritable(AudioUnitScope, AudioUnitElement) override
   {
-    return true;
+    return !IsInitialized();
   }
 
   std::vector<AUChannelInfo> cinfo;
