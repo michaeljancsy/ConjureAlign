@@ -1,6 +1,6 @@
 # AudioAlign
 
-A free VST3/CLAP plugin that automatically time-aligns two recordings of the same source
+A free VST3 / CLAP / AudioUnit plugin that automatically time-aligns two recordings of the same source
 captured by different microphones — e.g., a close mic and a room mic on one guitar amp —
 eliminating the phase cancellation and comb filtering caused by the distance between them.
 Sub-sample precision, automatic polarity detection, and support for *negative* shifts
@@ -18,6 +18,9 @@ Trim, hold Shift for fine control, scroll/pinch to pan and zoom.
    - **REAPER**: open the plugin's pin connector, add inputs 3/4, send the reference track there.
    - **Ableton Live** (VST3): choose the reference track in the device header's sidechain chooser.
    - **Bitwig** (CLAP): same, via the device's sidechain chooser.
+   - **Logic Pro** (AU): open the **Side Chain** menu at the top right of the plugin
+     window's header and pick the reference track. If the track isn't listed, send it to a
+     bus and pick the bus instead.
 3. **Play a loud, representative section** of the song.
 4. While it plays, **click "Capture"** in the plugin window (or toggle the "Capture"
    parameter on, e.g. from host automation). The plugin records a few seconds of both
@@ -46,8 +49,10 @@ the residual is entirely above ~19 kHz, where fractional delay is mathematically
 any plugin. In the audible band the null is −70 dB or deeper (measured in
 `tests/null_depth.rs`). A lowpass at ~19 kHz on the null bus shows the true audible-band depth.
 
-**Logic Pro is not supported yet** — Logic only loads Audio Units. An AU build via
-[clap-wrapper](https://github.com/free-audio/clap-wrapper) is planned.
+The Audio Unit build is produced by [clap-wrapper](https://github.com/free-audio/clap-wrapper),
+which re-exports the CLAP plugin behind an AU entry point. It carries a local patch so that
+both the mono and stereo layouts are reachable from AU hosts — without it Logic hides the
+plugin on mono tracks. See `deps/PATCHES.md`.
 
 ## Building
 
@@ -57,8 +62,11 @@ Stable Rust required.
 cargo xtask bundle audio_align --release
 ```
 
-Bundles appear in `target/bundled/`; copy `AudioAlign.clap` to `~/Library/Audio/Plug-Ins/CLAP/`
-and `AudioAlign.vst3` to `~/Library/Audio/Plug-Ins/VST3/` (macOS).
+Bundles appear in `target/bundled/`; on macOS copy `AudioAlign.clap` to
+`~/Library/Audio/Plug-Ins/CLAP/`, `AudioAlign.vst3` to `~/Library/Audio/Plug-Ins/VST3/`, and
+`AudioAlign.component` to `~/Library/Audio/Plug-Ins/Components/`. After replacing an
+installed `.component`, run `killall -9 AudioComponentRegistrar` and restart the host, or
+macOS will keep serving the cached registration.
 
 Run the DSP test suite with `cargo test --release`. To eyeball the GUI panels without a DAW,
 `cargo run --example gui_preview --features gui-preview` renders them with synthetic data to

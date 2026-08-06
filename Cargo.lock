@@ -285,6 +285,7 @@ version = "0.1.0"
 dependencies = [
  "atomic_float",
  "atomic_refcell",
+ "clap-wrapper",
  "egui_kittest",
  "image",
  "nih_plug",
@@ -572,6 +573,13 @@ dependencies = [
 name = "clap-sys"
 version = "0.5.0"
 source = "git+https://github.com/micahrj/clap-sys.git?rev=25d7f53fdb6363ad63fbd80049cb7a42a97ac156#25d7f53fdb6363ad63fbd80049cb7a42a97ac156"
+
+[[package]]
+name = "clap-wrapper"
+version = "0.3.1"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "clap_builder"
@@ -4528,7 +4536,11 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "cargo_metadata",
  "nih_plug_xtask",
+ "serde",
+ "toml",
 ]
 
 [[package]]

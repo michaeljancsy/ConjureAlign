@@ -28,6 +28,23 @@ atomic_float = "0.1"
 egui_kittest = { version = "0.31", features = ["wgpu"], optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
+# AudioUnit v2 export (macOS only). clap-wrapper re-exports the `clap_entry` that
+# `nih_export_clap!` already emits behind an AudioComponentFactoryFunction named
+# `GetPluginFactoryAUV2`. It vendors the free-audio/clap-wrapper C++ and builds it with
+# the `cc` crate, so no cmake is involved.
+#
+# `default-features = false` is load-bearing: the default set includes `vst3`, which
+# exports `GetPluginFactory`, `bundleEntry` and `bundleExit` — the exact three symbols
+# `nih_export_vst3!` already exports. Enabling it is a duplicate-symbol link error.
+#
+# Vendored at `deps/clap-wrapper-rs` (crates.io 0.3.1, VST3 SDK removed) because the AUv2
+# wrapper needs a patch to reach the plugin's Mono layout — see `deps/PATCHES.md`. Upstream
+# grew a `CLAP_WRAPPER_CPP_DIR` escape hatch for exactly this, but only after 0.3.1 shipped,
+# so the released build.rs hardcodes its source paths and a path dependency is the only way
+# in without taking an unreleased git rev.
+[target.'cfg(target_os = "macos")'.dependencies]
+clap-wrapper = { path = "deps/clap-wrapper-rs", default-features = false, features = ["auv2", "parallel"] }
+
 [features]
 # Dev-only: run the plugin (and its GUI) as a standalone app, no DAW needed:
 #   cargo run --bin standalone --features standalone -- --backend dummy
