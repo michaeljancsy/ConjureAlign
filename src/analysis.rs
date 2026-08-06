@@ -29,21 +29,69 @@ pub struct AnalysisResult {
     pub confidence: f32,
 }
 
+/// Why an analysis produced no usable offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// Fewer than two samples or an empty search window.
+    TooShort,
+    /// Either signal below `SILENCE_RMS_THRESHOLD` (e.g. no sidechain
+    /// connected).
+    Silence,
+    /// Peak normalized correlation below `CONFIDENCE_THRESHOLD`.
+    LowConfidence,
+}
+
+/// Everything an analysis run produced, including what a GUI needs to draw the
+/// correlation curve — present even for `LowConfidence` rejections, so the
+/// display can show *why* a capture failed.
+#[derive(Debug, Clone)]
+pub struct AnalysisReport {
+    pub outcome: Result<AnalysisResult, RejectReason>,
+    /// Normalized cross-correlation at every integer lag in
+    /// `[-max_shift_samples, +max_shift_samples]`; index `i` holds lag
+    /// `i - max_shift_samples`. Sign is preserved (an inverted-polarity match
+    /// peaks negative), so the value at the peak equals ±`confidence`. Empty
+    /// when the analysis was rejected before the FFT ran (`TooShort`,
+    /// `Silence`).
+    pub corr_curve: Vec<f32>,
+    /// The half-window actually searched (the requested window clamped to what
+    /// the FFT size allows).
+    pub max_shift_samples: usize,
+}
+
 /// Estimates the time offset between `main` and `reference` (equal-length mono
 /// captures recorded simultaneously), searching lags within
 /// `±max_shift_samples`. Returns `None` when either signal is near-silent or
 /// the correlation peak is too weak to trust.
 pub fn analyze(main: &[f32], reference: &[f32], max_shift_samples: usize) -> Option<AnalysisResult> {
+    analyze_detailed(main, reference, max_shift_samples)
+        .outcome
+        .ok()
+}
+
+/// Like [`analyze`], but also reports the correlation curve and the rejection
+/// reason. Same cost; [`analyze`] is a thin wrapper around this.
+pub fn analyze_detailed(
+    main: &[f32],
+    reference: &[f32],
+    max_shift_samples: usize,
+) -> AnalysisReport {
+    let reject = |reason, max_shift_samples| AnalysisReport {
+        outcome: Err(reason),
+        corr_curve: Vec::new(),
+        max_shift_samples,
+    };
+
     let n = main.len().min(reference.len());
     if n < 2 || max_shift_samples == 0 {
-        return None;
+        return reject(RejectReason::TooShort, max_shift_samples);
     }
 
     let e_main: f64 = main[..n].iter().map(|&x| x as f64 * x as f64).sum();
     let e_ref: f64 = reference[..n].iter().map(|&x| x as f64 * x as f64).sum();
     let silence_energy = SILENCE_RMS_THRESHOLD * SILENCE_RMS_THRESHOLD * n as f64;
     if e_main < silence_energy || e_ref < silence_energy {
-        return None;
+        return reject(RejectReason::Silence, max_shift_samples);
     }
 
     // Zero-pad past n + max_shift so every lag in the search window is a true
@@ -66,8 +114,13 @@ pub fn analyze(main: &[f32], reference: &[f32], max_shift_samples: usize) -> Opt
 
     let mut spec_main = r2c.make_output_vec();
     let mut spec_ref = r2c.make_output_vec();
-    r2c.process(&mut buf_main, &mut spec_main).ok()?;
-    r2c.process(&mut buf_ref, &mut spec_ref).ok()?;
+    // The planner sized every buffer, so process() cannot fail; reject
+    // defensively rather than panicking on a background thread.
+    if r2c.process(&mut buf_main, &mut spec_main).is_err()
+        || r2c.process(&mut buf_ref, &mut spec_ref).is_err()
+    {
+        return reject(RejectReason::TooShort, max_shift as usize);
+    }
 
     // Cross-correlation theorem: DFT of Σ_n main[n]·ref[n+τ] is conj(MAIN)·REF.
     // The peak of that sequence sits at τ = offset under our sign convention
@@ -79,10 +132,21 @@ pub fn analyze(main: &[f32], reference: &[f32], max_shift_samples: usize) -> Opt
     // for the sub-sample refinement below.
     let cross_spectrum = spec_main.clone();
     let mut corr = c2r.make_output_vec();
-    c2r.process(&mut spec_main, &mut corr).ok()?;
+    if c2r.process(&mut spec_main, &mut corr).is_err() {
+        return reject(RejectReason::TooShort, max_shift as usize);
+    }
 
     // Negative lags live at the top of the buffer: corr[nfft + τ].
     let at = |lag: i64| -> f64 { corr[lag.rem_euclid(nfft as i64) as usize] };
+
+    // corr is the unnormalized IFFT (scaled by nfft); dividing by the
+    // geometric mean of the signal energies turns it into a proper correlation
+    // coefficient — the same scale as `confidence`, so the curve's value at
+    // the peak lag equals ±confidence.
+    let norm = nfft as f64 * (e_main * e_ref).sqrt();
+    let corr_curve: Vec<f32> = (-max_shift..=max_shift)
+        .map(|lag| (at(lag) / norm) as f32)
+        .collect();
 
     let mut peak_lag = 0i64;
     let mut peak_val = 0.0f64;
@@ -94,12 +158,13 @@ pub fn analyze(main: &[f32], reference: &[f32], max_shift_samples: usize) -> Opt
         }
     }
 
-    // corr is the unnormalized IFFT (scaled by nfft); normalize against the
-    // signal energies for a proper correlation coefficient.
-    let confidence =
-        ((peak_val.abs() / nfft as f64) / (e_main * e_ref).sqrt()).min(1.0) as f32;
+    let confidence = ((peak_val.abs() / norm).min(1.0)) as f32;
     if confidence < CONFIDENCE_THRESHOLD {
-        return None;
+        return AnalysisReport {
+            outcome: Err(RejectReason::LowConfidence),
+            corr_curve,
+            max_shift_samples: max_shift as usize,
+        };
     }
 
     // Sub-sample refinement. A 3-point parabolic fit is biased on broadband
@@ -111,11 +176,15 @@ pub fn analyze(main: &[f32], reference: &[f32], max_shift_samples: usize) -> Opt
     let goal = |tau: f64| sign * continuous_corr(&cross_spectrum, nfft, tau);
     let refined = golden_section_max(goal, peak_lag as f64 - 0.6, peak_lag as f64 + 0.6);
 
-    Some(AnalysisResult {
-        offset_samples: refined,
-        inverted: peak_val < 0.0,
-        confidence,
-    })
+    AnalysisReport {
+        outcome: Ok(AnalysisResult {
+            offset_samples: refined,
+            inverted: peak_val < 0.0,
+            confidence,
+        }),
+        corr_curve,
+        max_shift_samples: max_shift as usize,
+    }
 }
 
 /// The circular cross-correlation evaluated at a *fractional* lag `tau`:
@@ -371,5 +440,71 @@ mod tests {
             analyze(&main, &reference, 1000).is_none(),
             "independent noise must not produce a confident result"
         );
+    }
+
+    #[test]
+    fn curve_peak_matches_confidence() {
+        let main = band_limited_noise(48_000, 42);
+        let k = 237i64;
+        let reference = delayed_copy(&main, k);
+        let report = analyze_detailed(&main, &reference, 1000);
+        let r = report.outcome.expect("must detect");
+        assert_eq!(report.max_shift_samples, 1000);
+        assert_eq!(report.corr_curve.len(), 2 * 1000 + 1);
+        let peak_idx = (report.max_shift_samples as i64 + k) as usize;
+        let v = report.corr_curve[peak_idx];
+        assert!(
+            (v - r.confidence).abs() < 1e-3,
+            "curve value {v} vs confidence {}",
+            r.confidence
+        );
+        // The detected lag must be the curve's max-magnitude point.
+        let max_idx = report
+            .corr_curve
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap())
+            .unwrap()
+            .0;
+        assert_eq!(max_idx, peak_idx);
+    }
+
+    #[test]
+    fn inverted_curve_peak_is_negative() {
+        let main = band_limited_noise(48_000, 5);
+        let k = 250i64;
+        let mut reference = delayed_copy(&main, k);
+        for x in &mut reference {
+            *x = -*x;
+        }
+        let report = analyze_detailed(&main, &reference, 1000);
+        let r = report.outcome.expect("must detect");
+        assert!(r.inverted);
+        let v = report.corr_curve[(1000 + k) as usize];
+        assert!(v < 0.0, "inverted peak must be negative, got {v}");
+        assert!((v + r.confidence).abs() < 1e-3);
+    }
+
+    #[test]
+    fn low_confidence_still_returns_curve() {
+        let main = noise(48_000, 123);
+        let reference = noise(48_000, 456);
+        let report = analyze_detailed(&main, &reference, 1000);
+        assert_eq!(report.outcome, Err(RejectReason::LowConfidence));
+        assert_eq!(report.corr_curve.len(), 2 * 1000 + 1);
+        let max_abs = report.corr_curve.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(max_abs < CONFIDENCE_THRESHOLD);
+    }
+
+    #[test]
+    fn early_rejects_have_empty_curves() {
+        let quiet = vec![0.0f32; 48_000];
+        let loud = band_limited_noise(48_000, 3);
+        let report = analyze_detailed(&quiet, &loud, 1000);
+        assert_eq!(report.outcome, Err(RejectReason::Silence));
+        assert!(report.corr_curve.is_empty());
+        let report = analyze_detailed(&loud[..1], &loud[..1], 1000);
+        assert_eq!(report.outcome, Err(RejectReason::TooShort));
+        assert!(report.corr_curve.is_empty());
     }
 }

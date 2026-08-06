@@ -1,13 +1,16 @@
 //! AudioAlign: time-aligns the main input to a sidechain reference.
 //!
-//! Headless plugin. The two load-bearing design decisions — the persisted-
-//! atomics state model and the latency/PDC trick — are documented in
-//! `params.rs` and `CLAUDE.md`.
+//! The three load-bearing design decisions — the persisted-atomics state
+//! model, the latency/PDC trick, and the GUI threading rules (the editor
+//! never touches the capture buffers) — are documented in `params.rs`,
+//! `shared.rs`, and `CLAUDE.md`.
 
 pub mod analysis;
 pub mod capture;
 pub mod dsp;
+pub mod editor;
 pub mod params;
+pub mod shared;
 
 use nih_plug::prelude::*;
 use std::sync::atomic::Ordering;
@@ -17,12 +20,14 @@ use capture::{CaptureState, PHASE_ANALYZING, PHASE_CAPTURING, PHASE_IDLE};
 use dsp::delay::{AlignDelay, TapSpec};
 use dsp::fractional::FIR_CENTER;
 use params::{AudioAlignParams, PolarityMode, CAPTURE_MAX_SECS, MAX_SHIFT_MAX_MS, TRIM_RANGE_MS};
+use shared::{AnalysisSnapshot, GuiShared};
 
 const CROSSFADE_SECONDS: f32 = 0.05;
 
 pub struct AudioAlign {
     params: Arc<AudioAlignParams>,
     capture: Arc<CaptureState>,
+    shared: Arc<GuiShared>,
     delay: AlignDelay,
     sample_rate: f32,
     prev_capture: bool,
@@ -38,6 +43,7 @@ impl Default for AudioAlign {
         Self {
             params: Arc::new(AudioAlignParams::default()),
             capture: Arc::new(CaptureState::new()),
+            shared: Arc::new(GuiShared::default()),
             // Placeholder until `initialize()` knows the real sample rate.
             delay: AlignDelay::new(2, 1024, 64),
             sample_rate: 48_000.0,
@@ -136,19 +142,29 @@ impl Plugin for AudioAlign {
         self.params.clone()
     }
 
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        editor::create(
+            self.params.clone(),
+            self.shared.clone(),
+            self.capture.handle(),
+        )
+    }
+
     fn task_executor(&mut self) -> TaskExecutor<Self> {
         let capture = self.capture.clone();
         let params = self.params.clone();
+        let shared = self.shared.clone();
         Box::new(move |task| match task {
             Task::Analyze => {
                 {
                     let data = capture.data.borrow();
-                    match analysis::analyze(
+                    let report = analysis::analyze_detailed(
                         &data.main[..data.filled],
                         &data.reference[..data.filled],
                         data.max_shift_samples,
-                    ) {
-                        Some(result) => {
+                    );
+                    match report.outcome {
+                        Ok(result) => {
                             let offset_ms =
                                 (result.offset_samples / data.sample_rate as f64 * 1000.0) as f32;
                             params
@@ -169,13 +185,26 @@ impl Plugin for AudioAlign {
                                 result.confidence
                             );
                         }
-                        None => {
+                        Err(reason) => {
                             nih_log!(
-                                "AudioAlign: analysis rejected (silence or low correlation); \
-                                 keeping previous offset"
+                                "AudioAlign: analysis rejected ({:?}); keeping previous offset",
+                                reason
                             );
                         }
                     }
+                    // Freeze everything the GUI needs. Copying here — on the
+                    // background thread, inside the Analyzing phase where this
+                    // task owns the borrow — is the only path waveform data
+                    // ever takes to the editor.
+                    let snapshot = Arc::new(AnalysisSnapshot {
+                        main: data.main[..data.filled].to_vec(),
+                        reference: data.reference[..data.filled].to_vec(),
+                        sample_rate: data.sample_rate,
+                        max_shift_samples: report.max_shift_samples,
+                        corr: report.corr_curve,
+                        outcome: report.outcome,
+                    });
+                    *shared.snapshot.lock().unwrap() = Some(snapshot);
                 }
                 capture.phase.store(PHASE_IDLE, Ordering::Release);
             }
@@ -208,6 +237,15 @@ impl Plugin for AudioAlign {
         let latency = self.latency_samples();
         context.set_latency_samples(latency);
         self.last_latency = latency;
+
+        // Mirror the values the GUI needs for its alignment math. Like every
+        // other clamp, these derive from the *reported* latency.
+        self.shared
+            .window_samples
+            .store(self.reported_window_samples() as u32, Ordering::Relaxed);
+        self.shared
+            .sample_rate
+            .store(self.sample_rate, Ordering::Relaxed);
 
         // Jump straight to the restored session's target instead of fading in
         // from a default position.
@@ -249,11 +287,13 @@ impl Plugin for AudioAlign {
         // path violates that (clap-validator flags it). Max Shift edits apply
         // on the next initialize() — until then all math uses last_latency.
 
-        // Rising edge on Capture starts a new capture, but only from Idle: a
-        // toggle during a running capture/analysis is ignored.
+        // A rising edge on the Capture param or a GUI request starts a new
+        // capture, but only from Idle: a toggle during a running capture or
+        // analysis is ignored. The GUI request is consumed every block so a
+        // stale click never latches longer than one block.
+        let gui_request = self.capture.request.swap(false, Ordering::AcqRel);
         let capture_on = self.params.capture.value();
-        if capture_on
-            && !self.prev_capture
+        if ((capture_on && !self.prev_capture) || gui_request)
             && self.capture.phase.load(Ordering::Acquire) == PHASE_IDLE
         {
             {
@@ -264,14 +304,18 @@ impl Plugin for AudioAlign {
                 data.filled = 0;
                 data.max_shift_samples = self.reported_window_samples();
                 data.sample_rate = self.sample_rate;
+                self.capture
+                    .target
+                    .store(data.target_len as u32, Ordering::Relaxed);
             }
+            self.capture.progress.store(0, Ordering::Relaxed);
             self.capture.phase.store(PHASE_CAPTURING, Ordering::Release);
         }
         self.prev_capture = capture_on;
 
         // Record the pre-delay input while capturing.
         if self.capture.phase.load(Ordering::Acquire) == PHASE_CAPTURING {
-            let full = {
+            let (filled, full) = {
                 let mut data_guard = self.capture.data.borrow_mut();
                 // Reborrow as a plain &mut so disjoint field borrows work.
                 let data = &mut *data_guard;
@@ -304,8 +348,11 @@ impl Plugin for AudioAlign {
                     }
                 }
                 data.filled += to_copy;
-                data.filled >= data.target_len
+                (data.filled, data.filled >= data.target_len)
             };
+            self.capture
+                .progress
+                .store(filled as u32, Ordering::Relaxed);
             if full {
                 self.capture.phase.store(PHASE_ANALYZING, Ordering::Release);
                 context.execute_background(Task::Analyze);

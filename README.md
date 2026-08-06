@@ -6,6 +6,11 @@ eliminating the phase cancellation and comb filtering caused by the distance bet
 Sub-sample precision, automatic polarity detection, and support for *negative* shifts
 (moving a track earlier) via latency compensation.
 
+The plugin window shows both captured waveforms overlaid (the main signal slides as the
+alignment changes) and the cross-correlation curve with a marker at the detected peak plus a
+live marker that tracks the applied shift — drag either display left/right to adjust Manual
+Trim, hold Shift for fine control, scroll/pinch to pan and zoom.
+
 ## How to use it
 
 1. Put **AudioAlign on the track you want to shift** (usually the more distant mic).
@@ -14,10 +19,12 @@ Sub-sample precision, automatic polarity detection, and support for *negative* s
    - **Ableton Live** (VST3): choose the reference track in the device header's sidechain chooser.
    - **Bitwig** (CLAP): same, via the device's sidechain chooser.
 3. **Play a loud, representative section** of the song.
-4. While it plays, **toggle the "Capture" parameter on**. The plugin records a few seconds of
-   both signals, measures the offset by cross-correlation, and glides click-free onto the
-   corrected alignment. The result is stored with your session.
-5. To re-analyze, toggle Capture **off and then on** again.
+4. While it plays, **click "Capture"** in the plugin window (or toggle the "Capture"
+   parameter on, e.g. from host automation). The plugin records a few seconds of both
+   signals, measures the offset by cross-correlation, and glides click-free onto the
+   corrected alignment. The waveforms, correlation curve, detected offset, polarity, and
+   confidence appear in the window, and the result is stored with your session.
+5. To re-analyze, click Capture again (or toggle the parameter off and on).
 
 ### Parameters
 
@@ -53,7 +60,9 @@ cargo xtask bundle audio_align --release
 Bundles appear in `target/bundled/`; copy `AudioAlign.clap` to `~/Library/Audio/Plug-Ins/CLAP/`
 and `AudioAlign.vst3` to `~/Library/Audio/Plug-Ins/VST3/` (macOS).
 
-Run the DSP test suite with `cargo test --release`.
+Run the DSP test suite with `cargo test --release`. To eyeball the GUI panels without a DAW,
+`cargo run --example gui_preview --features gui-preview` renders them with synthetic data to
+`gui_preview.png` / `gui_preview_zoom.png`.
 
 ## License
 
