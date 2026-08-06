@@ -30,7 +30,9 @@ pub struct CaptureState {
     pub phase: AtomicU8,
     /// GUI capture request. `process()` consumes (swaps to false) this every
     /// block and treats a `true` like a rising edge on the `capture` param;
-    /// a request that races a non-idle phase is simply dropped.
+    /// a request that races a non-idle phase is simply dropped. `reset()`
+    /// and `initialize()` also clear it, so a click made while the host
+    /// wasn't processing can't fire a surprise capture when playback resumes.
     pub request: AtomicBool,
     /// Capture progress in samples, for display only (Relaxed, approximate).
     pub progress: AtomicU32,
@@ -74,6 +76,22 @@ impl CaptureHandle {
 
     pub fn request_capture(&self) {
         self.0.request.store(true, Ordering::Release);
+    }
+
+    /// Aborts a capture in progress. GUI escape hatch: if the host stops
+    /// calling `process()` mid-capture, the phase machine freezes in
+    /// Capturing until processing resumes — this lets the user back out.
+    /// Safe from the GUI thread: the audio thread's borrows never span
+    /// blocks, and a capture that completes concurrently simply proceeds to
+    /// analysis (the CAS just fails).
+    pub fn cancel_capture(&self) {
+        self.0.request.store(false, Ordering::Relaxed);
+        let _ = self.0.phase.compare_exchange(
+            PHASE_CAPTURING,
+            PHASE_IDLE,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
     }
 }
 

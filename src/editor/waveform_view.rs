@@ -30,23 +30,33 @@ pub struct WaveViewState {
     pub cache: Option<WaveCache>,
 }
 
+/// Key for the shift-independent envelopes (reference + unshifted ghost).
 #[derive(PartialEq, Clone, Copy)]
-struct WaveKey {
+struct StaticKey {
     snap: usize,
     start_bits: u64,
     span_bits: u64,
     cols: usize,
-    net_bits: u32,
-    flip: bool,
     show_raw: bool,
 }
 
+/// Key for the main envelope, which additionally depends on the applied
+/// shift and polarity flip. Split from [`StaticKey`] so a trim drag only
+/// re-decimates the one envelope that actually changed.
+#[derive(PartialEq, Clone, Copy)]
+struct MainKey {
+    stat: StaticKey,
+    net_bits: u32,
+    flip: bool,
+}
+
 pub struct WaveCache {
-    key: WaveKey,
+    static_key: StaticKey,
+    main_key: MainKey,
     reference: Vec<MinMax>,
-    main: Vec<MinMax>,
     /// Unshifted main ghost; empty unless `show_raw`.
     raw: Vec<MinMax>,
+    main: Vec<MinMax>,
     /// Display gain: normalizes the tallest sample of either capture. Only
     /// recomputed when the snapshot changes (`gain_snap` key).
     gain: f32,
@@ -160,33 +170,53 @@ pub fn show(
         vs.view = Some(view);
     }
 
-    // --- Envelopes (cached) ---
+    // --- Envelopes (cached; the shift-dependent main envelope is keyed
+    // separately so a trim drag doesn't re-decimate reference and ghost) ---
     let cols = (rect.width().floor() as usize).max(8);
-    let key = WaveKey {
-        snap: Arc::as_ptr(snap) as usize,
+    let snap_addr = Arc::as_ptr(snap) as usize;
+    let static_key = StaticKey {
+        snap: snap_addr,
         start_bits: view.start_s.to_bits(),
         span_bits: view.span_s.to_bits(),
         cols,
-        net_bits: args.net_ms.to_bits(),
-        flip: args.flip_main,
         show_raw: *show_raw,
     };
-    let cache_valid = vs.cache.as_ref().is_some_and(|c| c.key == key);
-    if !cache_valid {
-        let gain_snap = Arc::as_ptr(snap) as usize;
-        let gain = match vs.cache.as_ref() {
-            Some(c) if c.gain_snap == gain_snap => c.gain,
-            _ => {
-                let peak = snap
-                    .main
-                    .iter()
-                    .chain(&snap.reference)
-                    .fold(0.0f32, |m, &v| m.max(v.abs()));
-                1.0 / peak.max(1e-6)
-            }
-        };
-        let start = view.start_s * sr;
-        let span = view.span_s * sr;
+    let main_key = MainKey {
+        stat: static_key,
+        net_bits: args.net_ms.to_bits(),
+        flip: args.flip_main,
+    };
+    let start = view.start_s * sr;
+    let span = view.span_s * sr;
+    let (old_static, old_main, old_gain) = match vs.cache.take() {
+        Some(c) => (
+            (c.static_key == static_key).then_some((c.reference, c.raw)),
+            (c.main_key == main_key).then_some(c.main),
+            (c.gain_snap == snap_addr).then_some(c.gain),
+        ),
+        None => (None, None, None),
+    };
+    let gain = old_gain.unwrap_or_else(|| {
+        let peak = snap
+            .main
+            .iter()
+            .chain(&snap.reference)
+            .fold(0.0f32, |m, &v| m.max(v.abs()));
+        // Cap the normalization so a near-silent (rejected) capture still
+        // looks silent instead of being blown up to full scale.
+        (1.0 / peak.max(1e-6)).min(64.0)
+    });
+    let (reference, raw) = old_static.unwrap_or_else(|| {
+        (
+            min_max_decimate(&snap.reference, start, span, cols),
+            if *show_raw {
+                min_max_decimate(&snap.main, start, span, cols)
+            } else {
+                Vec::new()
+            },
+        )
+    });
+    let main = old_main.unwrap_or_else(|| {
         let main_start = (view.start_s - args.net_ms as f64 / 1000.0) * sr;
         let mut main = min_max_decimate(&snap.main, main_start, span, cols);
         if args.flip_main {
@@ -197,37 +227,53 @@ pub fn show(
                 };
             }
         }
-        vs.cache = Some(WaveCache {
-            key,
-            reference: min_max_decimate(&snap.reference, start, span, cols),
-            main,
-            raw: if *show_raw {
-                min_max_decimate(&snap.main, start, span, cols)
-            } else {
-                Vec::new()
-            },
-            gain,
-            gain_snap,
-        });
-    }
+        main
+    });
+    vs.cache = Some(WaveCache {
+        static_key,
+        main_key,
+        reference,
+        raw,
+        main,
+        gain,
+        gain_snap: snap_addr,
+    });
     let cache = vs.cache.as_ref().unwrap();
 
     // --- Grid ---
     draw_time_grid(&painter, rect, &view);
 
     // --- Waveforms: reference first, ghost, then main on top. Translucent so
-    // the overlap region shows both signals.
+    // the overlap region shows both signals. Over-zoomed views (interpolated
+    // buckets) draw as connected lines instead of per-column stubs.
+    let as_line = span / (cols as f64) < 1.0;
     let half = rect.height() / 2.0 - 4.0;
     let y_of = |v: f32| rect.center().y - (v * cache.gain).clamp(-1.0, 1.0) * half;
-    draw_envelope(&painter, rect, &cache.raw, y_of, TEXT_DIM.gamma_multiply(0.4));
-    draw_envelope(&painter, rect, &cache.reference, y_of, ACCENT_REF.gamma_multiply(0.75));
-    draw_envelope(&painter, rect, &cache.main, y_of, ACCENT_MAIN.gamma_multiply(0.62));
+    draw_envelope(&painter, rect, &cache.raw, y_of, TEXT_DIM.gamma_multiply(0.4), as_line);
+    draw_envelope(
+        &painter,
+        rect,
+        &cache.reference,
+        y_of,
+        ACCENT_REF.gamma_multiply(0.75),
+        as_line,
+    );
+    draw_envelope(
+        &painter,
+        rect,
+        &cache.main,
+        y_of,
+        ACCENT_MAIN.gamma_multiply(0.62),
+        as_line,
+    );
 
     draw_capture_overlay(&painter, rect, args.capturing);
 
     PanelOutput {
         response,
-        ms_per_px: Some(view.span_s * 1000.0 / rect.width() as f64),
+        // A degenerate panel width would give an absurd (or negative, or
+        // non-finite) drag axis; disable the gesture instead.
+        ms_per_px: (rect.width() > 1.0).then(|| view.span_s * 1000.0 / rect.width() as f64),
     }
 }
 
@@ -255,8 +301,20 @@ fn draw_envelope(
     env: &[MinMax],
     y_of: impl Fn(f32) -> f32,
     color: Color32,
+    as_line: bool,
 ) {
     if env.is_empty() {
+        return;
+    }
+    if as_line {
+        // Over-zoomed: the buckets are single interpolated values (min ==
+        // max); connect them so the waveform reads as a line, not dots.
+        let points: Vec<Pos2> = env
+            .iter()
+            .enumerate()
+            .map(|(i, mm)| Pos2::new(rect.left() + i as f32 + 0.5, y_of(mm.max)))
+            .collect();
+        painter.add(egui::Shape::line(points, Stroke::new(1.5, color)));
         return;
     }
     let stroke = Stroke::new(1.0, color);

@@ -68,6 +68,11 @@ struct EditorState {
     corr_cache: Option<CorrCache>,
     show_raw: bool,
     trim_drag: Option<TrimDrag>,
+    /// Last trim value this editor sent. `set_parameter` only queues the
+    /// change until the audio thread drains the event queue, so gestures
+    /// base follow-up edits on this instead of the (possibly stale)
+    /// parameter; cleared once the parameter catches up.
+    pending_trim: Option<f32>,
 }
 
 pub fn create(
@@ -126,6 +131,14 @@ fn draw_ui(
     let (net_ms, net_clamped) = net_shift(params, shared);
     let phase = capture.phase();
 
+    // Once the host has applied our queued trim edit, the parameter is
+    // authoritative again (also lets external automation take over).
+    if let Some(p) = state.pending_trim {
+        if (params.trim.value() - p).abs() < 0.005 {
+            state.pending_trim = None;
+        }
+    }
+
     status_strip(ui, params, capture, state.snapshot.as_deref(), net_ms, net_clamped);
     ui.separator();
 
@@ -157,8 +170,22 @@ fn draw_ui(
         flip_main,
         capturing,
     };
-    let wave_out = waveform_view::show(ui, wave_h, &wave_args, &mut state.show_raw, &mut state.wave);
-    handle_trim_gestures(ui, &wave_out, setter, params, &mut state.trim_drag);
+    // push_id: the rejection banner above is emitted conditionally, and
+    // without an explicit scope its appearance would shift the panels'
+    // auto-Ids — killing an in-flight drag's Response identity mid-gesture.
+    let wave_out = ui
+        .push_id("wave-panel", |ui| {
+            waveform_view::show(ui, wave_h, &wave_args, &mut state.show_raw, &mut state.wave)
+        })
+        .inner;
+    handle_trim_gestures(
+        ui,
+        &wave_out,
+        setter,
+        params,
+        &mut state.trim_drag,
+        &mut state.pending_trim,
+    );
 
     ui.add_space(4.0);
 
@@ -176,14 +203,25 @@ fn draw_ui(
         align_on: params.align_on.value(),
         active_window_ms: active_window_ms(shared),
     };
-    let corr_out = correlation_view::show(
+    let corr_out = ui
+        .push_id("corr-panel", |ui| {
+            correlation_view::show(
+                ui,
+                corr_h,
+                &corr_args,
+                &mut state.corr_zoom_peak,
+                &mut state.corr_cache,
+            )
+        })
+        .inner;
+    handle_trim_gestures(
         ui,
-        corr_h,
-        &corr_args,
-        &mut state.corr_zoom_peak,
-        &mut state.corr_cache,
+        &corr_out,
+        setter,
+        params,
+        &mut state.trim_drag,
+        &mut state.pending_trim,
     );
-    handle_trim_gestures(ui, &corr_out, setter, params, &mut state.trim_drag);
 
     ui.add_space(6.0);
     control_bar(ui, setter, params, capture, phase);
@@ -208,12 +246,11 @@ fn net_shift(params: &AudioAlignParams, shared: &GuiShared) -> (f32, bool) {
 
 /// The active clamp window in ± ms; `None` before the first activation.
 fn active_window_ms(shared: &GuiShared) -> Option<f32> {
-    let w = shared.window_samples.load(Ordering::Relaxed);
+    let (w, sr) = shared.window();
     if w == 0 {
         return None;
     }
-    let sr = shared.sample_rate.load(Ordering::Relaxed).max(1.0);
-    Some(w as f32 / sr * 1000.0)
+    Some(w as f32 / sr.max(1.0) * 1000.0)
 }
 
 fn status_strip(
@@ -299,14 +336,33 @@ fn control_bar(
     phase: u8,
 ) {
     ui.horizontal(|ui| {
-        let idle = phase == PHASE_IDLE;
-        let label = if idle { "⏺ Capture" } else { "⏺ Capture…" };
-        if ui
-            .add_enabled(idle, egui::Button::new(egui::RichText::new(label).strong()))
-            .on_hover_text("Record both inputs and re-detect the offset")
-            .clicked()
-        {
-            capture.request_capture();
+        match phase {
+            // A host that stops processing mid-capture freezes the phase
+            // machine at Capturing; the Cancel button is the escape hatch.
+            PHASE_CAPTURING => {
+                if ui
+                    .button(egui::RichText::new("✕ Cancel").strong())
+                    .on_hover_text("Abort the capture in progress")
+                    .clicked()
+                {
+                    capture.cancel_capture();
+                }
+            }
+            PHASE_ANALYZING => {
+                ui.add_enabled(
+                    false,
+                    egui::Button::new(egui::RichText::new("⏺ Capture…").strong()),
+                );
+            }
+            _ => {
+                if ui
+                    .button(egui::RichText::new("⏺ Capture").strong())
+                    .on_hover_text("Record both inputs and re-detect the offset")
+                    .clicked()
+                {
+                    capture.request_capture();
+                }
+            }
         }
         ui.separator();
         bool_toggle(ui, setter, &params.align_on, "Align");
@@ -382,21 +438,40 @@ fn enum_selector<T: nih_plug::prelude::Enum + PartialEq + Copy + 'static>(
 
 /// Drag-to-trim plus keyboard nudge, shared by both panels. Dragging right
 /// slides the main waveform later (bigger applied shift), matching the
-/// correlation panel's x-axis 1:1; hold Shift for 10× finer control.
+/// correlation panel's x-axis 1:1; hold Shift for 10× finer drags.
 fn handle_trim_gestures(
     ui: &egui::Ui,
     panel: &PanelOutput,
     setter: &ParamSetter,
     params: &AudioAlignParams,
     drag: &mut Option<TrimDrag>,
+    pending_trim: &mut Option<f32>,
 ) {
-    let Some(ms_per_px) = panel.ms_per_px else { return };
     let response = &panel.response;
+    let align_on = params.align_on.value();
+
+    // Close an open gesture FIRST — before any early return — so a mid-drag
+    // snapshot swap (the panel loses its axis) or an Align toggle can never
+    // leave the host's begin/end bracket unbalanced.
+    if drag.is_some() && (response.drag_stopped() || !align_on) {
+        setter.end_set_parameter(&params.trim);
+        *drag = None;
+    }
+    // With alignment off neither panel displays the shift, so a gesture
+    // would silently slew trim with zero visual feedback; stay inert.
+    if !align_on {
+        return;
+    }
+    let Some(ms_per_px) = panel.ms_per_px else { return };
 
     if response.drag_started() {
+        if drag.is_some() {
+            // A previous gesture never closed (defensive); balance it.
+            setter.end_set_parameter(&params.trim);
+        }
         setter.begin_set_parameter(&params.trim);
         *drag = Some(TrimDrag {
-            accum_ms: params.trim.value() as f64,
+            accum_ms: pending_trim.unwrap_or_else(|| params.trim.value()) as f64,
         });
     }
     if response.dragged() {
@@ -406,17 +481,20 @@ fn handle_trim_gestures(
             } else {
                 1.0
             };
-            d.accum_ms += response.drag_delta().x as f64 * ms_per_px * fine;
-            setter.set_parameter(&params.trim, snap_trim(d.accum_ms));
+            // Clamp the accumulator itself: an overshooting drag must
+            // reverse immediately, not after re-traversing the overshoot.
+            d.accum_ms = (d.accum_ms + response.drag_delta().x as f64 * ms_per_px * fine)
+                .clamp(-TRIM_RANGE_MS as f64, TRIM_RANGE_MS as f64);
+            let new = snap_trim(d.accum_ms);
+            setter.set_parameter(&params.trim, new);
+            *pending_trim = Some(new);
         }
     }
-    if response.drag_stopped() && drag.is_some() {
-        setter.end_set_parameter(&params.trim);
-        *drag = None;
-    }
 
-    // Arrow-key nudge while hovering: ±0.01 ms, Shift for ±0.1 ms.
-    if response.hovered() && drag.is_none() {
+    // Arrow-key nudge while hovering: ±0.01 ms, Shift for ±0.1 ms. Skipped
+    // while something else (e.g. a ParamSlider's text entry) owns the
+    // keyboard.
+    if response.hovered() && drag.is_none() && !ui.ctx().wants_keyboard_input() {
         let (left, right, shift) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowLeft),
@@ -427,16 +505,22 @@ fn handle_trim_gestures(
         if left || right {
             let step = if shift { 0.1 } else { 0.01 };
             let delta = if right { step } else { -step };
-            let new = snap_trim(params.trim.value() as f64 + delta);
+            let base = pending_trim.unwrap_or_else(|| params.trim.value());
+            let new = snap_trim(base as f64 + delta);
             setter.begin_set_parameter(&params.trim);
             setter.set_parameter(&params.trim, new);
             setter.end_set_parameter(&params.trim);
+            *pending_trim = Some(new);
         }
     }
 }
 
 /// Clamp to the trim range and snap to the parameter's 0.01 ms step.
+/// Non-finite input (defense against a degenerate panel axis) maps to 0.
 fn snap_trim(ms: f64) -> f32 {
+    if !ms.is_finite() {
+        return 0.0;
+    }
     let clamped = ms.clamp(-TRIM_RANGE_MS as f64, TRIM_RANGE_MS as f64);
     ((clamped / 0.01).round() * 0.01) as f32
 }

@@ -6,10 +6,8 @@
 //! values the GUI needs for its own alignment math. The audio thread never
 //! touches the `Mutex`.
 
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-
-use atomic_float::AtomicF32;
 
 use crate::analysis::{AnalysisResult, RejectReason};
 
@@ -42,20 +40,35 @@ pub struct AnalysisSnapshot {
 pub struct GuiShared {
     /// Latest analysis snapshot.
     pub snapshot: Mutex<Option<Arc<AnalysisSnapshot>>>,
-    /// Mirror of `reported_window_samples()` — the active clamp window. The
-    /// GUI must derive its clamping from this, never from the Max Shift knob,
-    /// to stay in sync with the latency actually reported to the host.
-    pub window_samples: AtomicU32,
-    /// Current sample rate, for converting the window to milliseconds.
-    pub sample_rate: AtomicF32,
+    /// Mirror of `reported_window_samples()` (high 32 bits) packed with the
+    /// sample rate's bits (low 32). The two are one logical value, and a
+    /// single atomic keeps a GUI frame from ever pairing a new window with a
+    /// stale sample rate across a rate change. Written from `initialize()`;
+    /// a window of 0 means "not activated yet". The GUI must derive its
+    /// clamping from this, never from the Max Shift knob, to stay in sync
+    /// with the latency actually reported to the host.
+    window_and_rate: AtomicU64,
+}
+
+impl GuiShared {
+    /// Called from `initialize()` only.
+    pub fn set_window(&self, window_samples: u32, sample_rate: f32) {
+        let packed = ((window_samples as u64) << 32) | sample_rate.to_bits() as u64;
+        self.window_and_rate.store(packed, Ordering::Relaxed);
+    }
+
+    /// `(window_samples, sample_rate)` as one consistent pair.
+    pub fn window(&self) -> (u32, f32) {
+        let packed = self.window_and_rate.load(Ordering::Relaxed);
+        ((packed >> 32) as u32, f32::from_bits(packed as u32))
+    }
 }
 
 impl Default for GuiShared {
     fn default() -> Self {
         Self {
             snapshot: Mutex::new(None),
-            window_samples: AtomicU32::new(0),
-            sample_rate: AtomicF32::new(48_000.0),
+            window_and_rate: AtomicU64::new(48_000.0f32.to_bits() as u64),
         }
     }
 }

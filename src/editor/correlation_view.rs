@@ -266,6 +266,11 @@ pub fn show(
 
     // --- Live (dashed) marker at the applied shift ---
     let live_color = if args.clamped { ACCENT_WARN } else { ACCENT_LIVE };
+    // Marker and readout both use the clamped lag so the dot always sits on
+    // the drawn curve; a shift beyond the snapshot's search window (possible
+    // after a Max Shift change without a recapture) is reported as off-curve
+    // instead of a bogus r of 0.
+    let on_curve = (args.net_ms as f64).abs() <= full_ms;
     let lag = (args.net_ms as f64).clamp(x0, x1);
     let x = x_of(lag);
     painter.extend(Shape::dashed_line(
@@ -274,10 +279,12 @@ pub fn show(
         5.0,
         4.0,
     ));
-    let r = sample_linear(&snap.corr, idx_of(args.net_ms as f64));
+    let r = sample_linear(&snap.corr, idx_of(lag));
     painter.circle_filled(Pos2::new(x, y_of(r)), 3.5, live_color);
     let readout = if !args.align_on {
         "alignment off".to_string()
+    } else if !on_curve {
+        format!("off curve @ {:+.2} ms", args.net_ms)
     } else if args.clamped {
         format!("r {r:+.2} @ {:+.2} ms (clamped)", args.net_ms)
     } else {
@@ -299,6 +306,8 @@ pub fn show(
 
     PanelOutput {
         response,
-        ms_per_px: Some(span_ms / rect.width() as f64),
+        // A degenerate panel width would give an absurd (or negative, or
+        // non-finite) drag axis; disable the gesture instead.
+        ms_per_px: (rect.width() > 1.0).then(|| span_ms / rect.width() as f64),
     }
 }

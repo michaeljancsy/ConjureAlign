@@ -156,7 +156,13 @@ impl Plugin for AudioAlign {
         let shared = self.shared.clone();
         Box::new(move |task| match task {
             Task::Analyze => {
-                {
+                // Everything that reads `data` stays inside this scope; the
+                // snapshot mutex is deliberately touched only AFTER the
+                // borrow drops. The GUI locks that mutex every frame, and
+                // blocking here while holding the borrow would extend the
+                // window in which `initialize()`'s `allocate()` could
+                // collide with it.
+                let snapshot = {
                     let data = capture.data.borrow();
                     let report = analysis::analyze_detailed(
                         &data.main[..data.filled],
@@ -196,16 +202,16 @@ impl Plugin for AudioAlign {
                     // background thread, inside the Analyzing phase where this
                     // task owns the borrow — is the only path waveform data
                     // ever takes to the editor.
-                    let snapshot = Arc::new(AnalysisSnapshot {
+                    Arc::new(AnalysisSnapshot {
                         main: data.main[..data.filled].to_vec(),
                         reference: data.reference[..data.filled].to_vec(),
                         sample_rate: data.sample_rate,
                         max_shift_samples: report.max_shift_samples,
                         corr: report.corr_curve,
                         outcome: report.outcome,
-                    });
-                    *shared.snapshot.lock().unwrap() = Some(snapshot);
-                }
+                    })
+                };
+                *shared.snapshot.lock().unwrap() = Some(snapshot);
                 capture.phase.store(PHASE_IDLE, Ordering::Release);
             }
         })
@@ -231,6 +237,24 @@ impl Plugin for AudioAlign {
         let max_delay = 2 * max_shift_max + trim_max + FIR_CENTER + 1;
         let fade_len = (CROSSFADE_SECONDS * self.sample_rate) as usize;
         self.delay = AlignDelay::new(channels, max_delay, fade_len);
+
+        // An in-flight analysis holds a borrow of the capture buffers on the
+        // background thread, and `allocate()`'s `borrow_mut()` would panic
+        // across the FFI boundary if it collided (hosts re-run initialize()
+        // after state loads with no task drain). Analysis takes tens of
+        // milliseconds — wait it out, bounded in case something is wedged.
+        for _ in 0..500 {
+            if self.capture.phase.load(Ordering::Acquire) != PHASE_ANALYZING {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Drop any stale GUI capture request and progress so a click made
+        // while the host wasn't processing can't fire a surprise capture on
+        // the first block, and the editor can't show a stale percentage.
+        self.capture.request.store(false, Ordering::Relaxed);
+        self.capture.progress.store(0, Ordering::Relaxed);
+        self.capture.target.store(0, Ordering::Relaxed);
         self.capture
             .allocate(CAPTURE_MAX_SECS * self.sample_rate as usize, self.sample_rate);
 
@@ -238,14 +262,11 @@ impl Plugin for AudioAlign {
         context.set_latency_samples(latency);
         self.last_latency = latency;
 
-        // Mirror the values the GUI needs for its alignment math. Like every
-        // other clamp, these derive from the *reported* latency.
+        // Mirror the values the GUI needs for its alignment math (one packed
+        // atomic, so no frame ever pairs a new window with a stale rate).
+        // Like every other clamp, this derives from the *reported* latency.
         self.shared
-            .window_samples
-            .store(self.reported_window_samples() as u32, Ordering::Relaxed);
-        self.shared
-            .sample_rate
-            .store(self.sample_rate, Ordering::Relaxed);
+            .set_window(self.reported_window_samples() as u32, self.sample_rate);
 
         // Jump straight to the restored session's target instead of fading in
         // from a default position.
@@ -261,8 +282,11 @@ impl Plugin for AudioAlign {
 
     fn reset(&mut self) {
         self.delay.reset();
-        // Abort a capture in flight; a running analysis keeps its buffers and
-        // finishes on its own.
+        // Abort a capture in flight and drop any queued GUI capture request:
+        // reset() fires when processing resumes, and a click made while the
+        // host wasn't processing must not start a surprise capture now. A
+        // running analysis keeps its buffers and finishes on its own.
+        self.capture.request.store(false, Ordering::Relaxed);
         let _ = self.capture.phase.compare_exchange(
             PHASE_CAPTURING,
             PHASE_IDLE,
@@ -289,8 +313,9 @@ impl Plugin for AudioAlign {
 
         // A rising edge on the Capture param or a GUI request starts a new
         // capture, but only from Idle: a toggle during a running capture or
-        // analysis is ignored. The GUI request is consumed every block so a
-        // stale click never latches longer than one block.
+        // analysis is ignored. The GUI request is consumed every block while
+        // running, and cleared by reset()/initialize(), so a stale click
+        // can't fire a capture long after the fact.
         let gui_request = self.capture.request.swap(false, Ordering::AcqRel);
         let capture_on = self.params.capture.value();
         if ((capture_on && !self.prev_capture) || gui_request)
