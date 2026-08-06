@@ -58,7 +58,7 @@ fn exact_delayed_copy(signal: &[f32], delay: f64) -> Vec<f32> {
         *c *= realfft::num_complex::Complex::new(phase.cos(), phase.sin());
         // The inverse real FFT requires purely real DC/Nyquist bins; zeroing
         // the Nyquist imaginary part discards un-delayable content there.
-        if k == nyquist && n % 2 == 0 {
+        if k == nyquist && n.is_multiple_of(2) {
             c.im = 0.0;
         }
     }

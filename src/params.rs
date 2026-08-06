@@ -1,13 +1,15 @@
 //! The whole state model lives here.
 //!
-//! This plugin is headless: there is no GUI, hence no `ParamSetter`, hence NO
-//! WAY for the plugin to write its own host-visible parameters. Analysis
-//! results are therefore not parameters at all — they are `#[persist]` atomics
-//! that the background task writes, the audio thread reads, and nih-plug
+//! Analysis results are NOT host parameters. The editor could write params via
+//! its `ParamSetter`, but the *background analysis task* cannot, and results
+//! must update even with no editor open (the plugin still works headless from
+//! the host's generic UI). They are therefore `#[persist]` atomics that the
+//! background task writes, the audio thread and GUI read, and nih-plug
 //! serializes into the DAW session.
 
 use atomic_float::AtomicF32;
 use nih_plug::prelude::*;
+use nih_plug_egui::EguiState;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -51,8 +53,10 @@ impl CaptureTime {
 
 #[derive(Params)]
 pub struct AudioAlignParams {
-    /// Rising edge starts a capture. The plugin cannot un-toggle this
-    /// (headless); to re-analyze, the user toggles it off and on again.
+    /// Rising edge starts a capture — the host-automation / generic-UI path.
+    /// The plugin never un-toggles it; to re-analyze from here, toggle off and
+    /// on again. The editor's Capture button bypasses this param entirely via
+    /// `CaptureState::request`.
     #[id = "capture"]
     pub capture: BoolParam,
 
@@ -84,10 +88,16 @@ pub struct AudioAlignParams {
     pub detected_offset_ms: Arc<AtomicF32>,
     #[persist = "detected-polarity-inverted"]
     pub detected_polarity: Arc<AtomicBool>,
-    /// Peak normalized correlation of the last accepted analysis, for display
-    /// once there is a GUI. Not used for control.
+    /// Peak normalized correlation of the last accepted analysis, shown in
+    /// the editor. Not used for control.
     #[persist = "detected-confidence"]
     pub detected_confidence: Arc<AtomicF32>,
+
+    /// Editor window state (size), persisted so the window reopens as the
+    /// user left it. Additive to the state format: old sessions without the
+    /// key fall back to the default.
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
 }
 
 impl Default for AudioAlignParams {
@@ -122,6 +132,7 @@ impl Default for AudioAlignParams {
             detected_offset_ms: Arc::new(AtomicF32::new(0.0)),
             detected_polarity: Arc::new(AtomicBool::new(false)),
             detected_confidence: Arc::new(AtomicF32::new(0.0)),
+            editor_state: EguiState::from_size(820, 560),
         }
     }
 }

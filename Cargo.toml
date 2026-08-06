@@ -15,11 +15,48 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
+# Same git URL as nih_plug so Cargo resolves both at the single locked rev.
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 realfft = "3.5"
 atomic_refcell = "0.1"
 # Must track the version nih_plug uses: its AtomicF32 implements nih_plug's
 # PersistentField, which our #[persist] fields rely on.
 atomic_float = "0.1"
+# Dev-only, behind the `gui-preview` feature: headless rendering of the editor
+# panels to a PNG (examples/gui_preview.rs). Optional regular deps instead of
+# dev-deps so plain `cargo test` never builds the wgpu stack.
+egui_kittest = { version = "0.31", features = ["wgpu"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+
+[features]
+# Dev-only: run the plugin (and its GUI) as a standalone app, no DAW needed:
+#   cargo run --bin standalone --features standalone -- --backend dummy
+# (Crashes on recent macOS — upstream baseview issue; see src/bin/standalone.rs.)
+standalone = ["nih_plug/standalone"]
+# Dev-only: render the editor panels with synthetic data to a PNG:
+#   cargo run --example gui_preview --features gui-preview
+gui-preview = ["dep:egui_kittest", "dep:image"]
+
+[[bin]]
+name = "standalone"
+path = "src/bin/standalone.rs"
+required-features = ["standalone"]
+
+[[example]]
+name = "gui_preview"
+required-features = ["gui-preview"]
+
+# The baseview rev egui-baseview pins (9a0b42c) null-derefs in
+# `becomeFirstResponder` on recent macOS: AppKit invokes it while the view is
+# being attached, before it has a window, and `msg_send![nil, ...]` trips
+# rustc's null check and aborts the host. Upstream fixed it one commit later
+# (RustAudio/baseview#204, rev 3e12973); this pins that fix. Cargo forbids
+# patching a git source with its own URL, hence the fork (unmodified mirror of
+# upstream). Drop the patch when nih-plug / egui-baseview move past the fix.
+# (Also overrides the `standalone` feature's much older baseview pin — see
+# src/bin/standalone.rs.)
+[patch."https://github.com/RustAudio/baseview.git"]
+baseview = { git = "https://github.com/michaeljancsy/baseview.git", rev = "3e1297320f6c9feb01993cba7743277b2d645211" }
 
 [profile.release]
 lto = "thin"
