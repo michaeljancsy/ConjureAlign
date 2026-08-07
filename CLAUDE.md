@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-AudioAlign: a VST3 + CLAP plugin built on nih-plug that time-aligns a mic signal (the
+AudioAlign: a VST3 + CLAP + AudioUnit v2 plugin built on nih-plug that time-aligns a mic signal (the
 plugin's main input) to a reference mic (the sidechain "Reference" input) via FFT
 cross-correlation, with sub-sample precision and automatic polarity detection. Typical use:
 two microphones on one guitar amp, one plugin instance on the track to be shifted, the other
@@ -16,10 +16,12 @@ from the host's generic parameter UI.
 
 - Build + bundle (debug): `cargo xtask bundle audio_align`
 - Build + bundle (release): `cargo xtask bundle audio_align --release`
-  - Bundles land in `target/bundled/AudioAlign.clap` and `target/bundled/AudioAlign.vst3`
+  - Bundles land in `target/bundled/AudioAlign.clap`, `.vst3` and (macOS)
+    `.component` — one cdylib with three entry points, copied into three bundles
 - macOS universal binary: `cargo xtask bundle-universal audio_align --release`
-- Install locally (macOS): copy bundles to `~/Library/Audio/Plug-Ins/CLAP/` and
-  `~/Library/Audio/Plug-Ins/VST3/`
+- Install locally (macOS): copy bundles to `~/Library/Audio/Plug-Ins/CLAP/`,
+  `~/Library/Audio/Plug-Ins/VST3/` and `~/Library/Audio/Plug-Ins/Components/`
+  (the AU must live in one of the two `Components` directories; nowhere else works)
 - Unit + integration tests (pure DSP + GUI decimation, no plugin host involved):
   `cargo test --release` (release mode: the analysis tests run multi-second captures)
 - Lint: `cargo clippy --all-targets` (and `--features gui-preview,standalone` to cover the
@@ -33,6 +35,16 @@ from the host's generic parameter UI.
   (needs rustc ≥1.95 to `cargo install`; otherwise download the binary from
   free-audio/clap-validator GitHub releases)
 - VST3 validation: `pluginval --strictness-level 10 target/bundled/AudioAlign.vst3`
+- AU validation: install the `.component`, then
+  `killall -9 AudioComponentRegistrar; auval -v aufx ALGN CONJ` (add `-strict` for the
+  pedantic pass). The `;` is deliberate — `AudioComponentRegistrar` is an on-demand daemon,
+  so `killall` exits non-zero whenever it happens to be idle, and `&&` would skip `auval`
+  without printing anything that looks like a failure. A rebuild at an unchanged version needs the `killall` to be re-scanned,
+  and the host must be restarted; `rm -rf ~/Library/Caches/AudioUnitCache` is the
+  sledgehammer. Note `auval` renders the main bus only, so it never exercises the
+  sidechain, and it loads the plugin in-process without building the Cocoa view — a green
+  `auval` says nothing about the editor or about AU sandboxing. Logic's Plug-in Manager is
+  the real test.
 - Toolchain: stable Rust. nih_plug is a git dependency (not on crates.io); Cargo.lock pins the
   rev. `atomic_float` in Cargo.toml must stay on the same version nih_plug uses, because its
   `AtomicF32` implements nih_plug's `PersistentField`.
@@ -113,6 +125,60 @@ breaking that invariant desynchronizes the applied shift from host PDC.
 lines and capture buffers are sized in `initialize()` for the parameter maxima
 (`MAX_SHIFT_MAX_MS`, 4 s captures), so no parameter change ever allocates on the audio thread.
 
+### AudioUnit v2 (clap-wrapper)
+
+`clap_wrapper::export_auv2!()` at the bottom of `lib.rs` adds a third exported entry point,
+`GetPluginFactoryAUV2`, to the same cdylib that already exports `clap_entry` and
+`GetPluginFactory`; clap-wrapper's vendored C++ translates AU calls into CLAP calls against
+our own `clap_entry`. NEVER enable clap-wrapper's `vst3` feature — it exports
+`GetPluginFactory`, `bundleEntry` and `bundleExit`, the exact three symbols
+`nih_export_vst3!` already owns, so `default-features = false` in Cargo.toml is
+load-bearing.
+
+The AU identity (`aufx` / `ALGN` / `CONJ`) lives ONLY in `bundler.toml`. nih-plug does not
+export CLAP's `clap.plugin-factory-info-as-auv2.draft0` factory, so the plist is the only
+channel an AU host has for the four-character codes. `subtype` and `manufacturer` are what
+saved Logic sessions key on — changing either orphans every project that used the plugin.
+(`CONJ` is a shared manufacturer namespace with the other ConjureDSP plugins; identity is
+the type/subtype/manufacturer *triple*, so `aufx/ALGN/CONJ` is what must stay unique.)
+
+`nih_plug_xtask` has no AU support — it sniffs exported symbols and knows only
+clap/vst2/vst3, and its Info.plist has no `AudioComponents` array — so `xtask/src/main.rs`
+writes the `.component` itself. It copies the binary nih_plug_xtask already placed in the
+CLAP bundle rather than reconstructing target/profile paths: that binary is already lipo'd
+for `bundle-universal`, so one code path covers single-arch, cross-compiled Darwin and
+universal builds.
+
+The "Reference" aux port becomes AU input bus 1 (clap-wrapper creates one AU input element
+per CLAP input port and names it from the CLAP port name), which is what Logic uses as the
+side chain for `aufx` units. An unconnected bus 1 arrives as silence — clap-wrapper
+substitutes a silent buffer when `PullInput` fails — so `aux.inputs.first()` is
+`Some(silence)` and the capture is rejected, exactly as on the CLAP/VST3 path.
+
+**Both `AUDIO_IO_LAYOUTS` are reachable from AU, but only because of a local patch.** Stock
+clap-wrapper derives `AUChannelInfo` from the *current* CLAP audio-ports config, never calls
+`audio-ports-config::select`, and rejects in `ValidFormat` any stream format whose channel
+count differs from that config's port — pinning the AU to layout 0 and advertising `[2, 2]`
+only. Since Logic filters its Audio FX menu by what a plugin can actually instantiate as,
+that made AudioAlign invisible on mono tracks. `deps/clap-wrapper-rs` is therefore a
+vendored copy of the crate carrying a patch that enumerates every config into
+`AUChannelInfo`, accepts their formats, and selects the matching one before activation —
+see `deps/PATCHES.md`. `auval` must report `[2, 2]  [1, 1]`.
+
+`auval` only ever *renders* the default (stereo) config, so it cannot cover the mono path.
+`tests/au_mono_host.c` is a small AU host that does: it forces mono, initializes, and
+renders. Its load-bearing assertion is that the "Reference" sidechain bus follows the main
+bus down to 1 channel — if it does not, `select()` never reached the plugin and the AU is
+feeding mono buffers to a plugin that believes it is stereo.
+
+The generated `AudioComponents` entry deliberately carries `resourceUsage` and NO
+`sandboxSafe` key, matching what clap-wrapper's own CMake build-helper emits — claiming
+untested sandbox-safety only buys a stricter hosting path that can fail silently, and
+upstream clap-wrapper-rs dropped the flag from its bundler for the same reason. It also
+carries `tags = ["Effects"]`: Logic files plugins into the Audio FX menu by those, and it
+understands only a fixed vocabulary, so they are spelled out in `bundler.toml` rather than
+derived from `CLAP_FEATURES`.
+
 ## Known upstream issues (do not chase these as local bugs)
 
 clap-validator 0.4.1 fails 3 state-reproducibility tests and crashes on state-invalid-random
@@ -134,7 +200,39 @@ commit after `9a0b42c` (RustAudio/baseview#204, rev `3e12973`); Cargo.toml carri
 `michaeljancsy/baseview` fork (an unmodified mirror — cargo forbids patching a git source
 with its own URL). Do NOT remove the patch until nih-plug/egui-baseview advance past the fix;
 without it the editor crashes every host on current macOS even though pluginval passed on
-older systems.
+older systems. The AU path is the likeliest of the three to trip it: clap-wrapper's
+`wrappedview.asinclude.mm` calls `gui->set_parent()` on an NSView that is not yet in a
+window, which is exactly the scenario that null-derefs.
+
+clap-wrapper 0.14.0 (vendored by the `clap-wrapper` 0.3.1 crate) has these AUv2 quirks —
+all verified against the vendored sources, none worth patching for us:
+- `WrapAsAUV2::PostConstructor` calls `SetNumberOfElements`, which resets each bus's stream
+  format, and then only re-applies the *name*, never the channel count (upstream PR #496,
+  merged to `next` only). Harmless here: AUSDK's default element format is stereo and matches
+  our *layout-0* ports, which are the ones current at `PostConstructor` time, so both input
+  busses come up 2-channel and `auval`'s default pass reports `[2, 2]`. The mono layout is
+  reached later, through `select()` + `setupAudioBusses()`, which sets every element's channel
+  count explicitly — that is what stops the missing re-apply from biting. It would bite if
+  layout 0 were ever mono or >2 channels.
+- `SaveState`/`RestoreState` both early-return `kAudioUnitErr_Uninitialized` when
+  `!IsInitialized()` (upstream issue #490; the guards are still present on every branch).
+  If a Logic project ever fails to restore the detected offset, this is the first suspect —
+  patch it directly in `deps/clap-wrapper-rs/external/clap-wrapper/`, which is a path
+  dependency, so an edit there rebuilds. (Upstream's `CLAP_WRAPPER_CPP_DIR` hook would be the
+  tidier route, but it landed after 0.3.1 and the vendored `build.rs` ignores the variable —
+  see `deps/PATCHES.md`.)
+- `auval` warns `AU implements MusicDeviceMIDIEvent but is of type 'aufx'`. Cosmetic:
+  clap-wrapper registers every AU type through `AUSDK_COMPONENT_ENTRY(AUMusicDeviceFactory,
+  …)`. Validation still succeeds.
+- Tail Time is not implemented, so `auval` warns that a recommended property is missing.
+- AUv2 offline rendering is unsupported upstream.
+- nih-plug's `ext_gui_can_resize`/`get_resize_hints` return `false`, so an AU host cannot
+  resize the editor; the plugin-driven path (`ResizableWindow` → `gui_request_resize`)
+  works.
+- The AU wrapper is compiled into the one dylib behind all three bundles, so its ObjC
+  classes register even in a CLAP/VST3 host. Loading two of our own bundles in one process
+  can log an ObjC "implemented in both" warning — harmless, both copies are the same code
+  from the same build (0.3.1 already suffixes the class names to reduce this).
 
 `cargo xtask bundle` is UNSAFE IN A `.claude/worktrees/` WORKTREE: nih_plug_xtask's
 `chdir_workspace_root()` picks the TOPMOST ancestor directory containing a `Cargo.toml`,
@@ -154,7 +252,14 @@ main checkout, plain `cargo xtask bundle` is fine.
 - Ableton Live: VST3 build; the device's header exposes a sidechain routing chooser for plugins
   declaring aux inputs — set "Audio From" to the reference track.
 - Bitwig: CLAP build; sidechain chooser in the device header.
-- Logic Pro: NOT SUPPORTED yet (Logic only loads AU; planned via clap-wrapper's AUv2 target).
+- Logic Pro: AU build. Copy `AudioAlign.component` to `~/Library/Audio/Plug-Ins/Components/`,
+  `killall -9 AudioComponentRegistrar`, restart Logic, and confirm it validates in
+  Settings → Plug-in Manager (under **ConjureDSP**; "Reset & Rescan Selection" if not).
+  Insert it as Audio FX → ConjureDSP → AudioAlign → Stereo, then pick the reference track
+  in the **Side Chain** menu at the top right of the plugin header — if the track is not
+  listed, send it to a bus and pick the bus. Works on both mono and stereo tracks — if it
+  is missing from the Audio FX menu, that is the first symptom of the channel-layout
+  problem the `deps/` patch fixes; see the AudioUnit v2 section.
 - Null test recipe: duplicate a track, nudge the copy by a known amount (track delay or clip
   nudge), sidechain the original into AudioAlign on the copy, play a few seconds, click
   Capture in the plugin window (or toggle the Capture parameter); after the crossfade, invert
@@ -172,5 +277,8 @@ main checkout, plain `cargo xtask bundle` is fine.
 ## Licensing
 
 GPL-3.0-or-later, mandatorily: nih-plug itself is ISC but its VST3 bindings
-(`nih_export_vst3!`) are GPLv3. Do not add GPL-incompatible dependencies. A CLAP-only build
+(`nih_export_vst3!`) are GPLv3. Do not add GPL-incompatible dependencies. The `clap-wrapper`
+crate is MIT/Apache-2.0 and vendors free-audio/clap-wrapper (MIT) plus Apple's AudioUnitSDK
+(Apache-2.0); all are one-way compatible with GPL-3.0-or-later, and its VST3 SDK sources are
+never compiled because the `vst3` feature is off. A CLAP-only build
 could be relicensed by disabling VST3 export, but VST3 is a product requirement.

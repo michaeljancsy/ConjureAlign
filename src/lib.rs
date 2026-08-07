@@ -395,6 +395,9 @@ impl Plugin for AudioAlign {
 
 impl ClapPlugin for AudioAlign {
     const CLAP_ID: &'static str = "com.michaeljancsy.audio-align";
+    // The AudioUnit build repeats this string in `bundler.toml`; keep the two in
+    // sync. xtask can't read it from here without depending on this crate, which
+    // would mean building egui just to run the bundler.
     const CLAP_DESCRIPTION: Option<&'static str> =
         Some("Time-aligns a mic signal to a sidechain reference");
     const CLAP_MANUAL_URL: Option<&'static str> = None;
@@ -415,3 +418,13 @@ impl Vst3Plugin for AudioAlign {
 
 nih_export_clap!(AudioAlign);
 nih_export_vst3!(AudioAlign);
+
+// AudioUnit v2, macOS only. clap-wrapper wraps the `clap_entry` above behind
+// `GetPluginFactoryAUV2`, an AudioComponentFactoryFunction — so this one dylib
+// now carries three entry points and gets copied into three bundles. Nothing
+// AU-specific can live here: nih-plug's `get_factory` only answers the standard
+// CLAP plugin factory, never `clap.plugin-factory-info-as-auv2.draft0`, so the
+// four-character type/subtype/manufacturer codes are only expressible in the
+// `.component`'s Info.plist, which xtask generates from `bundler.toml`.
+#[cfg(target_os = "macos")]
+clap_wrapper::export_auv2!();
