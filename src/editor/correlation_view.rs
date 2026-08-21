@@ -59,15 +59,12 @@ pub fn show(
     ui: &mut Ui,
     height: f32,
     args: &CorrArgs,
+    tab: &mut super::LowerPanelTab,
     zoom_peak: &mut bool,
     cache: &mut Option<CorrCache>,
 ) -> PanelOutput {
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Cross-correlation vs lag")
-                .small()
-                .color(TEXT_DIM),
-        );
+        super::lower_tab_selector(ui, tab);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.selectable_label(*zoom_peak, "Zoom to peak").clicked() {
                 *zoom_peak = !*zoom_peak;

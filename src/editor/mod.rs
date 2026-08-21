@@ -11,6 +11,8 @@
 // synthetic data (see examples/gui_preview.rs).
 pub mod correlation_view;
 pub mod decimate;
+pub mod freq_scale;
+pub mod spectrum_view;
 pub mod waveform_view;
 
 use std::sync::atomic::Ordering;
@@ -22,12 +24,16 @@ use nih_plug_egui::{
 };
 
 use crate::analysis::{RejectReason, CONFIDENCE_THRESHOLD};
-use crate::capture::{CaptureHandle, PHASE_ANALYZING, PHASE_CAPTURING, PHASE_IDLE};
-use crate::params::{AudioAlignParams, CaptureTime, PolarityMode, TRIM_RANGE_MS};
+use crate::capture::{
+    CaptureHandle, GATE_MAIN_QUIET, GATE_OPEN, GATE_REF_QUIET, PHASE_ANALYZING, PHASE_ARMED,
+    PHASE_CAPTURING, PHASE_IDLE,
+};
+use crate::params::{AudioAlignParams, PolarityMode, TRIM_RANGE_MS};
 use crate::shared::{AnalysisSnapshot, GuiShared};
 
 use correlation_view::{CorrArgs, CorrCache};
-use waveform_view::{WaveArgs, WaveViewState};
+use spectrum_view::{SpectrumArgs, SpectrumCache};
+use waveform_view::{quiet_label, CaptureOverlay, WaveArgs, WaveViewState};
 
 use egui::Color32;
 
@@ -50,6 +56,30 @@ pub struct PanelOutput {
     pub ms_per_px: Option<f64>,
 }
 
+/// Which graph occupies the lower panel.
+#[derive(Default, Debug, PartialEq, Eq, Clone, Copy)]
+pub enum LowerPanelTab {
+    #[default]
+    Correlation,
+    Spectrum,
+}
+
+/// The tab strip both lower panels place at the left of their header row (a
+/// row of its own would break the fixed `PANEL_HEADER_H` layout budget).
+pub(crate) fn lower_tab_selector(ui: &mut egui::Ui, tab: &mut LowerPanelTab) {
+    for (value, label) in [
+        (LowerPanelTab::Correlation, "Correlation"),
+        (LowerPanelTab::Spectrum, "Spectrum"),
+    ] {
+        if ui
+            .selectable_label(*tab == value, egui::RichText::new(label).small())
+            .clicked()
+        {
+            *tab = value;
+        }
+    }
+}
+
 /// An in-progress trim drag gesture. The accumulator is f64 and holds the
 /// *unsnapped* value so the 0.01 ms step never swallows slow drags.
 struct TrimDrag {
@@ -58,7 +88,6 @@ struct TrimDrag {
 
 /// GUI-only state, alive as long as the editor object (survives window
 /// close/reopen).
-#[derive(Default)]
 struct EditorState {
     /// Latest snapshot the GUI has seen; compared to the published one by
     /// pointer each frame.
@@ -67,12 +96,34 @@ struct EditorState {
     corr_zoom_peak: bool,
     corr_cache: Option<CorrCache>,
     show_raw: bool,
+    lower_tab: LowerPanelTab,
+    spectrum_log: bool,
+    spectrum_cache: Option<SpectrumCache>,
     trim_drag: Option<TrimDrag>,
     /// Last trim value this editor sent. `set_parameter` only queues the
     /// change until the audio thread drains the event queue, so gestures
     /// base follow-up edits on this instead of the (possibly stale)
     /// parameter; cleared once the parameter catches up.
     pending_trim: Option<f32>,
+}
+
+// Manual because `spectrum_log` defaults to true; everything else matches
+// what derive(Default) produced before.
+impl Default for EditorState {
+    fn default() -> Self {
+        Self {
+            snapshot: None,
+            wave: WaveViewState::default(),
+            corr_zoom_peak: false,
+            corr_cache: None,
+            show_raw: false,
+            lower_tab: LowerPanelTab::default(),
+            spectrum_log: true,
+            spectrum_cache: None,
+            trim_drag: None,
+            pending_trim: None,
+        }
+    }
 }
 
 pub fn create(
@@ -103,6 +154,7 @@ pub fn create(
                 state.snapshot = latest;
                 state.wave = WaveViewState::default();
                 state.corr_cache = None;
+                state.spectrum_cache = None;
             }
 
             ResizableWindow::new("audio-align-resize")
@@ -139,7 +191,7 @@ fn draw_ui(
         }
     }
 
-    status_strip(ui, params, capture, state.snapshot.as_deref(), net_ms, net_clamped);
+    status_strip(ui, params, capture, shared, state.snapshot.as_deref(), net_ms, net_clamped);
     ui.separator();
 
     // Fixed-height control bar at the bottom; panels split the rest.
@@ -149,14 +201,31 @@ fn draw_ui(
     let wave_h = (avail * 0.58).max(110.0);
     let corr_h = (avail - wave_h - 12.0).max(80.0);
 
-    let capturing = (phase == PHASE_CAPTURING).then(|| {
-        let (filled, target) = capture.progress();
-        if target > 0 {
-            filled as f32 / target as f32
-        } else {
-            0.0
+    let gate = capture.gate_state();
+    let overlay = match phase {
+        PHASE_ARMED => CaptureOverlay::Armed {
+            main_quiet: gate & GATE_MAIN_QUIET != 0,
+            ref_quiet: gate & GATE_REF_QUIET != 0,
+        },
+        PHASE_CAPTURING => {
+            let (filled, target) = capture.progress();
+            // Valid for any in-flight capture: arming happens in process(),
+            // which only runs under the activation that wrote this pair.
+            let (_, sr) = shared.window();
+            CaptureOverlay::Capturing {
+                frac: if target > 0 {
+                    filled as f32 / target as f32
+                } else {
+                    0.0
+                },
+                secs: filled as f32 / sr.max(1.0),
+                paused_reason: (gate & GATE_OPEN == 0).then(|| {
+                    quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)
+                }),
+            }
         }
-    });
+        _ => CaptureOverlay::Idle,
+    };
     let flip_main = params.align_on.value()
         && match params.polarity.value() {
             PolarityMode::Auto => params.detected_polarity.load(Ordering::Relaxed),
@@ -168,7 +237,7 @@ fn draw_ui(
         snapshot: state.snapshot.as_ref(),
         net_ms,
         flip_main,
-        capturing,
+        overlay,
     };
     // push_id: the rejection banner above is emitted conditionally, and
     // without an explicit scope its appearance would shift the panels'
@@ -189,34 +258,59 @@ fn draw_ui(
 
     ui.add_space(4.0);
 
-    let detected_ms = (params.detected_confidence.load(Ordering::Relaxed) > 0.0)
-        .then(|| params.detected_offset_ms.load(Ordering::Relaxed));
-    let corr_args = CorrArgs {
-        snapshot: state.snapshot.as_ref(),
-        detected_ms,
-        held: state
-            .snapshot
-            .as_ref()
-            .is_some_and(|s| s.outcome.is_err()),
-        net_ms,
-        clamped: net_clamped,
-        align_on: params.align_on.value(),
-        active_window_ms: active_window_ms(shared),
+    let lower_out = match state.lower_tab {
+        LowerPanelTab::Correlation => {
+            let detected_ms = (params.detected_confidence.load(Ordering::Relaxed) > 0.0)
+                .then(|| params.detected_offset_ms.load(Ordering::Relaxed));
+            let corr_args = CorrArgs {
+                snapshot: state.snapshot.as_ref(),
+                detected_ms,
+                held: state
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.outcome.is_err()),
+                net_ms,
+                clamped: net_clamped,
+                align_on: params.align_on.value(),
+                active_window_ms: active_window_ms(shared),
+            };
+            ui.push_id("corr-panel", |ui| {
+                correlation_view::show(
+                    ui,
+                    corr_h,
+                    &corr_args,
+                    &mut state.lower_tab,
+                    &mut state.corr_zoom_peak,
+                    &mut state.corr_cache,
+                )
+            })
+            .inner
+        }
+        LowerPanelTab::Spectrum => {
+            let spec_args = SpectrumArgs {
+                snapshot: state.snapshot.as_ref(),
+                net_ms,
+                flip_main,
+                align_on: params.align_on.value(),
+            };
+            // Its own stable push_id (vs "corr-panel"): switching tabs must
+            // not alias the two panels' widget state or Response identity.
+            ui.push_id("spectrum-panel", |ui| {
+                spectrum_view::show(
+                    ui,
+                    corr_h,
+                    &spec_args,
+                    &mut state.lower_tab,
+                    &mut state.spectrum_log,
+                    &mut state.spectrum_cache,
+                )
+            })
+            .inner
+        }
     };
-    let corr_out = ui
-        .push_id("corr-panel", |ui| {
-            correlation_view::show(
-                ui,
-                corr_h,
-                &corr_args,
-                &mut state.corr_zoom_peak,
-                &mut state.corr_cache,
-            )
-        })
-        .inner;
     handle_trim_gestures(
         ui,
-        &corr_out,
+        &lower_out,
         setter,
         params,
         &mut state.trim_drag,
@@ -257,20 +351,39 @@ fn status_strip(
     ui: &mut egui::Ui,
     params: &AudioAlignParams,
     capture: &CaptureHandle,
+    shared: &GuiShared,
     snapshot: Option<&AnalysisSnapshot>,
     net_ms: f32,
     net_clamped: bool,
 ) {
     ui.horizontal(|ui| {
         match capture.phase() {
+            PHASE_ARMED => {
+                let gate = capture.gate_state();
+                ui.colored_label(
+                    ACCENT_LIVE,
+                    format!(
+                        "● Armed — waiting for signal ({})",
+                        quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)
+                    ),
+                );
+            }
             PHASE_CAPTURING => {
-                let (filled, target) = capture.progress();
-                let pct = if target > 0 {
-                    filled as f32 / target as f32 * 100.0
+                let (filled, _) = capture.progress();
+                let (_, sr) = shared.window();
+                let secs = filled as f32 / sr.max(1.0);
+                let gate = capture.gate_state();
+                if gate & GATE_OPEN == 0 {
+                    ui.colored_label(
+                        ACCENT_MAIN,
+                        format!(
+                            "● Capturing {secs:.1} s (paused — {}; analyzes after ~2 s of silence)",
+                            quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)
+                        ),
+                    );
                 } else {
-                    0.0
-                };
-                ui.colored_label(ACCENT_MAIN, format!("● Capturing {pct:.0}%"));
+                    ui.colored_label(ACCENT_MAIN, format!("● Capturing {secs:.1} s"));
+                }
             }
             PHASE_ANALYZING => {
                 ui.colored_label(ACCENT_LIVE, "● Analyzing…");
@@ -309,7 +422,9 @@ fn status_strip(
 
     if let Some(Err(reason)) = snapshot.map(|s| s.outcome) {
         let msg = match reason {
-            RejectReason::TooShort => "Last capture rejected: too short.".to_string(),
+            RejectReason::TooShort => {
+                "Last capture rejected: not enough contiguous signal was captured.".to_string()
+            }
             RejectReason::Silence => {
                 "Last capture rejected: input silent — is the sidechain connected and playing?"
                     .to_string()
@@ -337,12 +452,21 @@ fn control_bar(
 ) {
     ui.horizontal(|ui| {
         match phase {
-            // A host that stops processing mid-capture freezes the phase
-            // machine at Capturing; the Cancel button is the escape hatch.
-            PHASE_CAPTURING => {
+            // Stop analyzes what was recorded; Cancel discards. A host that
+            // stops processing mid-capture freezes the phase machine, and a
+            // Stop stays pending until playback resumes — Cancel, which
+            // acts directly from the GUI thread, is the escape hatch.
+            PHASE_ARMED | PHASE_CAPTURING => {
                 if ui
-                    .button(egui::RichText::new("✕ Cancel").strong())
-                    .on_hover_text("Abort the capture in progress")
+                    .button(egui::RichText::new("⏹ Stop").strong())
+                    .on_hover_text("Stop and analyze what was recorded")
+                    .clicked()
+                {
+                    capture.request_stop();
+                }
+                if ui
+                    .button("✕ Cancel")
+                    .on_hover_text("Discard the capture in progress")
                     .clicked()
                 {
                     capture.cancel_capture();
@@ -357,7 +481,10 @@ fn control_bar(
             _ => {
                 if ui
                     .button(egui::RichText::new("⏺ Capture").strong())
-                    .on_hover_text("Record both inputs and re-detect the offset")
+                    .on_hover_text(
+                        "Arm a gated capture: records while both inputs are above \
+                         the Gate threshold, then re-detects the offset",
+                    )
                     .clicked()
                 {
                     capture.request_capture();
@@ -378,36 +505,27 @@ fn control_bar(
                 (PolarityMode::Inverted, "Invert"),
             ],
         );
-        ui.separator();
-        ui.label(egui::RichText::new("Capture").small().color(TEXT_DIM));
-        enum_selector(
-            ui,
-            setter,
-            &params.capture_time,
-            &[
-                (CaptureTime::OneSecond, "1 s"),
-                (CaptureTime::TwoSeconds, "2 s"),
-                (CaptureTime::FourSeconds, "4 s"),
-            ],
-        );
     });
     ui.horizontal(|ui| {
         ui.label("Trim");
         ui.add_sized(
-            [240.0, 18.0],
+            [180.0, 18.0],
             widgets::ParamSlider::for_param(&params.trim, setter),
         );
         ui.separator();
+        ui.label("Gate");
+        ui.add_sized(
+            [100.0, 18.0],
+            widgets::ParamSlider::for_param(&params.gate_threshold, setter),
+        )
+        .on_hover_text("Capture records only while both inputs exceed this level");
+        ui.separator();
         ui.label("Max Shift");
         ui.add_sized(
-            [150.0, 18.0],
+            [130.0, 18.0],
             widgets::ParamSlider::for_param(&params.max_shift, setter),
-        );
-        ui.label(
-            egui::RichText::new("applies on next activation")
-                .small()
-                .color(TEXT_DIM),
-        );
+        )
+        .on_hover_text("Applies on the next activation (e.g. session reload)");
     });
 }
 

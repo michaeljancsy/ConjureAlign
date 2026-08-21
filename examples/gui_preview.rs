@@ -8,8 +8,11 @@ use std::sync::Arc;
 
 use audio_align::analysis;
 use audio_align::editor::correlation_view::{self, CorrArgs};
-use audio_align::editor::waveform_view::{self, WaveArgs, WaveViewState};
+use audio_align::editor::spectrum_view::{self, SpectrumArgs};
+use audio_align::editor::waveform_view::{self, CaptureOverlay, WaveArgs, WaveViewState};
+use audio_align::editor::LowerPanelTab;
 use audio_align::shared::AnalysisSnapshot;
+use audio_align::spectrum;
 use nih_plug_egui::egui;
 
 fn main() {
@@ -36,12 +39,15 @@ fn main() {
         "synthetic capture: outcome ok = {}, detected = {detected_ms:.3} ms (expected +5)",
         report.outcome.is_ok()
     );
+    let spectrum = spectrum::welch_for_capture(&main, &reference, sr, &report, &[]);
     let snapshot = Arc::new(AnalysisSnapshot {
         main,
         reference,
         sample_rate: sr,
         max_shift_samples: report.max_shift_samples,
         corr: report.corr_curve,
+        splices: Vec::new(),
+        spectrum,
         outcome: report.outcome,
     });
 
@@ -50,7 +56,15 @@ fn main() {
     let net_ms = detected_ms + trim_ms;
 
     // Scene 1: full-capture view.
-    render_scene(&out, &snapshot, detected_ms, net_ms, None, false);
+    render_scene(
+        &out,
+        &snapshot,
+        detected_ms,
+        net_ms,
+        None,
+        false,
+        LowerPanelTab::Correlation,
+    );
     // Scene 2: zoomed to one burst + correlation zoomed to the peak — the
     // view where the trim slide and the ghost offset are actually visible.
     let zoom = waveform_view::TimeView {
@@ -58,9 +72,42 @@ fn main() {
         span_s: 0.05,
     };
     let out_zoom = out.replace(".png", "_zoom.png");
-    render_scene(&out_zoom, &snapshot, detected_ms, net_ms, Some(zoom), true);
+    render_scene(
+        &out_zoom,
+        &snapshot,
+        detected_ms,
+        net_ms,
+        Some(zoom),
+        true,
+        LowerPanelTab::Correlation,
+    );
+    // Scene 3: spectrum tab at trim 0 — the captured sum combs with notches
+    // at 100, 300, 500, … Hz (the 5 ms offset), the corrected sum is flat.
+    let out_spec = out.replace(".png", "_spectrum.png");
+    render_scene(
+        &out_spec,
+        &snapshot,
+        detected_ms,
+        detected_ms,
+        None,
+        false,
+        LowerPanelTab::Spectrum,
+    );
+    // Scene 4: trim knocks the corrected sum off-peak by 1.5 ms — it re-combs
+    // at ≈333 Hz spacing, showing the live trim-follow.
+    let out_spec_trim = out.replace(".png", "_spectrum_trim.png");
+    render_scene(
+        &out_spec_trim,
+        &snapshot,
+        detected_ms,
+        net_ms,
+        None,
+        false,
+        LowerPanelTab::Spectrum,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_scene(
     out: &str,
     snapshot: &Arc<AnalysisSnapshot>,
@@ -68,6 +115,7 @@ fn render_scene(
     net_ms: f32,
     wave_view: Option<waveform_view::TimeView>,
     zoom_peak: bool,
+    lower: LowerPanelTab,
 ) {
     let snapshot = snapshot.clone();
     let mut wave_state = WaveViewState {
@@ -77,6 +125,9 @@ fn render_scene(
     let mut show_raw = true;
     let mut corr_cache = None;
     let mut zoom_peak = zoom_peak;
+    let mut tab = lower;
+    let mut spectrum_log = true;
+    let mut spectrum_cache = None;
 
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::Vec2::new(820.0, 560.0))
@@ -86,20 +137,47 @@ fn render_scene(
                 snapshot: Some(&snapshot),
                 net_ms,
                 flip_main: false,
-                capturing: None,
+                overlay: CaptureOverlay::Idle,
             };
             waveform_view::show(ui, 270.0, &wave_args, &mut show_raw, &mut wave_state);
             ui.add_space(6.0);
-            let corr_args = CorrArgs {
-                snapshot: Some(&snapshot),
-                detected_ms: Some(detected_ms),
-                held: false,
-                net_ms,
-                clamped: false,
-                align_on: true,
-                active_window_ms: Some(20.0),
-            };
-            correlation_view::show(ui, 200.0, &corr_args, &mut zoom_peak, &mut corr_cache);
+            match tab {
+                LowerPanelTab::Correlation => {
+                    let corr_args = CorrArgs {
+                        snapshot: Some(&snapshot),
+                        detected_ms: Some(detected_ms),
+                        held: false,
+                        net_ms,
+                        clamped: false,
+                        align_on: true,
+                        active_window_ms: Some(20.0),
+                    };
+                    correlation_view::show(
+                        ui,
+                        200.0,
+                        &corr_args,
+                        &mut tab,
+                        &mut zoom_peak,
+                        &mut corr_cache,
+                    );
+                }
+                LowerPanelTab::Spectrum => {
+                    let spec_args = SpectrumArgs {
+                        snapshot: Some(&snapshot),
+                        net_ms,
+                        flip_main: false,
+                        align_on: true,
+                    };
+                    spectrum_view::show(
+                        ui,
+                        200.0,
+                        &spec_args,
+                        &mut tab,
+                        &mut spectrum_log,
+                        &mut spectrum_cache,
+                    );
+                }
+            }
         });
 
     harness.run();

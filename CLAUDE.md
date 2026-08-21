@@ -70,29 +70,47 @@ parameters — they are `#[persist = "..."]` fields on the Params struct (`Arc<A
 offset in ms, `Arc<AtomicBool>` polarity, `Arc<AtomicF32>` confidence). nih-plug serializes
 these into the DAW session automatically. The editor reads them lock-free every frame.
 
-Flow: the user clicks Capture in the editor (sets `CaptureState::request`, an `AtomicBool`
-the audio thread consumes every block) or flips the `capture` BoolParam (host generic
-UI/automation; the plugin never un-toggles it) → `process()` treats either as a rising edge →
-the audio thread copies mono-summed main + sidechain into pre-allocated buffers (phase
-machine: Idle → Capturing → Analyzing → Idle, an `AtomicU8`; the buffers live in an
-`AtomicRefCell` but the phases guarantee borrows never overlap) → when full,
-`context.execute_background(Task::Analyze)` → the `task_executor()` closure (owns Arc clones)
-runs FFT cross-correlation, refines the peak to sub-sample precision by maximizing the
-continuous cross-correlation (DTFT of the cross-spectrum — deliberately NOT a parabolic fit,
-which is biased on sinc-shaped peaks), detects polarity from the peak sign, then stores the
-atomics → `process()` notices the changed target and crossfades (~50 ms, dual delay-line taps,
-coalescing rapid changes) to the new delay. Silent or low-confidence captures are rejected and
-the previous offset kept; the editor shows the reason. Results are logged via `nih_log!` and
-shown in the editor's status strip.
+Flow (gated capture): the user clicks Capture in the editor (sets `CaptureState::request`,
+an `AtomicBool` the audio thread consumes every block) or turns on the `capture` BoolParam
+(host generic UI/automation; the plugin never un-toggles it) → `process()` treats either as a
+start edge and ARMS a capture → samples are recorded into the pre-allocated buffers only
+while a gate (`dsp/gate.rs`: peak envelopes on both mono sums, instant attack, −6 dB
+hysteresis, 250 ms hold; threshold = the non-automatable `gate_threshold` param, default
+−60 dBFS) is open on BOTH inputs — silent stretches are spliced out and each gate re-opening
+records a seam in `CaptureData::splices` (fixed capacity; when full the rest records
+continuously, since an untracked seam could corrupt the analysis and extra silence cannot).
+The capture stops on the editor's Stop button (`stop_request`), the `capture` param's falling
+edge, when 4 s of accumulated signal fills the buffer, or automatically once signal has been
+recorded and the gate has stayed closed for `CAPTURE_AUTO_FINISH_SECONDS` (2 s; ≈2.8 s of
+real silence including the gate's release+hold) — so playing a short clip once analyzes by
+itself instead of pausing forever. Armed never times out (an off-edge after any auto-stop is
+a no-op). Phase machine: Idle → Armed → Capturing → Analyzing → Idle, an `AtomicU8`; Armed
+means nothing recorded yet, and every transition out of Armed/Capturing is a CAS so a GUI
+cancel always wins (`cancel_capture` tries ARMED→IDLE first — the phase only moves forward,
+so that order can't drop a cancel). The buffers live in an `AtomicRefCell`; the audio thread
+borrows in Idle/Armed/Capturing, the background task in Analyzing, never overlapping. On stop
+with data, `context.execute_background(Task::Analyze)` → the `task_executor()` closure (owns
+Arc clones) runs `analyze_spliced` (zeroes ±max_shift guard regions around each seam in both
+working copies — exactly the cross-seam products — before the FFT cross-correlation), refines
+the peak to sub-sample precision by maximizing the continuous cross-correlation (DTFT of the
+cross-spectrum — deliberately NOT a parabolic fit, which is biased on sinc-shaped peaks),
+detects polarity from the peak sign, then stores the atomics → `process()` notices the
+changed target and crossfades (~50 ms, dual delay-line taps, coalescing rapid changes) to the
+new delay. Too-short or low-confidence captures are rejected and the previous offset kept;
+the editor shows the reason. A missing sidechain shows up LIVE as "Armed — waiting for signal
+(ref quiet)" from the `gate_state` bitfield rather than only as a post-hoc rejection. Results
+are logged via `nih_log!` and shown in the editor's status strip.
 
 ### GUI threading rules
 
 The editor NEVER touches `CaptureState::data` — the `AtomicRefCell` borrow discipline covers
-only the audio thread (Idle/Capturing) and the background task (Analyzing); a GUI borrow
-would panic the audio thread. Enforced by construction: the editor only receives a
-`CaptureHandle` (phase/progress reads + capture request; cannot reach `data`). Waveform and
-correlation data reach the GUI exclusively through `shared::AnalysisSnapshot` — full raw
-copies of the captures plus the normalized correlation curve per integer lag, built by the
+only the audio thread (Idle/Armed/Capturing) and the background task (Analyzing); a GUI
+borrow would panic the audio thread. Enforced by construction: the editor only receives a
+`CaptureHandle` (phase/progress/gate-state reads + capture/stop requests + cancel; cannot
+reach `data`). Waveform and correlation data reach the GUI exclusively through
+`shared::AnalysisSnapshot` — full raw copies of the captures (un-zeroed; splice seam
+positions ride along for the waveform markers) plus the normalized correlation curve per
+integer lag, built by the
 background task at the end of `Task::Analyze` (allocation is fine there) and published via
 `Mutex<Option<Arc<AnalysisSnapshot>>>` before the phase returns to Idle. The audio thread
 never touches that mutex; its only GUI-related work is a handful of atomic loads/stores per
@@ -261,9 +279,10 @@ main checkout, plain `cargo xtask bundle` is fine.
   is missing from the Audio FX menu, that is the first symptom of the channel-layout
   problem the `deps/` patch fixes; see the AudioUnit v2 section.
 - Null test recipe: duplicate a track, nudge the copy by a known amount (track delay or clip
-  nudge), sidechain the original into AudioAlign on the copy, play a few seconds, click
-  Capture in the plugin window (or toggle the Capture parameter); after the crossfade, invert
-  one track and sum. Expected depths (measured in
+  nudge), sidechain the original into AudioAlign on the copy, click Capture (or toggle the
+  Capture parameter) and play — recording accumulates only while both inputs clear the Gate
+  threshold, so the click can precede playback; click Stop (or toggle the parameter off, or
+  let 4 s of signal fill the buffer); after the crossfade, invert one track and sum. Expected depths (measured in
   `tests/null_depth.rs`): integer-sample offsets null below −80 dB broadband; FRACTIONAL
   offsets are floored at only −20…−30 dB broadband because no real filter can fractionally
   delay content near Nyquist — but the audible band (<0.44·fs, ≈19 kHz) nulls at −69 dB

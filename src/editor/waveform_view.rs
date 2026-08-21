@@ -13,8 +13,27 @@ use nih_plug_egui::egui::{
 };
 
 use super::decimate::{min_max_decimate, MinMax};
-use super::{PanelOutput, ACCENT_MAIN, ACCENT_REF, GRID_COLOR, PANEL_BG, TEXT_DIM};
+use super::{PanelOutput, ACCENT_LIVE, ACCENT_MAIN, ACCENT_REF, GRID_COLOR, PANEL_BG, TEXT_DIM};
 use crate::shared::AnalysisSnapshot;
+
+/// Live capture status drawn over the waveform panel (built by `mod.rs` from
+/// the capture phase + gate bits).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CaptureOverlay {
+    Idle,
+    Armed {
+        main_quiet: bool,
+        ref_quiet: bool,
+    },
+    Capturing {
+        /// Fill fraction of the capture buffer (accumulated / capacity).
+        frac: f32,
+        /// Accumulated gated signal, seconds.
+        secs: f32,
+        /// `Some(reason)` while the gate is holding recording paused.
+        paused_reason: Option<&'static str>,
+    },
+}
 
 /// Visible window on the reference timeline, in seconds.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -69,8 +88,8 @@ pub struct WaveArgs<'a> {
     pub net_ms: f32,
     /// Draw the main waveform polarity-flipped.
     pub flip_main: bool,
-    /// `Some(fraction)` while a capture is running.
-    pub capturing: Option<f32>,
+    /// Live capture status overlay.
+    pub overlay: CaptureOverlay,
 }
 
 /// Header row + canvas. Returns the canvas response for trim-drag handling.
@@ -121,7 +140,7 @@ pub fn show(
             FontId::proportional(14.0),
             TEXT_DIM,
         );
-        draw_capture_overlay(&painter, rect, args.capturing);
+        draw_capture_overlay(&painter, rect, &args.overlay);
         return PanelOutput {
             response,
             ms_per_px: None,
@@ -243,6 +262,24 @@ pub fn show(
     // --- Grid ---
     draw_time_grid(&painter, rect, &view);
 
+    // Splice seams: the timeline is gated *signal*-time, and each seam marks
+    // where a silent stretch was cut out. One dashed marker per seam, on the
+    // reference timeline (the main waveform is drawn shifted, but both
+    // channels are spliced at identical positions).
+    for &s in &snap.splices {
+        let t = s as f64 / sr;
+        if t <= view.start_s || t >= view.start_s + view.span_s {
+            continue;
+        }
+        let x = rect.left() + ((t - view.start_s) / view.span_s) as f32 * rect.width();
+        painter.add(egui::Shape::dashed_line(
+            &[Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(1.0, TEXT_DIM.gamma_multiply(0.5)),
+            4.0,
+            6.0,
+        ));
+    }
+
     // --- Waveforms: reference first, ghost, then main on top. Translucent so
     // the overlap region shows both signals. Over-zoomed views (interpolated
     // buckets) draw as connected lines instead of per-column stubs.
@@ -267,7 +304,7 @@ pub fn show(
         as_line,
     );
 
-    draw_capture_overlay(&painter, rect, args.capturing);
+    draw_capture_overlay(&painter, rect, &args.overlay);
 
     PanelOutput {
         response,
@@ -289,7 +326,7 @@ fn set_span(vs: &mut WaveViewState, len_s: f64, span: f64) {
     });
 }
 
-fn legend_chip(ui: &mut Ui, color: Color32, label: &str) {
+pub(crate) fn legend_chip(ui: &mut Ui, color: Color32, label: &str) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
     ui.painter().circle_filled(rect.center(), 4.0, color);
     ui.label(egui::RichText::new(label).small());
@@ -356,20 +393,55 @@ fn draw_time_grid(painter: &egui::Painter, rect: egui::Rect, view: &TimeView) {
     );
 }
 
-fn draw_capture_overlay(painter: &egui::Painter, rect: egui::Rect, capturing: Option<f32>) {
-    let Some(frac) = capturing else { return };
-    let bar = egui::Rect::from_min_size(
-        rect.left_top(),
-        Vec2::new(rect.width() * frac.clamp(0.0, 1.0), 3.0),
-    );
-    painter.rect_filled(bar, 0.0, ACCENT_MAIN);
-    painter.text(
-        rect.center_top() + Vec2::new(0.0, 10.0),
-        Align2::CENTER_CENTER,
-        format!("Capturing… {:.0}%", frac * 100.0),
-        FontId::proportional(12.0),
-        ACCENT_MAIN,
-    );
+fn draw_capture_overlay(painter: &egui::Painter, rect: egui::Rect, overlay: &CaptureOverlay) {
+    match *overlay {
+        CaptureOverlay::Idle => {}
+        CaptureOverlay::Armed {
+            main_quiet,
+            ref_quiet,
+        } => {
+            painter.text(
+                rect.center_top() + Vec2::new(0.0, 10.0),
+                Align2::CENTER_CENTER,
+                format!("Armed — waiting for signal ({})", quiet_label(main_quiet, ref_quiet)),
+                FontId::proportional(12.0),
+                ACCENT_LIVE,
+            );
+        }
+        CaptureOverlay::Capturing {
+            frac,
+            secs,
+            paused_reason,
+        } => {
+            let bar = egui::Rect::from_min_size(
+                rect.left_top(),
+                Vec2::new(rect.width() * frac.clamp(0.0, 1.0), 3.0),
+            );
+            painter.rect_filled(bar, 0.0, ACCENT_MAIN);
+            let label = match paused_reason {
+                Some(reason) => format!("Capturing… {secs:.1} s (paused — {reason})"),
+                None => format!("Capturing… {secs:.1} s"),
+            };
+            painter.text(
+                rect.center_top() + Vec2::new(0.0, 10.0),
+                Align2::CENTER_CENTER,
+                label,
+                FontId::proportional(12.0),
+                ACCENT_MAIN,
+            );
+        }
+    }
+}
+
+/// Which input(s) are holding the gate shut, as display text.
+pub(crate) fn quiet_label(main_quiet: bool, ref_quiet: bool) -> &'static str {
+    match (main_quiet, ref_quiet) {
+        (true, true) => "both inputs quiet",
+        (true, false) => "main quiet",
+        (false, true) => "ref quiet — is the sidechain connected?",
+        // Transient: both envelopes crossed the threshold this very block.
+        (false, false) => "opening…",
+    }
 }
 
 /// 1/2/5 × 10^k step targeting roughly `target` divisions.

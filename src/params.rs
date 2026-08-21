@@ -18,8 +18,11 @@ use std::sync::Arc;
 pub const MAX_SHIFT_MAX_MS: f32 = 200.0;
 pub const MAX_SHIFT_MIN_MS: f32 = 10.0;
 pub const TRIM_RANGE_MS: f32 = 10.0;
-/// Longest selectable capture, seconds.
+/// Cap on *accumulated gated signal* per capture, seconds; the buffers are
+/// sized for this at initialization and a capture auto-stops when it fills.
 pub const CAPTURE_MAX_SECS: usize = 4;
+pub const GATE_THRESHOLD_MIN_DB: f32 = -90.0;
+pub const GATE_THRESHOLD_MAX_DB: f32 = -30.0;
 
 #[derive(Enum, Debug, PartialEq, Clone, Copy)]
 pub enum PolarityMode {
@@ -31,32 +34,16 @@ pub enum PolarityMode {
     Inverted,
 }
 
-#[derive(Enum, Debug, PartialEq, Clone, Copy)]
-pub enum CaptureTime {
-    #[name = "1 s"]
-    OneSecond,
-    #[name = "2 s"]
-    TwoSeconds,
-    #[name = "4 s"]
-    FourSeconds,
-}
-
-impl CaptureTime {
-    pub fn seconds(self) -> usize {
-        match self {
-            CaptureTime::OneSecond => 1,
-            CaptureTime::TwoSeconds => 2,
-            CaptureTime::FourSeconds => 4,
-        }
-    }
-}
-
 #[derive(Params)]
 pub struct AudioAlignParams {
-    /// Rising edge starts a capture — the host-automation / generic-UI path.
-    /// The plugin never un-toggles it; to re-analyze from here, toggle off and
-    /// on again. The editor's Capture button bypasses this param entirely via
-    /// `CaptureState::request`.
+    /// The host-automation / generic-UI capture control. On = arm; the gated
+    /// capture then records while both inputs are above the gate threshold.
+    /// The falling edge stops it and analyzes what was recorded (an off-edge
+    /// after the buffer-full auto-stop, or with nothing recorded, is a
+    /// no-op). The plugin never un-toggles it, and `initialize()` snapshots
+    /// its value into the edge tracker so a session saved with it on stays
+    /// inert on load. The editor's Capture/Stop buttons bypass this param
+    /// entirely via `CaptureState::{request, stop_request}`.
     #[id = "capture"]
     pub capture: BoolParam,
 
@@ -78,8 +65,11 @@ pub struct AudioAlignParams {
     #[id = "max_shift"]
     pub max_shift: FloatParam,
 
-    #[id = "capture_time"]
-    pub capture_time: EnumParam<CaptureTime>,
+    /// Capture gate threshold: recording only accumulates while BOTH inputs
+    /// are above this level. Read once at capture start (arming), like the
+    /// rest of the capture setup.
+    #[id = "gate_threshold"]
+    pub gate_threshold: FloatParam,
 
     // --- Analysis results (not host parameters; see module docs). ---
     /// `t_ref − t_main` in milliseconds. Stored in ms, not samples, so a
@@ -127,8 +117,17 @@ impl Default for AudioAlignParams {
             .with_unit(" ms")
             .with_step_size(1.0)
             .non_automatable(),
-            capture_time: EnumParam::new("Capture Time", CaptureTime::TwoSeconds)
-                .non_automatable(),
+            gate_threshold: FloatParam::new(
+                "Gate",
+                -60.0,
+                FloatRange::Linear {
+                    min: GATE_THRESHOLD_MIN_DB,
+                    max: GATE_THRESHOLD_MAX_DB,
+                },
+            )
+            .with_unit(" dB")
+            .with_step_size(1.0)
+            .non_automatable(),
             detected_offset_ms: Arc::new(AtomicF32::new(0.0)),
             detected_polarity: Arc::new(AtomicBool::new(false)),
             detected_confidence: Arc::new(AtomicF32::new(0.0)),

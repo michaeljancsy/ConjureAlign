@@ -69,6 +69,58 @@ pub fn analyze(main: &[f32], reference: &[f32], max_shift_samples: usize) -> Opt
         .ok()
 }
 
+/// Like [`analyze_detailed`], but for gated captures whose silent stretches
+/// were spliced out. Each entry of `splices` is a position in the spliced
+/// buffers where a new contiguous chunk begins; a cross-product straddling
+/// such a seam pairs wall-clock-mismatched content and would smear the
+/// correlation. Every straddling product at every searched lag has its main
+/// index within `max_shift_samples` of a seam, so zeroing `[s − W, s + W)`
+/// removes exactly the corrupted products. Both signals are zeroed
+/// symmetrically so the energy normalization shrinks in step and the
+/// confidence stays calibrated at the true peak.
+///
+/// Background thread only (allocates working copies).
+pub fn analyze_spliced(
+    main: &[f32],
+    reference: &[f32],
+    max_shift_samples: usize,
+    splices: &[usize],
+) -> AnalysisReport {
+    if splices.is_empty() {
+        return analyze_detailed(main, reference, max_shift_samples);
+    }
+    let n = main.len().min(reference.len());
+    let w = max_shift_samples;
+    let mut main_z = main[..n].to_vec();
+    let mut ref_z = reference[..n].to_vec();
+    for &s in splices {
+        let lo = s.saturating_sub(w);
+        let hi = s.saturating_add(w).min(n);
+        if lo < hi {
+            main_z[lo..hi].fill(0.0);
+            ref_z[lo..hi].fill(0.0);
+        }
+    }
+    let report = analyze_detailed(&main_z, &ref_z, max_shift_samples);
+
+    // Dense seams × a large search window can erase most of a capture that
+    // genuinely had signal; reporting that as Silence ("is the sidechain
+    // connected?") would misdiagnose it. Downgrade to TooShort — too little
+    // contiguous signal for this Max Shift.
+    if report.outcome == Err(RejectReason::Silence) {
+        let energy = |s: &[f32]| s.iter().map(|&x| x as f64 * x as f64).sum::<f64>();
+        let silence_energy = SILENCE_RMS_THRESHOLD * SILENCE_RMS_THRESHOLD * n as f64;
+        if energy(&main[..n]) >= silence_energy && energy(&reference[..n]) >= silence_energy {
+            return AnalysisReport {
+                outcome: Err(RejectReason::TooShort),
+                corr_curve: Vec::new(),
+                max_shift_samples: report.max_shift_samples,
+            };
+        }
+    }
+    report
+}
+
 /// Like [`analyze`], but also reports the correlation curve and the rejection
 /// reason. Same cost; [`analyze`] is a thin wrapper around this.
 pub fn analyze_detailed(
@@ -494,6 +546,85 @@ mod tests {
         assert_eq!(report.corr_curve.len(), 2 * 1000 + 1);
         let max_abs = report.corr_curve.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(max_abs < CONFIDENCE_THRESHOLD);
+    }
+
+    /// Build a gated-capture pair: cut the same signal-time windows out of a
+    /// (main, ref) pair and concatenate them, recording each seam — exactly
+    /// what the capture gate produces.
+    fn splice_capture(
+        main: &[f32],
+        reference: &[f32],
+        keep: &[(usize, usize)], // (start, len) windows in original time
+    ) -> (Vec<f32>, Vec<f32>, Vec<usize>) {
+        let mut m = Vec::new();
+        let mut r = Vec::new();
+        let mut seams = Vec::new();
+        for &(start, len) in keep {
+            if !m.is_empty() {
+                seams.push(m.len());
+            }
+            m.extend_from_slice(&main[start..start + len]);
+            r.extend_from_slice(&reference[start..start + len]);
+        }
+        (m, r, seams)
+    }
+
+    #[test]
+    fn spliced_with_no_seams_is_identical() {
+        let main = band_limited_noise(48_000, 42);
+        let reference = delayed_copy(&main, 237);
+        let a = analyze_detailed(&main, &reference, 1000);
+        let b = analyze_spliced(&main, &reference, 1000, &[]);
+        assert_eq!(a.corr_curve, b.corr_curve);
+        assert_eq!(a.outcome, b.outcome);
+    }
+
+    #[test]
+    fn spliced_capture_detects_offset() {
+        let main = band_limited_noise(96_000, 21);
+        let k = 300i64;
+        let reference = delayed_copy(&main, k);
+        let keep = [
+            (1_000, 12_000),
+            (25_000, 10_000),
+            (48_000, 14_000),
+            (75_000, 9_000),
+        ];
+        let (m, r, seams) = splice_capture(&main, &reference, &keep);
+        assert_eq!(seams.len(), 3);
+        let report = analyze_spliced(&m, &r, 1000, &seams);
+        let res = report.outcome.expect("must detect");
+        assert!(
+            (res.offset_samples - k as f64).abs() < 0.1,
+            "got {}",
+            res.offset_samples
+        );
+        assert!(!res.inverted);
+        // Symmetric guard zeroing keeps the confidence calibrated even with
+        // ~13% of the buffers zeroed.
+        assert!(res.confidence > 0.8, "confidence {}", res.confidence);
+    }
+
+    #[test]
+    fn seams_near_buffer_edges_are_clamped() {
+        let main = band_limited_noise(20_000, 3);
+        let reference = delayed_copy(&main, 100);
+        let report = analyze_spliced(&main, &reference, 1000, &[5, 19_999]);
+        let res = report.outcome.expect("the un-zeroed middle must carry it");
+        assert!((res.offset_samples - 100.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn guard_erased_capture_reports_too_short_not_silence() {
+        // Chunks far shorter than the guard width: the zeroing erases the
+        // whole capture. The raw signal is loud, so Silence ("is the
+        // sidechain connected?") would misdiagnose it.
+        let main = band_limited_noise(4_000, 9);
+        let reference = delayed_copy(&main, 10);
+        let seams: Vec<usize> = (1..8).map(|i| i * 500).collect();
+        let report = analyze_spliced(&main, &reference, 1000, &seams);
+        assert_eq!(report.outcome, Err(RejectReason::TooShort));
+        assert!(report.corr_curve.is_empty());
     }
 
     #[test]

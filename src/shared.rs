@@ -30,6 +30,14 @@ pub struct AnalysisSnapshot {
     /// `i − max_shift_samples`. Empty when analysis was rejected before the
     /// FFT ran (too short / silence).
     pub corr: Vec<f32>,
+    /// Positions in the (spliced, signal-time) capture buffers where the
+    /// gate re-opened — each starts a new contiguous chunk. The raw captures
+    /// above are NOT guard-zeroed; the analysis works on its own copies.
+    pub splices: Vec<usize>,
+    /// Welch spectra for the Spectrum panel (~64 KB at 48 kHz, ~262 KB at
+    /// 192 kHz). `None` when the capture was rejected before analysis ran
+    /// (mirrors `corr.is_empty()`) or no full Welch segment fits.
+    pub spectrum: Option<crate::spectrum::SpectrumData>,
     pub outcome: Result<AnalysisResult, RejectReason>,
 }
 
