@@ -125,10 +125,7 @@ fn render_scene(
     };
     let mut show_raw = true;
     let mut corr_cache = None;
-    let mut corr_state = CorrViewState {
-        view: corr_view,
-        ..Default::default()
-    };
+    let mut corr_state = CorrViewState { view: corr_view };
     let mut tab = lower;
     let mut spectrum_log = true;
     let mut spec_state = SpecViewState::default();

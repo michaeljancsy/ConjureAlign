@@ -49,25 +49,9 @@ pub(crate) const ACCENT_LIVE: Color32 = Color32::from_rgb(0xff, 0xd5, 0x4f); // 
 pub(crate) const ACCENT_WARN: Color32 = Color32::from_rgb(0xe5, 0x73, 0x73); // red
 pub(crate) const CURVE_COLOR: Color32 = Color32::from_rgb(0x64, 0xb5, 0xf6); // blue
 
-/// What a panel hands back so the shared trim-drag handling can run on it.
+/// What a panel hands back so the shared arrow-key trim nudge can run on it.
 pub struct PanelOutput {
     pub response: egui::Response,
-    /// Milliseconds of the panel's own x-axis per pixel; `None` when the
-    /// panel had nothing to draw (drag does nothing then).
-    pub ms_per_px: Option<f64>,
-    /// The in-flight drag was latched as a Trim gesture (⌥ held at drag
-    /// start). Plain drags pan inside the panel and must never open a trim
-    /// automation gesture.
-    pub drag_is_trim: bool,
-}
-
-/// What a drag gesture was latched as when it started. ⌥ at `drag_started`
-/// means Trim; anything else pans. A mid-gesture modifier change never
-/// switches modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DragKind {
-    Pan,
-    Trim,
 }
 
 /// Which graph occupies the lower panel.
@@ -94,12 +78,6 @@ pub(crate) fn lower_tab_selector(ui: &mut egui::Ui, tab: &mut LowerPanelTab) {
     }
 }
 
-/// An in-progress trim drag gesture. The accumulator is f64 and holds the
-/// *unsnapped* value so the 0.01 ms step never swallows slow drags.
-struct TrimDrag {
-    accum_ms: f64,
-}
-
 /// GUI-only state, alive as long as the editor object (survives window
 /// close/reopen).
 struct EditorState {
@@ -114,10 +92,9 @@ struct EditorState {
     lower_tab: LowerPanelTab,
     spectrum_log: bool,
     spectrum_cache: Option<SpectrumCache>,
-    trim_drag: Option<TrimDrag>,
     /// Last trim value this editor sent. `set_parameter` only queues the
-    /// change until the audio thread drains the event queue, so gestures
-    /// base follow-up edits on this instead of the (possibly stale)
+    /// change until the audio thread drains the event queue, so the nudge
+    /// bases follow-up edits on this instead of the (possibly stale)
     /// parameter; cleared once the parameter catches up.
     pending_trim: Option<f32>,
     /// Measured control-bar height from the previous frame; the panel split
@@ -141,7 +118,6 @@ impl Default for EditorState {
             lower_tab: LowerPanelTab::default(),
             spectrum_log: true,
             spectrum_cache: None,
-            trim_drag: None,
             pending_trim: None,
             // Estimates for the first frame only; measured thereafter.
             control_bar_h: 84.0,
@@ -196,7 +172,7 @@ pub fn create(
 
             // Keep animating through captures/analysis and drags even if the
             // host stops delivering input events.
-            if capture.phase() != PHASE_IDLE || state.trim_drag.is_some() {
+            if capture.phase() != PHASE_IDLE {
                 ctx.request_repaint();
             }
         },
@@ -281,14 +257,7 @@ fn draw_ui(
             waveform_view::show(ui, wave_h, &wave_args, &mut state.show_raw, &mut state.wave)
         })
         .inner;
-    handle_trim_gestures(
-        ui,
-        &wave_out,
-        setter,
-        params,
-        &mut state.trim_drag,
-        &mut state.pending_trim,
-    );
+    handle_trim_nudge(ui, &wave_out, setter, params, &mut state.pending_trim);
 
     ui.add_space(4.0);
 
@@ -343,14 +312,7 @@ fn draw_ui(
             .inner
         }
     };
-    handle_trim_gestures(
-        ui,
-        &lower_out,
-        setter,
-        params,
-        &mut state.trim_drag,
-        &mut state.pending_trim,
-    );
+    handle_trim_nudge(ui, &lower_out, setter, params, &mut state.pending_trim);
 
     ui.add_space(6.0);
     let bar = ui.scope(|ui| {
@@ -576,22 +538,6 @@ fn control_bar(
              the host to compensate. Takes effect the next time the session loads.",
         );
     });
-    // The gesture legend, fully visible. Spelled-out modifiers: egui's
-    // default font renders ⌘ but not ⌥/⇧/arrows (boxes), so words it is.
-    ui.add_space(4.0);
-    ui.vertical_centered(|ui| {
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(
-                    "drag / scroll: pan  ·  pinch or cmd-scroll: zoom  ·  opt-drag: \
-                     trim (shift: fine)  ·  arrow keys: nudge trim  ·  double-click: fit",
-                )
-                .small()
-                .color(TEXT_DIM),
-            )
-            .truncate(),
-        );
-    });
 }
 
 fn bool_toggle(ui: &mut egui::Ui, setter: &ParamSetter, param: &BoolParam, label: &str) {
@@ -619,71 +565,23 @@ fn enum_selector<T: nih_plug::prelude::Enum + PartialEq + Copy + 'static>(
     }
 }
 
-/// Drag-to-trim plus keyboard nudge, shared by both panels. Dragging right
-/// slides the main waveform later (bigger applied shift), matching the
-/// correlation panel's x-axis 1:1; hold Shift for 10× finer drags.
-fn handle_trim_gestures(
+/// Arrow-key trim nudge while hovering a panel: ±0.01 ms, Shift for
+/// ±0.1 ms. Skipped while something else (e.g. a ParamSlider's text entry)
+/// owns the keyboard, and during a pan drag.
+fn handle_trim_nudge(
     ui: &egui::Ui,
     panel: &PanelOutput,
     setter: &ParamSetter,
     params: &AudioAlignParams,
-    drag: &mut Option<TrimDrag>,
     pending_trim: &mut Option<f32>,
 ) {
     let response = &panel.response;
-    let align_on = params.align_on.value();
-
-    // Close an open gesture FIRST — before any early return — so a mid-drag
-    // snapshot swap (the panel loses its axis) or an Align toggle can never
-    // leave the host's begin/end bracket unbalanced.
-    if drag.is_some() && (response.drag_stopped() || !align_on) {
-        setter.end_set_parameter(&params.trim);
-        *drag = None;
-    }
-    // With alignment off neither panel displays the shift, so a gesture
-    // would silently slew trim with zero visual feedback; stay inert.
-    if !align_on {
+    // With alignment off neither panel displays the shift, so a nudge would
+    // silently slew trim with zero visual feedback; stay inert.
+    if !params.align_on.value() {
         return;
     }
-    let Some(ms_per_px) = panel.ms_per_px else { return };
-
-    // Only ⌥-drags belong to trim (latched by the panel at drag start);
-    // plain drags pan inside the panel and must not open a host gesture.
-    if response.drag_started() && panel.drag_is_trim {
-        if drag.is_some() {
-            // A previous gesture never closed (defensive); balance it.
-            setter.end_set_parameter(&params.trim);
-        }
-        setter.begin_set_parameter(&params.trim);
-        *drag = Some(TrimDrag {
-            accum_ms: pending_trim.unwrap_or_else(|| params.trim.value()) as f64,
-        });
-    }
-    if response.dragged() {
-        if let Some(d) = drag.as_mut() {
-            let fine = if ui.input(|i| i.modifiers.shift) {
-                0.1
-            } else {
-                1.0
-            };
-            // Clamp the accumulator itself: an overshooting drag must
-            // reverse immediately, not after re-traversing the overshoot.
-            d.accum_ms = (d.accum_ms + response.drag_delta().x as f64 * ms_per_px * fine)
-                .clamp(-TRIM_RANGE_MS as f64, TRIM_RANGE_MS as f64);
-            let new = snap_trim(d.accum_ms);
-            setter.set_parameter(&params.trim, new);
-            *pending_trim = Some(new);
-        }
-    }
-
-    // Arrow-key nudge while hovering: ±0.01 ms, Shift for ±0.1 ms. Skipped
-    // while something else (e.g. a ParamSlider's text entry) owns the
-    // keyboard, and during a pan drag.
-    if response.hovered()
-        && drag.is_none()
-        && !response.dragged()
-        && !ui.ctx().wants_keyboard_input()
-    {
+    if response.hovered() && !response.dragged() && !ui.ctx().wants_keyboard_input() {
         let (left, right, shift) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowLeft),
@@ -713,3 +611,4 @@ fn snap_trim(ms: f64) -> f32 {
     let clamped = ms.clamp(-TRIM_RANGE_MS as f64, TRIM_RANGE_MS as f64);
     ((clamped / 0.01).round() * 0.01) as f32
 }
+

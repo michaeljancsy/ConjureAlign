@@ -14,8 +14,7 @@ use nih_plug_egui::egui::{
 
 use super::decimate::{min_max_decimate, MinMax};
 use super::{
-    view_math, DragKind, PanelOutput, ACCENT_LIVE, ACCENT_MAIN, ACCENT_REF, GRID_COLOR, PANEL_BG,
-    TEXT_DIM,
+    view_math, PanelOutput, ACCENT_LIVE, ACCENT_MAIN, ACCENT_REF, GRID_COLOR, PANEL_BG, TEXT_DIM,
 };
 use crate::shared::AnalysisSnapshot;
 
@@ -50,8 +49,6 @@ pub struct WaveViewState {
     /// `None` = fit the whole capture.
     pub view: Option<TimeView>,
     pub cache: Option<WaveCache>,
-    /// What the in-flight drag was latched as at drag start.
-    pub drag: Option<DragKind>,
 }
 
 /// Key for the shift-independent envelopes (reference + unshifted ghost).
@@ -137,16 +134,6 @@ pub fn show(
     painter.rect_filled(rect, 4.0, PANEL_BG);
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, GRID_COLOR), StrokeKind::Inside);
 
-    // Latch the drag mode at gesture start: ⌥ = trim (handled centrally by
-    // mod.rs), plain = pan. A mid-gesture modifier change never switches.
-    if response.drag_started() {
-        vs.drag = Some(if ui.input(|i| i.modifiers.alt) {
-            DragKind::Trim
-        } else {
-            DragKind::Pan
-        });
-    }
-
     let Some(snap) = args.snapshot else {
         painter.text(
             rect.center(),
@@ -156,14 +143,7 @@ pub fn show(
             TEXT_DIM,
         );
         draw_capture_overlay(&painter, rect, &args.overlay);
-        if response.drag_stopped() {
-            vs.drag = None;
-        }
-        return PanelOutput {
-            response,
-            ms_per_px: None,
-            drag_is_trim: false,
-        };
+        return PanelOutput { response };
     };
 
     let sr = snap.sample_rate.max(1.0) as f64;
@@ -208,15 +188,12 @@ pub fn show(
             view.start_s = view_math::pan(view.start_s, view.span_s, delta, 0.0, full);
         }
     }
-    if vs.drag == Some(DragKind::Pan) && response.dragged() {
+    if response.dragged() {
         let dx = response.drag_delta().x;
         if dx != 0.0 && rect.width() > 1.0 {
             let delta = -dx as f64 * view.span_s / rect.width() as f64;
             view.start_s = view_math::pan(view.start_s, view.span_s, delta, 0.0, full);
         }
-    }
-    if response.drag_stopped() {
-        vs.drag = None;
     }
     if response.double_clicked() {
         vs.view = None;
@@ -347,13 +324,7 @@ pub fn show(
 
     draw_capture_overlay(&painter, rect, &args.overlay);
 
-    PanelOutput {
-        response,
-        // A degenerate panel width would give an absurd (or negative, or
-        // non-finite) drag axis; disable the gesture instead.
-        ms_per_px: (rect.width() > 1.0).then(|| view.span_s * 1000.0 / rect.width() as f64),
-        drag_is_trim: vs.drag == Some(DragKind::Trim),
-    }
+    PanelOutput { response }
 }
 
 fn set_span(vs: &mut WaveViewState, len_s: f64, span: f64) {

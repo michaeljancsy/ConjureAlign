@@ -15,8 +15,8 @@ use super::decimate::MinMax;
 use super::freq_scale::{bucket_curve, bucket_edges, fmt_hz, log_ticks};
 use super::waveform_view::{legend_chip, nice_step};
 use super::{
-    view_math, DragKind, LowerPanelTab, PanelOutput, ACCENT_LIVE, CURVE_COLOR, GRID_COLOR,
-    PANEL_BG, TEXT_DIM,
+    view_math, LowerPanelTab, PanelOutput, ACCENT_LIVE, CURVE_COLOR, GRID_COLOR, PANEL_BG,
+    TEXT_DIM,
 };
 use crate::shared::AnalysisSnapshot;
 use crate::spectrum::synth_sum_db;
@@ -33,9 +33,6 @@ pub struct SpecViewState {
     /// `(f_lo, f_hi)` in Hz; `None` = the axis mode's full range. Reset when
     /// the log/linear mode toggles (the two spaces don't share a view).
     pub view: Option<(f64, f64)>,
-    /// What the in-flight drag was latched as at drag start. Always `Pan`
-    /// here — a frequency axis has no trim to drag.
-    pub drag: Option<DragKind>,
 }
 
 /// Everything that only changes with the snapshot or the view itself.
@@ -120,12 +117,6 @@ pub fn show(
     painter.rect_filled(rect, 4.0, PANEL_BG);
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, GRID_COLOR), StrokeKind::Inside);
 
-    // Always Pan: a frequency axis has no trim to drag, and a stray ⌥
-    // shouldn't dead-zone the gesture.
-    if response.drag_started() {
-        vs.drag = Some(DragKind::Pan);
-    }
-
     let center_message = |text: &str| {
         painter.text(
             rect.center(),
@@ -140,26 +131,12 @@ pub fn show(
             Some(spec) => spec,
             None => {
                 center_message("No spectrum — the capture was rejected before analysis");
-                if response.drag_stopped() {
-                    vs.drag = None;
-                }
-                return PanelOutput {
-                    response,
-                    ms_per_px: None,
-                    drag_is_trim: false,
-                };
+                return PanelOutput { response };
             }
         },
         None => {
             center_message("The spectrum appears after a capture");
-            if response.drag_stopped() {
-                vs.drag = None;
-            }
-            return PanelOutput {
-                response,
-                ms_per_px: None,
-                drag_is_trim: false,
-            };
+            return PanelOutput { response };
         }
     };
     let snap = args.snapshot.unwrap();
@@ -226,7 +203,7 @@ pub fn show(
             vs.view = Some((v_lo, v_hi));
         }
     }
-    if vs.drag == Some(DragKind::Pan) && response.dragged() {
+    if response.dragged() {
         let dx = response.drag_delta().x;
         if dx != 0.0 && rect.width() > 1.0 {
             let (lo, hi) = pan_view(log, v_lo, v_hi, dx, rect.width(), base_lo, base_hi);
@@ -234,9 +211,6 @@ pub fn show(
             v_hi = hi;
             vs.view = Some((v_lo, v_hi));
         }
-    }
-    if response.drag_stopped() {
-        vs.drag = None;
     }
     if response.double_clicked() {
         vs.view = None;
@@ -381,11 +355,7 @@ pub fn show(
         color,
     );
 
-    PanelOutput {
-        response,
-        ms_per_px: None,
-        drag_is_trim: false,
-    }
+    PanelOutput { response }
 }
 
 /// Pans the `(v_lo, v_hi)` frequency view by `px` display pixels, operating

@@ -10,10 +10,11 @@ cross-correlation, with sub-sample precision and automatic polarity detection. T
 two microphones on one guitar amp, one plugin instance on the track to be shifted, the other
 track routed into the sidechain. Has a custom egui editor (overlaid capture waveforms, a
 cross-correlation graph with live markers, a comb-filter spectrum panel; all graphs share one
-gesture set — drag/scroll pans, pinch or ⌘-scroll zooms the x-axis (the y-axis is always
-plugin-scaled), ⌥-drag adjusts Trim, double-click fits — see the control-bar cheat sheet,
-which spells modifiers as words because egui's default font renders ⌘ but not ⌥/⇧/←/→)
-but remains fully operable headless from the host's generic parameter UI.
+gesture set — drag/scroll pans, pinch or ⌘-scroll zooms the x-axis, the y-axis is always
+plugin-scaled, double-click fits; Trim is adjusted via its slider or ←/→ while hovering a
+graph, there is no drag-to-trim; NOTE egui's default font renders ⌘ but not ⌥/⇧/←/→, so
+UI text must spell those as words) but remains fully operable headless from the host's
+generic parameter UI.
 
 ## Commands
 

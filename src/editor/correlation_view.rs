@@ -14,8 +14,8 @@ use nih_plug_egui::egui::{
 use super::decimate::{min_max_decimate, sample_linear, MinMax};
 use super::waveform_view::nice_step;
 use super::{
-    view_math, DragKind, PanelOutput, ACCENT_DETECTED, ACCENT_LIVE, ACCENT_WARN, CURVE_COLOR,
-    GRID_COLOR, PANEL_BG, TEXT_DIM,
+    view_math, PanelOutput, ACCENT_DETECTED, ACCENT_LIVE, ACCENT_WARN, CURVE_COLOR, GRID_COLOR,
+    PANEL_BG, TEXT_DIM,
 };
 use crate::analysis::CONFIDENCE_THRESHOLD;
 use crate::shared::AnalysisSnapshot;
@@ -26,8 +26,6 @@ use crate::shared::AnalysisSnapshot;
 pub struct CorrViewState {
     /// `(x0_ms, span_ms)`; `None` = the full ±window.
     pub view: Option<(f64, f64)>,
-    /// What the in-flight drag was latched as at drag start.
-    pub drag: Option<DragKind>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -104,16 +102,6 @@ pub fn show(
     painter.rect_filled(rect, 4.0, PANEL_BG);
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, GRID_COLOR), StrokeKind::Inside);
 
-    // Latch the drag mode at gesture start: ⌥ = trim (handled centrally by
-    // mod.rs), plain = pan. A mid-gesture modifier change never switches.
-    if response.drag_started() {
-        vs.drag = Some(if ui.input(|i| i.modifiers.alt) {
-            DragKind::Trim
-        } else {
-            DragKind::Pan
-        });
-    }
-
     let snap = match args.snapshot {
         Some(s) if !s.corr.is_empty() => s,
         Some(_) => {
@@ -124,14 +112,7 @@ pub fn show(
                 FontId::proportional(13.0),
                 TEXT_DIM,
             );
-            if response.drag_stopped() {
-                vs.drag = None;
-            }
-            return PanelOutput {
-                response,
-                ms_per_px: None,
-                drag_is_trim: false,
-            };
+            return PanelOutput { response };
         }
         None => {
             painter.text(
@@ -141,14 +122,7 @@ pub fn show(
                 FontId::proportional(13.0),
                 TEXT_DIM,
             );
-            if response.drag_stopped() {
-                vs.drag = None;
-            }
-            return PanelOutput {
-                response,
-                ms_per_px: None,
-                drag_is_trim: false,
-            };
+            return PanelOutput { response };
         }
     };
 
@@ -195,16 +169,13 @@ pub fn show(
             vs.view = Some((x0, span_ms));
         }
     }
-    if vs.drag == Some(DragKind::Pan) && response.dragged() {
+    if response.dragged() {
         let dx = response.drag_delta().x;
         if dx != 0.0 && rect.width() > 1.0 {
             let delta = -dx as f64 * span_ms / rect.width() as f64;
             x0 = view_math::pan(x0, span_ms, delta, -full_ms, full_ms);
             vs.view = Some((x0, span_ms));
         }
-    }
-    if response.drag_stopped() {
-        vs.drag = None;
     }
     if response.double_clicked() {
         vs.view = None;
@@ -396,11 +367,5 @@ pub fn show(
         live_color,
     );
 
-    PanelOutput {
-        response,
-        // A degenerate panel width would give an absurd (or negative, or
-        // non-finite) drag axis; disable the gesture instead.
-        ms_per_px: (rect.width() > 1.0).then(|| span_ms / rect.width() as f64),
-        drag_is_trim: vs.drag == Some(DragKind::Trim),
-    }
+    PanelOutput { response }
 }
