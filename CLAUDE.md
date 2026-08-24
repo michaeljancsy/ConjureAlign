@@ -9,8 +9,12 @@ plugin's main input) to a reference mic (the sidechain "Reference" input) via FF
 cross-correlation, with sub-sample precision and automatic polarity detection. Typical use:
 two microphones on one guitar amp, one plugin instance on the track to be shifted, the other
 track routed into the sidechain. Has a custom egui editor (overlaid capture waveforms, a
-cross-correlation graph with live markers, drag-to-trim) but remains fully operable headless
-from the host's generic parameter UI.
+cross-correlation graph with live markers, a comb-filter spectrum panel; all graphs share one
+gesture set — drag/scroll pans, pinch or ⌘-scroll zooms the x-axis, the y-axis is always
+plugin-scaled, double-click fits; Trim is adjusted via its slider or ←/→ while hovering a
+graph, there is no drag-to-trim; NOTE egui's default font renders ⌘ but not ⌥/⇧/←/→, so
+UI text must spell those as words) but remains fully operable headless from the host's
+generic parameter UI.
 
 ## Commands
 
@@ -70,29 +74,47 @@ parameters — they are `#[persist = "..."]` fields on the Params struct (`Arc<A
 offset in ms, `Arc<AtomicBool>` polarity, `Arc<AtomicF32>` confidence). nih-plug serializes
 these into the DAW session automatically. The editor reads them lock-free every frame.
 
-Flow: the user clicks Capture in the editor (sets `CaptureState::request`, an `AtomicBool`
-the audio thread consumes every block) or flips the `capture` BoolParam (host generic
-UI/automation; the plugin never un-toggles it) → `process()` treats either as a rising edge →
-the audio thread copies mono-summed main + sidechain into pre-allocated buffers (phase
-machine: Idle → Capturing → Analyzing → Idle, an `AtomicU8`; the buffers live in an
-`AtomicRefCell` but the phases guarantee borrows never overlap) → when full,
-`context.execute_background(Task::Analyze)` → the `task_executor()` closure (owns Arc clones)
-runs FFT cross-correlation, refines the peak to sub-sample precision by maximizing the
-continuous cross-correlation (DTFT of the cross-spectrum — deliberately NOT a parabolic fit,
-which is biased on sinc-shaped peaks), detects polarity from the peak sign, then stores the
-atomics → `process()` notices the changed target and crossfades (~50 ms, dual delay-line taps,
-coalescing rapid changes) to the new delay. Silent or low-confidence captures are rejected and
-the previous offset kept; the editor shows the reason. Results are logged via `nih_log!` and
-shown in the editor's status strip.
+Flow (gated capture): the user clicks Capture in the editor (sets `CaptureState::request`,
+an `AtomicBool` the audio thread consumes every block) or turns on the `capture` BoolParam
+(host generic UI/automation; the plugin never un-toggles it) → `process()` treats either as a
+start edge and ARMS a capture → samples are recorded into the pre-allocated buffers only
+while a gate (`dsp/gate.rs`: peak envelopes on both mono sums, instant attack, −6 dB
+hysteresis, 250 ms hold; threshold = the non-automatable `gate_threshold` param, default
+−60 dBFS) is open on BOTH inputs — silent stretches are spliced out and each gate re-opening
+records a seam in `CaptureData::splices` (fixed capacity; when full the rest records
+continuously, since an untracked seam could corrupt the analysis and extra silence cannot).
+The capture stops on the editor's Stop button (`stop_request`), the `capture` param's falling
+edge, when 4 s of accumulated signal fills the buffer, or automatically once signal has been
+recorded and the gate has stayed closed for `CAPTURE_AUTO_FINISH_SECONDS` (2 s; ≈2.8 s of
+real silence including the gate's release+hold) — so playing a short clip once analyzes by
+itself instead of pausing forever. Armed never times out (an off-edge after any auto-stop is
+a no-op). Phase machine: Idle → Armed → Capturing → Analyzing → Idle, an `AtomicU8`; Armed
+means nothing recorded yet, and every transition out of Armed/Capturing is a CAS so a GUI
+cancel always wins (`cancel_capture` tries ARMED→IDLE first — the phase only moves forward,
+so that order can't drop a cancel). The buffers live in an `AtomicRefCell`; the audio thread
+borrows in Idle/Armed/Capturing, the background task in Analyzing, never overlapping. On stop
+with data, `context.execute_background(Task::Analyze)` → the `task_executor()` closure (owns
+Arc clones) runs `analyze_spliced` (zeroes ±max_shift guard regions around each seam in both
+working copies — exactly the cross-seam products — before the FFT cross-correlation), refines
+the peak to sub-sample precision by maximizing the continuous cross-correlation (DTFT of the
+cross-spectrum — deliberately NOT a parabolic fit, which is biased on sinc-shaped peaks),
+detects polarity from the peak sign, then stores the atomics → `process()` notices the
+changed target and crossfades (~50 ms, dual delay-line taps, coalescing rapid changes) to the
+new delay. Too-short or low-confidence captures are rejected and the previous offset kept;
+the editor shows the reason. A missing sidechain shows up LIVE as "Armed — waiting for signal
+(ref quiet)" from the `gate_state` bitfield rather than only as a post-hoc rejection. Results
+are logged via `nih_log!` and shown in the editor's status strip.
 
 ### GUI threading rules
 
 The editor NEVER touches `CaptureState::data` — the `AtomicRefCell` borrow discipline covers
-only the audio thread (Idle/Capturing) and the background task (Analyzing); a GUI borrow
-would panic the audio thread. Enforced by construction: the editor only receives a
-`CaptureHandle` (phase/progress reads + capture request; cannot reach `data`). Waveform and
-correlation data reach the GUI exclusively through `shared::AnalysisSnapshot` — full raw
-copies of the captures plus the normalized correlation curve per integer lag, built by the
+only the audio thread (Idle/Armed/Capturing) and the background task (Analyzing); a GUI
+borrow would panic the audio thread. Enforced by construction: the editor only receives a
+`CaptureHandle` (phase/progress/gate-state reads + capture/stop requests + cancel; cannot
+reach `data`). Waveform and correlation data reach the GUI exclusively through
+`shared::AnalysisSnapshot` — full raw copies of the captures (un-zeroed; splice seam
+positions ride along for the waveform markers) plus the normalized correlation curve per
+integer lag, built by the
 background task at the end of `Task::Analyze` (allocation is fine there) and published via
 `Mutex<Option<Arc<AnalysisSnapshot>>>` before the phase returns to Idle. The audio thread
 never touches that mutex; its only GUI-related work is a handful of atomic loads/stores per
@@ -196,11 +218,19 @@ baseview (both the rev egui-baseview pins, `9a0b42c`, and the older one nih-plug
 THE HOST when the editor window opens: AppKit now attaches the view before it has a window,
 and `msg_send![nil, isKeyWindow]` trips rustc's inserted null check. Fixed upstream one
 commit after `9a0b42c` (RustAudio/baseview#204, rev `3e12973`); Cargo.toml carries a
-`[patch."https://github.com/RustAudio/baseview.git"]` pinning that rev via the
-`michaeljancsy/baseview` fork (an unmodified mirror — cargo forbids patching a git source
-with its own URL). Do NOT remove the patch until nih-plug/egui-baseview advance past the fix;
-without it the editor crashes every host on current macOS even though pluginval passed on
-older systems. The AU path is the likeliest of the three to trip it: clap-wrapper's
+`[patch."https://github.com/RustAudio/baseview.git"]` pointing at the
+`michaeljancsy/baseview` fork's `magnify-as-ctrl-scroll` branch (rev `c1ff57c`), which is
+that fix PLUS ONE LOCAL COMMIT: stock baseview registers no `magnifyWithEvent:` handler, so
+macOS trackpad pinches produce no events at all in the editor — the commit re-encodes them
+as ctrl-scroll `WheelScrolled` events (K = 200 calibrates to egui's default scroll-zoom
+speed of 1/200, giving exp(magnification) — the native AppKit convention). That is what
+makes pinch-zoom work in every host; see deps/PATCHES.md. Do NOT remove the patch when
+nih-plug/egui-baseview advance past the #204 fix — REBASE the magnify commit onto the new
+rev instead (without #204 the editor crashes every host on current macOS; without the
+magnify commit pinch silently dies). Beware when pushing to the fork: its GitHub refs
+predate the pinned revs (objects resolve via the fork network), so pushing a branch uploads
+upstream history that touches `.github/workflows/` and needs a gh token with the `workflow`
+scope. The AU path is the likeliest of the three to trip the null-deref: clap-wrapper's
 `wrappedview.asinclude.mm` calls `gui->set_parent()` on an NSView that is not yet in a
 window, which is exactly the scenario that null-derefs.
 
@@ -261,9 +291,10 @@ main checkout, plain `cargo xtask bundle` is fine.
   is missing from the Audio FX menu, that is the first symptom of the channel-layout
   problem the `deps/` patch fixes; see the AudioUnit v2 section.
 - Null test recipe: duplicate a track, nudge the copy by a known amount (track delay or clip
-  nudge), sidechain the original into AudioAlign on the copy, play a few seconds, click
-  Capture in the plugin window (or toggle the Capture parameter); after the crossfade, invert
-  one track and sum. Expected depths (measured in
+  nudge), sidechain the original into AudioAlign on the copy, click Capture (or toggle the
+  Capture parameter) and play — recording accumulates only while both inputs clear the Gate
+  threshold, so the click can precede playback; click Stop (or toggle the parameter off, or
+  let 4 s of signal fill the buffer); after the crossfade, invert one track and sum. Expected depths (measured in
   `tests/null_depth.rs`): integer-sample offsets null below −80 dB broadband; FRACTIONAL
   offsets are floored at only −20…−30 dB broadband because no real filter can fractionally
   delay content near Nyquist — but the audible band (<0.44·fs, ≈19 kHz) nulls at −69 dB

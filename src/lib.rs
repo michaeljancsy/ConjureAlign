@@ -11,31 +11,58 @@ pub mod dsp;
 pub mod editor;
 pub mod params;
 pub mod shared;
+pub mod spectrum;
 
 use nih_plug::prelude::*;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use capture::{CaptureState, PHASE_ANALYZING, PHASE_CAPTURING, PHASE_IDLE};
+use capture::{
+    CaptureState, GATE_MAIN_QUIET, GATE_OPEN, GATE_REF_QUIET, PHASE_ANALYZING, PHASE_ARMED,
+    PHASE_CAPTURING, PHASE_IDLE,
+};
 use dsp::delay::{AlignDelay, TapSpec};
 use dsp::fractional::FIR_CENTER;
+use dsp::gate::CaptureGate;
 use params::{AudioAlignParams, PolarityMode, CAPTURE_MAX_SECS, MAX_SHIFT_MAX_MS, TRIM_RANGE_MS};
 use shared::{AnalysisSnapshot, GuiShared};
 
 const CROSSFADE_SECONDS: f32 = 0.05;
+
+/// A capture that has already recorded signal auto-finishes (stops and
+/// analyzes) once the gate has been closed this long — the short-clip
+/// workflow: play the clip once and the analysis fires by itself instead of
+/// pausing forever. With the gate's release + hold in front of it, this
+/// amounts to ≈2.8 s of real-world silence. Armed never times out; with
+/// nothing recorded it keeps waiting for signal.
+const CAPTURE_AUTO_FINISH_SECONDS: f32 = 2.0;
 
 pub struct AudioAlign {
     params: Arc<AudioAlignParams>,
     capture: Arc<CaptureState>,
     shared: Arc<GuiShared>,
     delay: AlignDelay,
+    /// Capture gate; rebuilt (allocation-free) each time a capture arms.
+    gate: CaptureGate,
     sample_rate: f32,
     prev_capture: bool,
+    /// Whether the previous gated sample was recorded — a false→true
+    /// transition with samples already written marks a splice seam.
+    prev_record: bool,
     last_latency: u32,
 }
 
 pub enum Task {
     Analyze,
+}
+
+/// Packs the gate status into the display bitfield the editor reads
+/// ([`GATE_OPEN`] | [`GATE_MAIN_QUIET`] | [`GATE_REF_QUIET`]).
+fn gate_bits(gate: &CaptureGate) -> u8 {
+    let st = gate.status();
+    (if st.open { GATE_OPEN } else { 0 })
+        | (if st.main_below { GATE_MAIN_QUIET } else { 0 })
+        | (if st.ref_below { GATE_REF_QUIET } else { 0 })
 }
 
 impl Default for AudioAlign {
@@ -44,10 +71,12 @@ impl Default for AudioAlign {
             params: Arc::new(AudioAlignParams::default()),
             capture: Arc::new(CaptureState::new()),
             shared: Arc::new(GuiShared::default()),
-            // Placeholder until `initialize()` knows the real sample rate.
+            // Placeholders until `initialize()` knows the real sample rate.
             delay: AlignDelay::new(2, 1024, 64),
+            gate: CaptureGate::new(48_000.0, 1e-3),
             sample_rate: 48_000.0,
             prev_capture: false,
+            prev_record: false,
             last_latency: 0,
         }
     }
@@ -164,10 +193,11 @@ impl Plugin for AudioAlign {
                 // collide with it.
                 let snapshot = {
                     let data = capture.data.borrow();
-                    let report = analysis::analyze_detailed(
+                    let report = analysis::analyze_spliced(
                         &data.main[..data.filled],
                         &data.reference[..data.filled],
                         data.max_shift_samples,
+                        &data.splices,
                     );
                     match report.outcome {
                         Ok(result) => {
@@ -202,12 +232,21 @@ impl Plugin for AudioAlign {
                     // background thread, inside the Analyzing phase where this
                     // task owns the borrow — is the only path waveform data
                     // ever takes to the editor.
+                    let spectrum = spectrum::welch_for_capture(
+                        &data.main[..data.filled],
+                        &data.reference[..data.filled],
+                        data.sample_rate,
+                        &report,
+                        &data.splices,
+                    );
                     Arc::new(AnalysisSnapshot {
                         main: data.main[..data.filled].to_vec(),
                         reference: data.reference[..data.filled].to_vec(),
                         sample_rate: data.sample_rate,
                         max_shift_samples: report.max_shift_samples,
                         corr: report.corr_curve,
+                        splices: data.splices.clone(),
+                        spectrum,
                         outcome: report.outcome,
                     })
                 };
@@ -249,10 +288,13 @@ impl Plugin for AudioAlign {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        // Drop any stale GUI capture request and progress so a click made
-        // while the host wasn't processing can't fire a surprise capture on
-        // the first block, and the editor can't show a stale percentage.
+        // Drop any stale GUI capture/stop request and progress so a click
+        // made while the host wasn't processing can't fire a surprise
+        // capture on the first block, and the editor can't show a stale
+        // percentage or gate state.
         self.capture.request.store(false, Ordering::Relaxed);
+        self.capture.stop_request.store(false, Ordering::Relaxed);
+        self.capture.gate_state.store(0, Ordering::Relaxed);
         self.capture.progress.store(0, Ordering::Relaxed);
         self.capture.target.store(0, Ordering::Relaxed);
         self.capture
@@ -282,17 +324,22 @@ impl Plugin for AudioAlign {
 
     fn reset(&mut self) {
         self.delay.reset();
-        // Abort a capture in flight and drop any queued GUI capture request:
+        // Abort a capture in flight and drop any queued GUI requests:
         // reset() fires when processing resumes, and a click made while the
         // host wasn't processing must not start a surprise capture now. A
         // running analysis keeps its buffers and finishes on its own.
+        // ARMED first — the phase only moves Armed→Capturing, so this order
+        // can't miss (see CaptureHandle::cancel_capture).
         self.capture.request.store(false, Ordering::Relaxed);
-        let _ = self.capture.phase.compare_exchange(
-            PHASE_CAPTURING,
-            PHASE_IDLE,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        self.capture.stop_request.store(false, Ordering::Relaxed);
+        for phase in [PHASE_ARMED, PHASE_CAPTURING] {
+            let _ = self.capture.phase.compare_exchange(
+                phase,
+                PHASE_IDLE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
     }
 
     fn process(
@@ -311,75 +358,160 @@ impl Plugin for AudioAlign {
         // path violates that (clap-validator flags it). Max Shift edits apply
         // on the next initialize() — until then all math uses last_latency.
 
-        // A rising edge on the Capture param or a GUI request starts a new
-        // capture, but only from Idle: a toggle during a running capture or
-        // analysis is ignored. The GUI request is consumed every block while
-        // running, and cleared by reset()/initialize(), so a stale click
-        // can't fire a capture long after the fact.
+        // Consume the GUI requests and the Capture param edges every block —
+        // even while running, and cleared by reset()/initialize(), so a
+        // stale click can't fire long after the fact. prev_capture updates
+        // unconditionally: a toggle that lands while non-idle must not
+        // re-fire later.
         let gui_request = self.capture.request.swap(false, Ordering::AcqRel);
+        let gui_stop = self.capture.stop_request.swap(false, Ordering::AcqRel);
         let capture_on = self.params.capture.value();
-        if ((capture_on && !self.prev_capture) || gui_request)
-            && self.capture.phase.load(Ordering::Acquire) == PHASE_IDLE
-        {
+        let rising = (capture_on && !self.prev_capture) || gui_request;
+        let falling = !capture_on && self.prev_capture;
+        self.prev_capture = capture_on;
+
+        // Stop BEFORE start, so a stop and a fresh capture request arriving
+        // in one block resolve in click order. Needs no borrow: Armed means
+        // nothing was recorded (back to Idle, previous snapshot kept), and
+        // both transitions are CASes so a GUI cancel that already landed
+        // wins — the analysis task fires only if OUR transition succeeds.
+        if gui_stop || falling {
+            let _ = self.capture.phase.compare_exchange(
+                PHASE_ARMED,
+                PHASE_IDLE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            if self
+                .capture
+                .phase
+                .compare_exchange(
+                    PHASE_CAPTURING,
+                    PHASE_ANALYZING,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                context.execute_background(Task::Analyze);
+            }
+        }
+
+        // A rising edge arms a gated capture, but only from Idle: a toggle
+        // during a running capture or analysis is ignored.
+        if rising && self.capture.phase.load(Ordering::Acquire) == PHASE_IDLE {
             {
                 let mut data = self.capture.data.borrow_mut();
-                let wanted = (self.params.capture_time.value().seconds() as f32
-                    * self.sample_rate) as usize;
-                data.target_len = wanted.min(data.main.len());
+                // The whole buffer: the gate makes this "4 s of signal", not
+                // 4 s of wall time, and a Stop can end the capture earlier.
+                data.target_len = data.main.len();
                 data.filled = 0;
+                data.splices.clear();
                 data.max_shift_samples = self.reported_window_samples();
                 data.sample_rate = self.sample_rate;
                 self.capture
                     .target
                     .store(data.target_len as u32, Ordering::Relaxed);
             }
+            self.gate = CaptureGate::new(
+                self.sample_rate,
+                nih_plug::util::db_to_gain(self.params.gate_threshold.value()),
+            );
+            self.prev_record = false;
+            self.capture
+                .gate_state
+                .store(gate_bits(&self.gate), Ordering::Relaxed);
             self.capture.progress.store(0, Ordering::Relaxed);
-            self.capture.phase.store(PHASE_CAPTURING, Ordering::Release);
+            // Blind store is fine here: only the audio thread leaves Idle.
+            self.capture.phase.store(PHASE_ARMED, Ordering::Release);
         }
-        self.prev_capture = capture_on;
 
-        // Record the pre-delay input while capturing.
-        if self.capture.phase.load(Ordering::Acquire) == PHASE_CAPTURING {
-            let (filled, full) = {
+        // Record the pre-delay input through the gate while armed/capturing.
+        let phase_now = self.capture.phase.load(Ordering::Acquire);
+        if phase_now == PHASE_ARMED || phase_now == PHASE_CAPTURING {
+            let (filled, target_len) = {
                 let mut data_guard = self.capture.data.borrow_mut();
                 // Reborrow as a plain &mut so disjoint field borrows work.
                 let data = &mut *data_guard;
                 let main_channels = buffer.as_slice_immutable();
-                let to_copy = (data.target_len - data.filled).min(num_samples);
-                for i in 0..to_copy {
-                    let mono = main_channels.iter().map(|ch| ch[i]).sum::<f32>()
+                let ref_buf = aux.inputs.first();
+                let ref_channels = ref_buf.map(|b| b.as_slice_immutable());
+                // An absent or short sidechain feeds 0.0 into the gate, so
+                // it never opens and the editor shows "ref quiet" — the live
+                // replacement for the old post-hoc Silence rejection.
+                let ref_len = ref_buf.map(|b| b.samples()).unwrap_or(0);
+                let cap = data.splices.capacity();
+                for i in 0..num_samples {
+                    if data.filled >= data.target_len {
+                        break;
+                    }
+                    let mono_main = main_channels.iter().map(|ch| ch[i]).sum::<f32>()
                         / main_channels.len() as f32;
-                    data.main[data.filled + i] = mono;
-                }
-                match aux.inputs.first() {
-                    Some(reference) => {
-                        let ref_channels = reference.as_slice_immutable();
-                        let ref_samples = reference.samples().min(to_copy);
-                        for i in 0..ref_samples {
-                            let mono = ref_channels.iter().map(|ch| ch[i]).sum::<f32>()
-                                / ref_channels.len() as f32;
-                            data.reference[data.filled + i] = mono;
+                    let mono_ref = match &ref_channels {
+                        Some(chs) if i < ref_len => {
+                            chs.iter().map(|ch| ch[i]).sum::<f32>() / chs.len() as f32
                         }
-                        for i in ref_samples..to_copy {
-                            data.reference[data.filled + i] = 0.0;
+                        _ => 0.0,
+                    };
+                    // Once the splice list is full, record continuously (an
+                    // untracked seam could corrupt the analysis; extra
+                    // silence cannot). The force-open term keys on
+                    // `== capacity` with gate.step still run: a gap can only
+                    // START below capacity, and the push terminating it
+                    // finds len == cap−1 — so no gap ever goes untracked.
+                    let record =
+                        self.gate.step(mono_main, mono_ref) || data.splices.len() == cap;
+                    if record {
+                        if !self.prev_record && data.filled > 0 && data.splices.len() < cap {
+                            // Within capacity: push never allocates.
+                            data.splices.push(data.filled);
                         }
+                        data.main[data.filled] = mono_main;
+                        data.reference[data.filled] = mono_ref;
+                        data.filled += 1;
                     }
-                    // No sidechain connected: record silence; analysis will
-                    // reject it rather than produce a bogus offset.
-                    None => {
-                        for i in 0..to_copy {
-                            data.reference[data.filled + i] = 0.0;
-                        }
-                    }
+                    self.prev_record = record;
                 }
-                data.filled += to_copy;
-                (data.filled, data.filled >= data.target_len)
+                (data.filled, data.target_len)
             };
+            self.capture
+                .gate_state
+                .store(gate_bits(&self.gate), Ordering::Relaxed);
             self.capture
                 .progress
                 .store(filled as u32, Ordering::Relaxed);
-            if full {
-                self.capture.phase.store(PHASE_ANALYZING, Ordering::Release);
+            // Promote Armed→Capturing once something was recorded. A CAS,
+            // not a store: a GUI cancel that landed mid-block must not be
+            // overwritten (a blind store would resurrect the capture).
+            let mut phase_now = phase_now;
+            if phase_now == PHASE_ARMED && filled > 0 {
+                phase_now = match self.capture.phase.compare_exchange(
+                    PHASE_ARMED,
+                    PHASE_CAPTURING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => PHASE_CAPTURING,
+                    // Cancelled mid-block; the samples already written are
+                    // harmless (filled resets at the next capture start).
+                    Err(actual) => actual,
+                };
+            }
+            let auto_finish = self.gate.closed_streak()
+                >= (CAPTURE_AUTO_FINISH_SECONDS * self.sample_rate) as u32;
+            if phase_now == PHASE_CAPTURING
+                && (filled >= target_len || auto_finish)
+                && self
+                    .capture
+                    .phase
+                    .compare_exchange(
+                        PHASE_CAPTURING,
+                        PHASE_ANALYZING,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
                 context.execute_background(Task::Analyze);
             }
         }

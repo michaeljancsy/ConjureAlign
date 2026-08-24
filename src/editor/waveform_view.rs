@@ -13,8 +13,29 @@ use nih_plug_egui::egui::{
 };
 
 use super::decimate::{min_max_decimate, MinMax};
-use super::{PanelOutput, ACCENT_MAIN, ACCENT_REF, GRID_COLOR, PANEL_BG, TEXT_DIM};
+use super::{
+    view_math, PanelOutput, ACCENT_LIVE, ACCENT_MAIN, ACCENT_REF, GRID_COLOR, PANEL_BG, TEXT_DIM,
+};
 use crate::shared::AnalysisSnapshot;
+
+/// Live capture status drawn over the waveform panel (built by `mod.rs` from
+/// the capture phase + gate bits).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CaptureOverlay {
+    Idle,
+    Armed {
+        main_quiet: bool,
+        ref_quiet: bool,
+    },
+    Capturing {
+        /// Fill fraction of the capture buffer (accumulated / capacity).
+        frac: f32,
+        /// Accumulated gated signal, seconds.
+        secs: f32,
+        /// `Some(reason)` while the gate is holding recording paused.
+        paused_reason: Option<&'static str>,
+    },
+}
 
 /// Visible window on the reference timeline, in seconds.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -69,8 +90,8 @@ pub struct WaveArgs<'a> {
     pub net_ms: f32,
     /// Draw the main waveform polarity-flipped.
     pub flip_main: bool,
-    /// `Some(fraction)` while a capture is running.
-    pub capturing: Option<f32>,
+    /// Live capture status overlay.
+    pub overlay: CaptureOverlay,
 }
 
 /// Header row + canvas. Returns the canvas response for trim-drag handling.
@@ -121,11 +142,8 @@ pub fn show(
             FontId::proportional(14.0),
             TEXT_DIM,
         );
-        draw_capture_overlay(&painter, rect, args.capturing);
-        return PanelOutput {
-            response,
-            ms_per_px: None,
-        };
+        draw_capture_overlay(&painter, rect, &args.overlay);
+        return PanelOutput { response };
     };
 
     let sr = snap.sample_rate.max(1.0) as f64;
@@ -137,7 +155,10 @@ pub fn show(
     let min_span = (16.0 / sr).min(len_s.max(1e-3));
     view.span_s = view.span_s.clamp(min_span, len_s.max(1e-3));
 
-    // --- Interactions: zoom about the cursor, scroll to pan, double-click fit.
+    // --- Interactions: drag/scroll to pan, pinch (or ⌘/⌃-scroll — egui
+    // folds both into zoom_delta) to zoom the time axis about the cursor,
+    // double-click to fit. The vertical axis is plugin-scaled, always.
+    let full = len_s.max(1e-3);
     if response.hovered() {
         let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));
         if zoom != 1.0 {
@@ -145,24 +166,40 @@ pub fn show(
                 .hover_pos()
                 .map(|p| ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0))
                 .unwrap_or(0.5) as f64;
-            let t_at = view.start_s + frac * view.span_s;
-            view.span_s = (view.span_s / zoom as f64).clamp(min_span, len_s.max(1e-3));
-            view.start_s = t_at - frac * view.span_s;
+            let (s, sp) = view_math::zoom_about(
+                view.start_s,
+                view.span_s,
+                frac,
+                zoom as f64,
+                min_span,
+                0.0,
+                full,
+            );
+            view.start_s = s;
+            view.span_s = sp;
         }
         let pan_px = if scroll.x.abs() > scroll.y.abs() {
             scroll.x
         } else {
             scroll.y
         };
-        if pan_px != 0.0 {
-            view.start_s -= pan_px as f64 * view.span_s / rect.width() as f64;
+        if pan_px != 0.0 && rect.width() > 1.0 {
+            let delta = -pan_px as f64 * view.span_s / rect.width() as f64;
+            view.start_s = view_math::pan(view.start_s, view.span_s, delta, 0.0, full);
+        }
+    }
+    if response.dragged() {
+        let dx = response.drag_delta().x;
+        if dx != 0.0 && rect.width() > 1.0 {
+            let delta = -dx as f64 * view.span_s / rect.width() as f64;
+            view.start_s = view_math::pan(view.start_s, view.span_s, delta, 0.0, full);
         }
     }
     if response.double_clicked() {
         vs.view = None;
         view = TimeView {
             start_s: 0.0,
-            span_s: len_s.max(1e-3),
+            span_s: full,
         };
     }
     view.start_s = view.start_s.clamp(0.0, (len_s - view.span_s).max(0.0));
@@ -243,6 +280,24 @@ pub fn show(
     // --- Grid ---
     draw_time_grid(&painter, rect, &view);
 
+    // Splice seams: the timeline is gated *signal*-time, and each seam marks
+    // where a silent stretch was cut out. One dashed marker per seam, on the
+    // reference timeline (the main waveform is drawn shifted, but both
+    // channels are spliced at identical positions).
+    for &s in &snap.splices {
+        let t = s as f64 / sr;
+        if t <= view.start_s || t >= view.start_s + view.span_s {
+            continue;
+        }
+        let x = rect.left() + ((t - view.start_s) / view.span_s) as f32 * rect.width();
+        painter.add(egui::Shape::dashed_line(
+            &[Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(1.0, TEXT_DIM.gamma_multiply(0.5)),
+            4.0,
+            6.0,
+        ));
+    }
+
     // --- Waveforms: reference first, ghost, then main on top. Translucent so
     // the overlap region shows both signals. Over-zoomed views (interpolated
     // buckets) draw as connected lines instead of per-column stubs.
@@ -267,14 +322,9 @@ pub fn show(
         as_line,
     );
 
-    draw_capture_overlay(&painter, rect, args.capturing);
+    draw_capture_overlay(&painter, rect, &args.overlay);
 
-    PanelOutput {
-        response,
-        // A degenerate panel width would give an absurd (or negative, or
-        // non-finite) drag axis; disable the gesture instead.
-        ms_per_px: (rect.width() > 1.0).then(|| view.span_s * 1000.0 / rect.width() as f64),
-    }
+    PanelOutput { response }
 }
 
 fn set_span(vs: &mut WaveViewState, len_s: f64, span: f64) {
@@ -289,7 +339,7 @@ fn set_span(vs: &mut WaveViewState, len_s: f64, span: f64) {
     });
 }
 
-fn legend_chip(ui: &mut Ui, color: Color32, label: &str) {
+pub(crate) fn legend_chip(ui: &mut Ui, color: Color32, label: &str) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
     ui.painter().circle_filled(rect.center(), 4.0, color);
     ui.label(egui::RichText::new(label).small());
@@ -356,20 +406,55 @@ fn draw_time_grid(painter: &egui::Painter, rect: egui::Rect, view: &TimeView) {
     );
 }
 
-fn draw_capture_overlay(painter: &egui::Painter, rect: egui::Rect, capturing: Option<f32>) {
-    let Some(frac) = capturing else { return };
-    let bar = egui::Rect::from_min_size(
-        rect.left_top(),
-        Vec2::new(rect.width() * frac.clamp(0.0, 1.0), 3.0),
-    );
-    painter.rect_filled(bar, 0.0, ACCENT_MAIN);
-    painter.text(
-        rect.center_top() + Vec2::new(0.0, 10.0),
-        Align2::CENTER_CENTER,
-        format!("Capturing… {:.0}%", frac * 100.0),
-        FontId::proportional(12.0),
-        ACCENT_MAIN,
-    );
+fn draw_capture_overlay(painter: &egui::Painter, rect: egui::Rect, overlay: &CaptureOverlay) {
+    match *overlay {
+        CaptureOverlay::Idle => {}
+        CaptureOverlay::Armed {
+            main_quiet,
+            ref_quiet,
+        } => {
+            painter.text(
+                rect.center_top() + Vec2::new(0.0, 10.0),
+                Align2::CENTER_CENTER,
+                format!("Armed — waiting for signal ({})", quiet_label(main_quiet, ref_quiet)),
+                FontId::proportional(12.0),
+                ACCENT_LIVE,
+            );
+        }
+        CaptureOverlay::Capturing {
+            frac,
+            secs,
+            paused_reason,
+        } => {
+            let bar = egui::Rect::from_min_size(
+                rect.left_top(),
+                Vec2::new(rect.width() * frac.clamp(0.0, 1.0), 3.0),
+            );
+            painter.rect_filled(bar, 0.0, ACCENT_MAIN);
+            let label = match paused_reason {
+                Some(reason) => format!("Capturing… {secs:.1} s (paused — {reason})"),
+                None => format!("Capturing… {secs:.1} s"),
+            };
+            painter.text(
+                rect.center_top() + Vec2::new(0.0, 10.0),
+                Align2::CENTER_CENTER,
+                label,
+                FontId::proportional(12.0),
+                ACCENT_MAIN,
+            );
+        }
+    }
+}
+
+/// Which input(s) are holding the gate shut, as display text.
+pub(crate) fn quiet_label(main_quiet: bool, ref_quiet: bool) -> &'static str {
+    match (main_quiet, ref_quiet) {
+        (true, true) => "both inputs quiet",
+        (true, false) => "main quiet",
+        (false, true) => "ref quiet — is the sidechain connected?",
+        // Transient: both envelopes crossed the threshold this very block.
+        (false, false) => "opening…",
+    }
 }
 
 /// 1/2/5 × 10^k step targeting roughly `target` divisions.

@@ -14,11 +14,19 @@ use nih_plug_egui::egui::{
 use super::decimate::{min_max_decimate, sample_linear, MinMax};
 use super::waveform_view::nice_step;
 use super::{
-    PanelOutput, ACCENT_DETECTED, ACCENT_LIVE, ACCENT_WARN, CURVE_COLOR, GRID_COLOR, PANEL_BG,
-    TEXT_DIM,
+    view_math, PanelOutput, ACCENT_DETECTED, ACCENT_LIVE, ACCENT_WARN, CURVE_COLOR, GRID_COLOR,
+    PANEL_BG, TEXT_DIM,
 };
 use crate::analysis::CONFIDENCE_THRESHOLD;
 use crate::shared::AnalysisSnapshot;
+
+/// Pan/zoom state for the correlation panel. The y-axis is auto-scaled by
+/// the panel, always.
+#[derive(Default)]
+pub struct CorrViewState {
+    /// `(x0_ms, span_ms)`; `None` = the full ±window.
+    pub view: Option<(f64, f64)>,
+}
 
 #[derive(PartialEq, Clone, Copy)]
 struct CorrKey {
@@ -59,18 +67,31 @@ pub fn show(
     ui: &mut Ui,
     height: f32,
     args: &CorrArgs,
-    zoom_peak: &mut bool,
+    tab: &mut super::LowerPanelTab,
+    vs: &mut CorrViewState,
     cache: &mut Option<CorrCache>,
 ) -> PanelOutput {
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Cross-correlation vs lag")
-                .small()
-                .color(TEXT_DIM),
-        );
+        super::lower_tab_selector(ui, tab);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.selectable_label(*zoom_peak, "Zoom to peak").clicked() {
-                *zoom_peak = !*zoom_peak;
+            if ui.small_button("Fit").clicked() {
+                vs.view = None;
+            }
+            let can_peak = args.snapshot.is_some_and(|s| !s.corr.is_empty());
+            if ui
+                .add_enabled(can_peak, egui::Button::new("Peak").small())
+                .on_hover_text("Zoom to ±15 ms around the detected offset")
+                .clicked()
+            {
+                if let Some(s) = args.snapshot {
+                    let sr = s.sample_rate.max(1.0) as f64;
+                    let full_ms = s.max_shift_samples as f64 / sr * 1000.0;
+                    let c = (args.detected_ms.unwrap_or(0.0) as f64).clamp(-full_ms, full_ms);
+                    let half = 15.0f64.min(full_ms);
+                    let x0 = (c - half).max(-full_ms);
+                    let x1 = (c + half).min(full_ms);
+                    vs.view = Some((x0, x1 - x0));
+                }
             }
         });
     });
@@ -91,10 +112,7 @@ pub fn show(
                 FontId::proportional(13.0),
                 TEXT_DIM,
             );
-            return PanelOutput {
-                response,
-                ms_per_px: None,
-            };
+            return PanelOutput { response };
         }
         None => {
             painter.text(
@@ -104,23 +122,68 @@ pub fn show(
                 FontId::proportional(13.0),
                 TEXT_DIM,
             );
-            return PanelOutput {
-                response,
-                ms_per_px: None,
-            };
+            return PanelOutput { response };
         }
     };
 
     let sr = snap.sample_rate.max(1.0) as f64;
     let full_ms = snap.max_shift_samples as f64 / sr * 1000.0;
-    let (x0, x1) = if *zoom_peak {
-        let c = (args.detected_ms.unwrap_or(0.0) as f64).clamp(-full_ms, full_ms);
-        let half = 15.0f64.min(full_ms);
-        ((c - half).max(-full_ms), (c + half).min(full_ms))
-    } else {
-        (-full_ms, full_ms)
+    let min_span_ms = (16.0 / sr * 1000.0).min(2.0 * full_ms);
+
+    // Resolve the view, then apply this frame's gestures to it.
+    let (mut x0, mut span_ms) = match vs.view {
+        Some((s, sp)) => {
+            let sp = sp.clamp(min_span_ms, 2.0 * full_ms);
+            (s.clamp(-full_ms, full_ms - sp), sp)
+        }
+        None => (-full_ms, 2.0 * full_ms),
     };
-    let span_ms = (x1 - x0).max(1e-6);
+    if response.hovered() {
+        let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));
+        if zoom != 1.0 {
+            let frac = response
+                .hover_pos()
+                .map(|p| ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0))
+                .unwrap_or(0.5) as f64;
+            let (s, sp) = view_math::zoom_about(
+                x0,
+                span_ms,
+                frac,
+                zoom as f64,
+                min_span_ms,
+                -full_ms,
+                full_ms,
+            );
+            x0 = s;
+            span_ms = sp;
+            vs.view = Some((x0, span_ms));
+        }
+        let pan_px = if scroll.x.abs() > scroll.y.abs() {
+            scroll.x
+        } else {
+            scroll.y
+        };
+        if pan_px != 0.0 && rect.width() > 1.0 {
+            let delta = -pan_px as f64 * span_ms / rect.width() as f64;
+            x0 = view_math::pan(x0, span_ms, delta, -full_ms, full_ms);
+            vs.view = Some((x0, span_ms));
+        }
+    }
+    if response.dragged() {
+        let dx = response.drag_delta().x;
+        if dx != 0.0 && rect.width() > 1.0 {
+            let delta = -dx as f64 * span_ms / rect.width() as f64;
+            x0 = view_math::pan(x0, span_ms, delta, -full_ms, full_ms);
+            vs.view = Some((x0, span_ms));
+        }
+    }
+    if response.double_clicked() {
+        vs.view = None;
+        x0 = -full_ms;
+        span_ms = 2.0 * full_ms;
+    }
+    let span_ms = span_ms.max(1e-6);
+    let x1 = x0 + span_ms;
     let x_of = |lag_ms: f64| rect.left() + ((lag_ms - x0) / span_ms) as f32 * rect.width();
     let idx_of = |lag_ms: f64| lag_ms / 1000.0 * sr + snap.max_shift_samples as f64;
 
@@ -304,10 +367,5 @@ pub fn show(
         live_color,
     );
 
-    PanelOutput {
-        response,
-        // A degenerate panel width would give an absurd (or negative, or
-        // non-finite) drag axis; disable the gesture instead.
-        ms_per_px: (rect.width() > 1.0).then(|| span_ms / rect.width() as f64),
-    }
+    PanelOutput { response }
 }

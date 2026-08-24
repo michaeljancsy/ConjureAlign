@@ -142,3 +142,40 @@ crate. Upstream clap-wrapper has no issue tracking the missing `audio-ports-conf
 as of this writing; the related AUv2 channel-count bug is PR #496, which is merged only to
 the `next` branch and is a different defect (it is harmless here, because AUSDK's default
 element format is stereo and matches our layout-0 ports).
+
+---
+
+# Patched `baseview` fork (not vendored — a `[patch]` in the root Cargo.toml)
+
+`[patch."https://github.com/RustAudio/baseview.git"]` points at
+`michaeljancsy/baseview`, branch `magnify-as-ctrl-scroll` (rev `c1ff57c`). That branch is
+upstream's RustAudio/baseview#204 null-deref fix (`3e12973`, the rev the fork originally
+pinned unmodified) **plus one commit**:
+
+## The patch: deliver macOS trackpad pinches at all
+
+**Problem.** baseview's macOS view registers `scrollWheel:` but no `magnifyWithEvent:`
+handler, and its event enum has no pinch/zoom variant. A trackpad pinch over the editor
+therefore produces **no events whatsoever** — pinch-zoom is unimplementable from inside the
+plugin, in every host.
+
+**Fix.** One added handler in `src/macos/view.rs` that re-encodes each magnify event as a
+precise scroll-wheel event with the CTRL modifier forced on:
+
+```text
+magnifyWithEvent: → WheelScrolled { Pixels { x: 0, y: 200 · magnification }, mods | CTRL }
+```
+
+No new event variants, no egui-baseview changes: egui's `is_zoom` convention
+(`ctrl || command` + scroll = zoom) picks it up through the existing pipeline. The factor
+200 calibrates to egui's default `scroll_zoom_speed` of 1/200, so a pinch applies
+`exp(magnification)` — the native AppKit `1 + magnification` convention, compounded across
+the gesture. The event's real modifiers ride along. Magnify gestures have no momentum phase;
+the began/ended phases carry `magnification == 0` and synthesize harmless zero deltas.
+
+**Maintenance.** When nih-plug/egui-baseview move past `3e12973`, rebase this one commit
+onto the new upstream rev and update the `[patch]` rev — do not drop the fork. Note the
+fork's GitHub refs are years older than the pinned revs (the objects resolve via GitHub's
+fork network), so pushing any branch based on modern upstream uploads history touching
+`.github/workflows/` and requires a gh token with the `workflow` scope
+(`gh auth refresh -h github.com -s workflow`).
