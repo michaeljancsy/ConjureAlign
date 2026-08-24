@@ -95,6 +95,8 @@ pub struct WaveArgs<'a> {
 }
 
 /// Header row + canvas. Returns the canvas response for trim-drag handling.
+/// `height` is the panel's TOTAL height — the canvas gets what the header
+/// row leaves, so the caller can budget without guessing a header height.
 pub fn show(
     ui: &mut Ui,
     height: f32,
@@ -108,7 +110,7 @@ pub fn show(
         .unwrap_or(0.0);
 
     // --- Header: legend + raw ghost toggle + zoom presets ---
-    ui.horizontal(|ui| {
+    let header = ui.horizontal(|ui| {
         legend_chip(ui, ACCENT_MAIN, "Main");
         legend_chip(ui, ACCENT_REF, "Reference");
         ui.add_space(8.0);
@@ -128,8 +130,10 @@ pub fn show(
     });
 
     let width = ui.available_width();
-    let (response, painter) =
-        ui.allocate_painter(Vec2::new(width, height), Sense::click_and_drag());
+    let (response, painter) = ui.allocate_painter(
+        Vec2::new(width, super::canvas_height(ui, height, &header.response)),
+        Sense::click_and_drag(),
+    );
     let rect = response.rect.shrink(1.0);
     painter.rect_filled(rect, 4.0, PANEL_BG);
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, GRID_COLOR), StrokeKind::Inside);

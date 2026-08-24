@@ -48,6 +48,11 @@ pub(crate) const ACCENT_DETECTED: Color32 = Color32::from_rgb(0x81, 0xc7, 0x84);
 pub(crate) const ACCENT_LIVE: Color32 = Color32::from_rgb(0xff, 0xd5, 0x4f); // yellow
 pub(crate) const ACCENT_WARN: Color32 = Color32::from_rgb(0xe5, 0x73, 0x73); // red
 pub(crate) const CURVE_COLOR: Color32 = Color32::from_rgb(0x64, 0xb5, 0xf6); // blue
+// The capture button's fills — deliberately the loudest thing in the window,
+// since nothing else happens until a user finds it. Green when idle (press
+// me), red while a capture is running (recording, press to stop).
+const CAPTURE_GREEN: Color32 = Color32::from_rgb(0x34, 0xc7, 0x59);
+const CAPTURE_RED: Color32 = Color32::from_rgb(0xff, 0x3b, 0x30);
 
 /// What a panel hands back so the shared arrow-key trim nudge can run on it.
 pub struct PanelOutput {
@@ -63,7 +68,7 @@ pub enum LowerPanelTab {
 }
 
 /// The tab strip both lower panels place at the left of their header row (a
-/// row of its own would break the fixed `PANEL_HEADER_H` layout budget).
+/// row of its own would eat into the graph below it).
 pub(crate) fn lower_tab_selector(ui: &mut egui::Ui, tab: &mut LowerPanelTab) {
     for (value, label) in [
         (LowerPanelTab::Correlation, "Correlation"),
@@ -78,9 +83,45 @@ pub(crate) fn lower_tab_selector(ui: &mut egui::Ui, tab: &mut LowerPanelTab) {
     }
 }
 
+/// What is left of a panel's total height once its header row and the
+/// spacing below it are taken off. Panels measure their own header instead
+/// of the caller assuming one, so the split below always adds up and the
+/// window bottom never shows dead space.
+pub(crate) fn canvas_height(ui: &egui::Ui, total: f32, header: &egui::Response) -> f32 {
+    (total - header.rect.height() - ui.spacing().item_spacing.y).max(40.0)
+}
+
+/// The gesture legend, drawn in the lower panel's header row — that row's
+/// height is already budgeted, so the legend costs none of its own. It
+/// truncates rather than wrapping when the window is narrow. Modifiers are
+/// spelled out: egui's default font renders ⌘ but not ⌥/⇧/arrows (boxes).
+pub(crate) fn gesture_legend(ui: &mut egui::Ui) {
+    // Allocated to exactly what is left of the row: a bare truncating label
+    // asks for the full available width, which inside a right-to-left layout
+    // grows the row and shoves its buttons off the panel's right edge.
+    let size = egui::Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(
+        size,
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "drag / scroll: pan  ·  pinch or cmd-scroll: zoom  ·  \
+                         arrow keys: nudge trim  ·  double-click: fit",
+                    )
+                    .small()
+                    .color(TEXT_DIM),
+                )
+                .truncate(),
+            );
+        },
+    );
+}
+
 /// GUI-only state, alive as long as the editor object (survives window
-/// close/reopen).
-struct EditorState {
+/// close/reopen). Public for the same reason as [`draw_ui`].
+pub struct EditorState {
     /// Latest snapshot the GUI has seen; compared to the published one by
     /// pointer each frame.
     snapshot: Option<Arc<AnalysisSnapshot>>,
@@ -97,9 +138,6 @@ struct EditorState {
     /// bases follow-up edits on this instead of the (possibly stale)
     /// parameter; cleared once the parameter catches up.
     pending_trim: Option<f32>,
-    /// Measured control-bar height from the previous frame; the panel split
-    /// uses it so no dead space accumulates at the window bottom.
-    control_bar_h: f32,
     /// Measured width of the Capture/Align/Polarity row, for centering it.
     capture_row_w: f32,
 }
@@ -119,9 +157,19 @@ impl Default for EditorState {
             spectrum_log: true,
             spectrum_cache: None,
             pending_trim: None,
-            // Estimates for the first frame only; measured thereafter.
-            control_bar_h: 84.0,
+            // Estimate for the first frame only; measured thereafter.
             capture_row_w: 300.0,
+        }
+    }
+}
+
+impl EditorState {
+    /// Preview-only: state that already holds a snapshot, as if an analysis
+    /// had just published one (see [`draw_ui`]).
+    pub fn with_snapshot(snapshot: Arc<AnalysisSnapshot>) -> Self {
+        Self {
+            snapshot: Some(snapshot),
+            ..Self::default()
         }
     }
 }
@@ -179,7 +227,9 @@ pub fn create(
     )
 }
 
-fn draw_ui(
+/// The whole editor body, one window margin in. Public so the `gui-preview`
+/// example can render it headless (see examples/gui_preview.rs).
+pub fn draw_ui(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
     state: &mut EditorState,
@@ -201,15 +251,41 @@ fn draw_ui(
     status_strip(ui, params, capture, shared, state.snapshot.as_deref(), net_ms, net_clamped);
     ui.separator();
 
-    // Control bar at the bottom; the panels split the rest. Its height is
-    // MEASURED (last frame's, stored in state) rather than budgeted, so the
-    // window bottom never shows dead space when the bar's real height and a
-    // hardcoded estimate disagree.
-    const PANEL_HEADER_H: f32 = 26.0;
-    let avail =
-        (ui.available_height() - state.control_bar_h - 2.0 * PANEL_HEADER_H).max(180.0);
-    let wave_h = (avail * 0.58).max(110.0);
-    let corr_h = (avail - wave_h - 12.0).max(80.0);
+    // The control bar sizes itself as a bottom panel and the graphs take
+    // exactly what is left, so nothing has to budget a height it can only
+    // guess at — which is what used to leave dead black space under the bar.
+    // Bottom first: a central panel claims whatever the panels above and
+    // below it did not.
+    egui::TopBottomPanel::bottom("audio-align-controls")
+        .frame(egui::Frame::new())
+        .show_inside(ui, |ui| {
+            ui.add_space(6.0);
+            control_bar(ui, setter, params, &mut state.capture_row_w);
+        });
+
+    egui::CentralPanel::default()
+        .frame(egui::Frame::new())
+        .show_inside(ui, |ui| {
+            graphs(ui, setter, state, params, shared, capture, net_ms, net_clamped, phase);
+        });
+}
+
+/// The two stacked graph panels, filling the central region exactly: the
+/// waveform takes its share of the height, the lower panel takes the rest.
+#[allow(clippy::too_many_arguments)]
+fn graphs(
+    ui: &mut egui::Ui,
+    setter: &ParamSetter,
+    state: &mut EditorState,
+    params: &AudioAlignParams,
+    shared: &GuiShared,
+    capture: &CaptureHandle,
+    net_ms: f32,
+    net_clamped: bool,
+    phase: u8,
+) {
+    const PANEL_GAP: f32 = 4.0;
+    let wave_h = ((ui.available_height() - PANEL_GAP) * 0.58).max(110.0);
 
     let gate = capture.gate_state();
     let overlay = match phase {
@@ -259,7 +335,10 @@ fn draw_ui(
         .inner;
     handle_trim_nudge(ui, &wave_out, setter, params, &mut state.pending_trim);
 
-    ui.add_space(4.0);
+    ui.add_space(PANEL_GAP);
+    // Whatever the waveform panel and the gap left: no leftover, by
+    // construction.
+    let corr_h = ui.available_height().max(80.0);
 
     let lower_out = match state.lower_tab {
         LowerPanelTab::Correlation => {
@@ -313,12 +392,6 @@ fn draw_ui(
         }
     };
     handle_trim_nudge(ui, &lower_out, setter, params, &mut state.pending_trim);
-
-    ui.add_space(6.0);
-    let bar = ui.scope(|ui| {
-        control_bar(ui, setter, params, capture, phase, &mut state.capture_row_w)
-    });
-    state.control_bar_h = bar.response.rect.height() + 6.0;
 }
 
 /// The currently applied shift in ms and whether the window clamp kicked in.
@@ -347,6 +420,64 @@ fn active_window_ms(shared: &GuiShared) -> Option<f32> {
     Some(w as f32 / sr.max(1.0) * 1000.0)
 }
 
+/// A status message that truncates instead of running under the capture
+/// button when the window is narrow.
+fn status_label(ui: &mut egui::Ui, color: Color32, text: String) {
+    ui.add(egui::Label::new(egui::RichText::new(text).color(color)).truncate());
+}
+
+/// The capture control, top right of the status strip. Its buttons are
+/// egui's default height, which is also the strip's minimum row height, so
+/// it rides along without making that section any taller.
+fn capture_button(ui: &mut egui::Ui, capture: &CaptureHandle, phase: u8) {
+    match phase {
+        // Stop analyzes what was recorded; Cancel discards. A host that
+        // stops processing mid-capture freezes the phase machine, and a
+        // Stop stays pending until playback resumes — Cancel, which acts
+        // directly from the GUI thread, is the escape hatch.
+        PHASE_ARMED | PHASE_CAPTURING => {
+            if ui
+                .add(capture_toggle("⏹ Stop", CAPTURE_RED, Color32::WHITE))
+                .on_hover_text("Stop and analyze what was recorded")
+                .clicked()
+            {
+                capture.request_stop();
+            }
+            if ui
+                .button("✕ Cancel")
+                .on_hover_text("Discard the capture in progress")
+                .clicked()
+            {
+                capture.cancel_capture();
+            }
+        }
+        PHASE_ANALYZING => {
+            ui.add_enabled(
+                false,
+                capture_toggle("⏺ Capture…", CAPTURE_GREEN, Color32::BLACK),
+            );
+        }
+        _ => {
+            if ui
+                .add(capture_toggle("⏺ Capture", CAPTURE_GREEN, Color32::BLACK))
+                .on_hover_text(
+                    "Arm a gated capture: records while both inputs are above \
+                     the Gate threshold, then re-detects the offset",
+                )
+                .clicked()
+            {
+                capture.request_capture();
+            }
+        }
+    }
+}
+
+/// Black text on green, white on red: each is the readable pairing on its
+/// own fill.
+fn capture_toggle(label: &str, fill: Color32, text: Color32) -> egui::Button<'_> {
+    egui::Button::new(egui::RichText::new(label).strong().color(text)).fill(fill)
+}
+
 fn status_strip(
     ui: &mut egui::Ui,
     params: &AudioAlignParams,
@@ -357,67 +488,80 @@ fn status_strip(
     net_clamped: bool,
 ) {
     ui.horizontal(|ui| {
-        match capture.phase() {
-            PHASE_ARMED => {
-                let gate = capture.gate_state();
-                ui.colored_label(
-                    ACCENT_LIVE,
-                    format!(
-                        "● Armed — waiting for signal ({})",
-                        quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)
-                    ),
-                );
-            }
-            PHASE_CAPTURING => {
-                let (filled, _) = capture.progress();
-                let (_, sr) = shared.window();
-                let secs = filled as f32 / sr.max(1.0);
-                let gate = capture.gate_state();
-                if gate & GATE_OPEN == 0 {
-                    ui.colored_label(
-                        ACCENT_MAIN,
-                        format!(
-                            "● Capturing {secs:.1} s (paused — {}; analyzes after ~2 s of silence)",
-                            quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)
-                        ),
-                    );
-                } else {
-                    ui.colored_label(ACCENT_MAIN, format!("● Capturing {secs:.1} s"));
+        // Right-to-left outer layout: the capture button claims the right
+        // edge first, so a long status line crowds itself rather than
+        // squeezing the one control a new user has to find.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            capture_button(ui, capture, capture.phase());
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                match capture.phase() {
+                    PHASE_ARMED => {
+                        let gate = capture.gate_state();
+                        // Truncating, not wrapping: these messages are the
+                        // long ones, and the row now ends at the capture
+                        // button rather than at the window edge.
+                        status_label(
+                            ui,
+                            ACCENT_LIVE,
+                            format!(
+                                "● Armed — waiting for signal ({})",
+                                quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)
+                            ),
+                        );
+                    }
+                    PHASE_CAPTURING => {
+                        let (filled, _) = capture.progress();
+                        let (_, sr) = shared.window();
+                        let secs = filled as f32 / sr.max(1.0);
+                        let gate = capture.gate_state();
+                        if gate & GATE_OPEN == 0 {
+                            status_label(
+                                ui,
+                                ACCENT_MAIN,
+                                format!(
+                                    "● Capturing {secs:.1} s (paused — {}; analyzes after ~2 s of silence)",
+                                    quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)
+                                ),
+                            );
+                        } else {
+                            ui.colored_label(ACCENT_MAIN, format!("● Capturing {secs:.1} s"));
+                        }
+                    }
+                    PHASE_ANALYZING => {
+                        ui.colored_label(ACCENT_LIVE, "● Analyzing…");
+                        ui.spinner();
+                    }
+                    _ => {
+                        ui.colored_label(TEXT_DIM, "● Idle");
+                    }
                 }
-            }
-            PHASE_ANALYZING => {
-                ui.colored_label(ACCENT_LIVE, "● Analyzing…");
-                ui.spinner();
-            }
-            _ => {
-                ui.colored_label(TEXT_DIM, "● Idle");
-            }
-        }
-        ui.separator();
+                ui.separator();
 
-        let conf = params.detected_confidence.load(Ordering::Relaxed);
-        if conf > 0.0 {
-            let off = params.detected_offset_ms.load(Ordering::Relaxed);
-            let pol = params.detected_polarity.load(Ordering::Relaxed);
-            ui.label(format!("Detected {off:+.2} ms"));
-            ui.label(format!("Confidence {:.0}%", conf * 100.0));
-            ui.label(if pol {
-                "Polarity inverted"
-            } else {
-                "Polarity normal"
+                let conf = params.detected_confidence.load(Ordering::Relaxed);
+                if conf > 0.0 {
+                    let off = params.detected_offset_ms.load(Ordering::Relaxed);
+                    let pol = params.detected_polarity.load(Ordering::Relaxed);
+                    ui.label(format!("Detected {off:+.2} ms"));
+                    ui.label(format!("Confidence {:.0}%", conf * 100.0));
+                    ui.label(if pol {
+                        "Polarity inverted"
+                    } else {
+                        "Polarity normal"
+                    });
+                } else {
+                    ui.colored_label(TEXT_DIM, "No offset detected yet");
+                }
+                ui.separator();
+
+                if !params.align_on.value() {
+                    ui.colored_label(TEXT_DIM, "Alignment off");
+                } else if net_clamped {
+                    ui.colored_label(ACCENT_WARN, format!("Applied {net_ms:+.2} ms (clamped)"));
+                } else {
+                    ui.label(format!("Applied {net_ms:+.2} ms"));
+                }
             });
-        } else {
-            ui.colored_label(TEXT_DIM, "No offset detected yet");
-        }
-        ui.separator();
-
-        if !params.align_on.value() {
-            ui.colored_label(TEXT_DIM, "Alignment off");
-        } else if net_clamped {
-            ui.colored_label(ACCENT_WARN, format!("Applied {net_ms:+.2} ms (clamped)"));
-        } else {
-            ui.label(format!("Applied {net_ms:+.2} ms"));
-        }
+        });
     });
 
     if let Some(Err(reason)) = snapshot.map(|s| s.outcome) {
@@ -447,8 +591,6 @@ fn control_bar(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
     params: &AudioAlignParams,
-    capture: &CaptureHandle,
-    phase: u8,
     capture_row_w: &mut f32,
 ) {
     ui.horizontal(|ui| {
@@ -457,47 +599,6 @@ fn control_bar(
         let pad = ((ui.available_width() - *capture_row_w) / 2.0).max(0.0);
         ui.add_space(pad);
         let row_start = ui.cursor().left();
-        match phase {
-            // Stop analyzes what was recorded; Cancel discards. A host that
-            // stops processing mid-capture freezes the phase machine, and a
-            // Stop stays pending until playback resumes — Cancel, which
-            // acts directly from the GUI thread, is the escape hatch.
-            PHASE_ARMED | PHASE_CAPTURING => {
-                if ui
-                    .button(egui::RichText::new("⏹ Stop").strong())
-                    .on_hover_text("Stop and analyze what was recorded")
-                    .clicked()
-                {
-                    capture.request_stop();
-                }
-                if ui
-                    .button("✕ Cancel")
-                    .on_hover_text("Discard the capture in progress")
-                    .clicked()
-                {
-                    capture.cancel_capture();
-                }
-            }
-            PHASE_ANALYZING => {
-                ui.add_enabled(
-                    false,
-                    egui::Button::new(egui::RichText::new("⏺ Capture…").strong()),
-                );
-            }
-            _ => {
-                if ui
-                    .button(egui::RichText::new("⏺ Capture").strong())
-                    .on_hover_text(
-                        "Arm a gated capture: records while both inputs are above \
-                         the Gate threshold, then re-detects the offset",
-                    )
-                    .clicked()
-                {
-                    capture.request_capture();
-                }
-            }
-        }
-        ui.separator();
         bool_toggle(ui, setter, &params.align_on, "Align");
         ui.separator();
         ui.label(egui::RichText::new("Polarity").small().color(TEXT_DIM));

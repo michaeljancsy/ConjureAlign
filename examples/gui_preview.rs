@@ -11,8 +11,11 @@ use audio_align::editor::correlation_view::{self, CorrArgs, CorrViewState};
 use audio_align::editor::spectrum_view::{self, SpecViewState, SpectrumArgs};
 use audio_align::editor::waveform_view::{self, CaptureOverlay, WaveArgs, WaveViewState};
 use audio_align::editor::LowerPanelTab;
-use audio_align::shared::AnalysisSnapshot;
+use audio_align::capture::CaptureState;
+use audio_align::params::AudioAlignParams;
+use audio_align::shared::{AnalysisSnapshot, GuiShared};
 use audio_align::spectrum;
+use nih_plug::prelude::{GuiContext, ParamPtr, ParamSetter, PluginApi, PluginState};
 use nih_plug_egui::egui;
 
 fn main() {
@@ -106,6 +109,69 @@ fn main() {
         None,
         LowerPanelTab::Spectrum,
     );
+    // Scene 5: the WHOLE editor — status strip, both panels and the control
+    // bar — which is the only way to see the vertical budget (dead space at
+    // the window bottom, a clipped control bar) rather than just the graphs.
+    render_full(&out.replace(".png", "_full.png"), &snapshot, detected_ms);
+}
+
+/// A `GuiContext` that goes nowhere: `ParamSetter` needs one, and the editor
+/// only ever writes parameters through it, which a preview must not do.
+struct StubGuiContext;
+
+impl GuiContext for StubGuiContext {
+    fn plugin_api(&self) -> PluginApi {
+        PluginApi::Clap
+    }
+    fn request_resize(&self) -> bool {
+        true
+    }
+    unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
+    unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, _normalized: f32) {}
+    unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
+    fn get_state(&self) -> PluginState {
+        unimplemented!("the editor never asks a preview for plugin state")
+    }
+    fn set_state(&self, _state: PluginState) {
+        unimplemented!("the editor never restores state in a preview")
+    }
+}
+
+/// Renders `editor::draw_ui` at the real minimum window size, one window
+/// margin in — the same wrapping the editor's own `create()` uses.
+fn render_full(out: &str, snapshot: &Arc<AnalysisSnapshot>, detected_ms: f32) {
+    let params = AudioAlignParams::default();
+    params
+        .detected_offset_ms
+        .store(detected_ms, std::sync::atomic::Ordering::Relaxed);
+    params
+        .detected_confidence
+        .store(0.9, std::sync::atomic::Ordering::Relaxed);
+    let shared = GuiShared::default();
+    shared.set_window(960, snapshot.sample_rate);
+    *shared.snapshot.lock().unwrap() = Some(snapshot.clone());
+    let capture = Arc::new(CaptureState::new()).handle();
+    let mut state = audio_align::editor::EditorState::with_snapshot(snapshot.clone());
+
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::Vec2::new(600.0, 460.0))
+        .build_ui(move |ui| {
+            ui.ctx().set_visuals(egui::Visuals::dark());
+            let ctx = StubGuiContext;
+            let setter = ParamSetter::new(&ctx);
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    audio_align::editor::draw_ui(
+                        ui, &setter, &mut state, &params, &shared, &capture,
+                    );
+                });
+        });
+
+    harness.run();
+    let image = harness.render().expect("wgpu offscreen render");
+    image.save(out).expect("write png");
+    println!("wrote {out}");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -141,7 +207,8 @@ fn render_scene(
                 flip_main: false,
                 overlay: CaptureOverlay::Idle,
             };
-            waveform_view::show(ui, 270.0, &wave_args, &mut show_raw, &mut wave_state);
+            // Panel heights are TOTALS (header row included).
+            waveform_view::show(ui, 296.0, &wave_args, &mut show_raw, &mut wave_state);
             ui.add_space(6.0);
             match tab {
                 LowerPanelTab::Correlation => {
@@ -156,7 +223,7 @@ fn render_scene(
                     };
                     correlation_view::show(
                         ui,
-                        200.0,
+                        226.0,
                         &corr_args,
                         &mut tab,
                         &mut corr_state,
@@ -172,7 +239,7 @@ fn render_scene(
                     };
                     spectrum_view::show(
                         ui,
-                        200.0,
+                        226.0,
                         &spec_args,
                         &mut tab,
                         &mut spectrum_log,

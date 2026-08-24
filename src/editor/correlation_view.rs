@@ -63,6 +63,7 @@ pub struct CorrArgs<'a> {
     pub active_window_ms: Option<f32>,
 }
 
+/// `height` is the panel's TOTAL height, header row included.
 pub fn show(
     ui: &mut Ui,
     height: f32,
@@ -71,7 +72,7 @@ pub fn show(
     vs: &mut CorrViewState,
     cache: &mut Option<CorrCache>,
 ) -> PanelOutput {
-    ui.horizontal(|ui| {
+    let header = ui.horizontal(|ui| {
         super::lower_tab_selector(ui, tab);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.small_button("Fit").clicked() {
@@ -93,11 +94,19 @@ pub fn show(
                     vs.view = Some((x0, x1 - x0));
                 }
             }
+            // Fills the row's dead middle, so the legend costs no height.
+            ui.add_space(8.0);
+            super::gesture_legend(ui);
         });
     });
 
-    let (response, painter) =
-        ui.allocate_painter(Vec2::new(ui.available_width(), height), Sense::click_and_drag());
+    let (response, painter) = ui.allocate_painter(
+        Vec2::new(
+            ui.available_width(),
+            super::canvas_height(ui, height, &header.response),
+        ),
+        Sense::click_and_drag(),
+    );
     let rect = response.rect.shrink(1.0);
     painter.rect_filled(rect, 4.0, PANEL_BG);
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, GRID_COLOR), StrokeKind::Inside);
