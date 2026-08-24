@@ -12,9 +12,17 @@ track routed into the sidechain. Has a custom egui editor (overlaid capture wave
 cross-correlation graph with live markers, a comb-filter spectrum panel; all graphs share one
 gesture set — drag/scroll pans, pinch or ⌘-scroll zooms the x-axis, the y-axis is always
 plugin-scaled, double-click fits; Trim is adjusted via its slider or ←/→ while hovering a
-graph, there is no drag-to-trim; NOTE egui's default font renders ⌘ but not ⌥/⇧/←/→, so
-UI text must spell those as words) but remains fully operable headless from the host's
-generic parameter UI.
+graph, there is no drag-to-trim; the lower panel's header row carries a legend spelling
+the gesture set out — it rides in that already-budgeted row rather than a line of its own,
+and words the modifiers because egui's default font renders ⌘ but not ⌥/⇧/←/→) but
+remains fully operable headless from the host's generic parameter UI. Capture/Stop/Cancel
+sit at the top right of the status strip — the primary button is bright green when idle and
+bright red while a capture runs, because it is the one control a new user must find, and it
+fits the strip's existing row height. The
+editor body is
+a bottom panel (control bar, sizes itself) plus a central panel (the graphs, take exactly
+what is left); panels are handed a TOTAL height and subtract their own measured header
+row, so nothing budgets a guessed height and no dead space collects at the window bottom.
 
 ## Commands
 
@@ -31,8 +39,11 @@ generic parameter UI.
 - Lint: `cargo clippy --all-targets` (and `--features gui-preview,standalone` to cover the
   dev-only targets)
 - GUI visual check without a DAW: `cargo run --example gui_preview --features gui-preview`
-  renders the two panels with synthetic data (known +5 ms offset) to `gui_preview.png` and
-  `gui_preview_zoom.png` via egui_kittest's offscreen wgpu renderer, or run the plugin
+  renders synthetic data (known +5 ms offset) through egui_kittest's offscreen wgpu
+  renderer: the panels alone (`gui_preview.png`, `_zoom`, `_spectrum`, `_spectrum_trim`)
+  and — via a stub `GuiContext` behind a `ParamSetter` — the WHOLE editor at its 600×460
+  minimum window (`_full.png`), which is the only scene that shows the vertical budget
+  (dead space under the control bar, a clipped bar). Or run the plugin
   interactively with `cargo run --bin standalone --features standalone -- --backend dummy`
   (works thanks to the baseview `[patch]` — see Known upstream issues).
 - CLAP validation: `clap-validator validate target/bundled/AudioAlign.clap`

@@ -80,9 +80,8 @@ pub struct SpectrumArgs<'a> {
     pub align_on: bool,
 }
 
-/// Header row + canvas. `ms_per_px` is always `None`: a drag along a
-/// frequency axis has no meaning in milliseconds, so the shared trim-drag
-/// gesture stays inert on this panel.
+/// Header row + canvas. `height` is the panel's TOTAL height, header row
+/// included.
 pub fn show(
     ui: &mut Ui,
     height: f32,
@@ -92,7 +91,7 @@ pub fn show(
     vs: &mut SpecViewState,
     cache: &mut Option<SpectrumCache>,
 ) -> PanelOutput {
-    ui.horizontal(|ui| {
+    let header = ui.horizontal(|ui| {
         super::lower_tab_selector(ui, tab);
         ui.add_space(8.0);
         legend_chip(ui, CURVE_COLOR.gamma_multiply(0.55), "Captured sum");
@@ -107,12 +106,20 @@ pub fn show(
                 // The two axis spaces don't share a meaningful view.
                 vs.view = None;
             }
+            // Fills the row's dead middle, so the legend costs no height.
+            ui.add_space(8.0);
+            super::gesture_legend(ui);
         });
     });
     let log = *log_axis;
 
-    let (response, painter) =
-        ui.allocate_painter(Vec2::new(ui.available_width(), height), Sense::click_and_drag());
+    let (response, painter) = ui.allocate_painter(
+        Vec2::new(
+            ui.available_width(),
+            super::canvas_height(ui, height, &header.response),
+        ),
+        Sense::click_and_drag(),
+    );
     let rect = response.rect.shrink(1.0);
     painter.rect_filled(rect, 4.0, PANEL_BG);
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, GRID_COLOR), StrokeKind::Inside);
