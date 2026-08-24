@@ -1,8 +1,8 @@
-[audio_align]
-name = "AudioAlign"
+[conjure_align]
+name = "ConjureAlign"
 
 # AudioUnit v2 identity — the single source of truth. xtask writes these into
-# AudioAlign.component/Contents/Info.plist; nih_plug_xtask parses this file into a struct
+# ConjureAlign.component/Contents/Info.plist; nih_plug_xtask parses this file into a struct
 # that only has `name` and ignores everything else, so this table is ours alone. The plugin
 # binary never sees these values: nih-plug does not export CLAP's
 # `clap.plugin-factory-info-as-auv2.draft0` factory, so an AU host can only learn them from
@@ -11,7 +11,7 @@ name = "AudioAlign"
 # `subtype` + `manufacturer` are the identity every saved Logic session keys on. Changing
 # either orphans every project that used the plugin. Apple reserves all-lowercase
 # manufacturer codes, so `manufacturer` must contain an uppercase character.
-[audio_align.auv2]
+[conjure_align.auv2]
 # kAudioUnitType_Effect. Logic only offers its Side Chain menu for `aufx` units that
 # publish two or more input busses.
 type = "aufx"
@@ -19,10 +19,10 @@ subtype = "ALGN"
 manufacturer = "CONJ"
 # Display only: Logic groups its plugin menu by the text before the colon in the
 # AudioComponents `name`. This matches the other CONJ-manufacturer plugins so they all
-# file under one submenu; the plugin's CLAP/VST3 vendor string in src/lib.rs is
-# separate and still reads "Michael Jancsy".
+# file under one submenu, and the CLAP/VST3 vendor string in src/lib.rs matches it,
+# so every format shelves the plugin under the same brand.
 manufacturer_name = "ConjureDSP"
-bundle_id = "com.michaeljancsy.audio-align.component"
+bundle_id = "com.michaeljancsy.conjure-align.component"
 # Keep in sync with CLAP_DESCRIPTION in src/lib.rs.
 description = "Time-aligns a mic signal to a sidechain reference"
 # Logic files the plugin into its Audio FX menu by these; it understands a fixed

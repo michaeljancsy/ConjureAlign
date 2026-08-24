@@ -8,5 +8,5 @@
 //! non-interactive alternative (renders PNGs offscreen).
 
 fn main() {
-    nih_plug::nih_export_standalone::<audio_align::AudioAlign>();
+    nih_plug::nih_export_standalone::<conjure_align::ConjureAlign>();
 }

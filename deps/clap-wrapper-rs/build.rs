@@ -5,7 +5,7 @@ use std::{
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    // AudioAlign patch: upstream only watches build.rs, so edits to the vendored C++
+    // ConjureAlign patch: upstream only watches build.rs, so edits to the vendored C++
     // silently do not rebuild — you keep testing the previous binary. We patch these
     // sources (see deps/PATCHES.md), so watch them too. Emitting any rerun-if-changed also
     // switches off cargo's default whole-package watch, which makes a hand-picked list of

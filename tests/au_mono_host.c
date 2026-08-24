@@ -1,4 +1,4 @@
-// Minimal AU host: instantiate AudioAlign, force a MONO stream format on the main busses,
+// Minimal AU host: instantiate ConjureAlign, force a MONO stream format on the main busses,
 // initialise, and render. Verifies that clap-wrapper's audio-ports-config selection really
 // reached the CLAP plugin — if it did not, the wrapped plugin still believes it is stereo
 // while the buffers are mono, and processes a shape it did not agree to.

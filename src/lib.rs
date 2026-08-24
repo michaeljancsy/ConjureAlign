@@ -1,4 +1,4 @@
-//! AudioAlign: time-aligns the main input to a sidechain reference.
+//! ConjureAlign: time-aligns the main input to a sidechain reference.
 //!
 //! The three load-bearing design decisions — the persisted-atomics state
 //! model, the latency/PDC trick, and the GUI threading rules (the editor
@@ -24,7 +24,7 @@ use capture::{
 use dsp::delay::{AlignDelay, TapSpec};
 use dsp::fractional::FIR_CENTER;
 use dsp::gate::CaptureGate;
-use params::{AudioAlignParams, PolarityMode, CAPTURE_MAX_SECS, MAX_SHIFT_MAX_MS, TRIM_RANGE_MS};
+use params::{ConjureAlignParams, PolarityMode, CAPTURE_MAX_SECS, MAX_SHIFT_MAX_MS, TRIM_RANGE_MS};
 use shared::{AnalysisSnapshot, GuiShared};
 
 const CROSSFADE_SECONDS: f32 = 0.05;
@@ -37,8 +37,8 @@ const CROSSFADE_SECONDS: f32 = 0.05;
 /// nothing recorded it keeps waiting for signal.
 const CAPTURE_AUTO_FINISH_SECONDS: f32 = 2.0;
 
-pub struct AudioAlign {
-    params: Arc<AudioAlignParams>,
+pub struct ConjureAlign {
+    params: Arc<ConjureAlignParams>,
     capture: Arc<CaptureState>,
     shared: Arc<GuiShared>,
     delay: AlignDelay,
@@ -65,10 +65,10 @@ fn gate_bits(gate: &CaptureGate) -> u8 {
         | (if st.ref_below { GATE_REF_QUIET } else { 0 })
 }
 
-impl Default for AudioAlign {
+impl Default for ConjureAlign {
     fn default() -> Self {
         Self {
-            params: Arc::new(AudioAlignParams::default()),
+            params: Arc::new(ConjureAlignParams::default()),
             capture: Arc::new(CaptureState::new()),
             shared: Arc::new(GuiShared::default()),
             // Placeholders until `initialize()` knows the real sample rate.
@@ -82,7 +82,7 @@ impl Default for AudioAlign {
     }
 }
 
-impl AudioAlign {
+impl ConjureAlign {
     /// Reported latency: the PDC trick, computed from the Max Shift parameter.
     /// Only ever *reported* during `initialize()` — CLAP allows latency changes
     /// only around activation, so a Max Shift edit takes effect the next time
@@ -128,9 +128,9 @@ impl AudioAlign {
     }
 }
 
-impl Plugin for AudioAlign {
-    const NAME: &'static str = "AudioAlign";
-    const VENDOR: &'static str = "Michael Jancsy";
+impl Plugin for ConjureAlign {
+    const NAME: &'static str = "ConjureAlign";
+    const VENDOR: &'static str = "ConjureDSP";
     const URL: &'static str = env!("CARGO_PKG_HOMEPAGE");
     const EMAIL: &'static str = "michaeljancsy@gmail.com";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -213,7 +213,7 @@ impl Plugin for AudioAlign {
                                 .detected_confidence
                                 .store(result.confidence, Ordering::Relaxed);
                             nih_log!(
-                                "AudioAlign: detected offset {:.3} ms ({:.2} samples), \
+                                "ConjureAlign: detected offset {:.3} ms ({:.2} samples), \
                                  polarity {}, confidence {:.2}",
                                 offset_ms,
                                 result.offset_samples,
@@ -223,7 +223,7 @@ impl Plugin for AudioAlign {
                         }
                         Err(reason) => {
                             nih_log!(
-                                "AudioAlign: analysis rejected ({:?}); keeping previous offset",
+                                "ConjureAlign: analysis rejected ({:?}); keeping previous offset",
                                 reason
                             );
                         }
@@ -525,8 +525,8 @@ impl Plugin for AudioAlign {
     }
 }
 
-impl ClapPlugin for AudioAlign {
-    const CLAP_ID: &'static str = "com.michaeljancsy.audio-align";
+impl ClapPlugin for ConjureAlign {
+    const CLAP_ID: &'static str = "com.michaeljancsy.conjure-align";
     // The AudioUnit build repeats this string in `bundler.toml`; keep the two in
     // sync. xtask can't read it from here without depending on this crate, which
     // would mean building egui just to run the bundler.
@@ -542,14 +542,14 @@ impl ClapPlugin for AudioAlign {
     ];
 }
 
-impl Vst3Plugin for AudioAlign {
-    const VST3_CLASS_ID: [u8; 16] = *b"MJancsyAudioAlgn";
+impl Vst3Plugin for ConjureAlign {
+    const VST3_CLASS_ID: [u8; 16] = *b"MJancsyConjrAlgn";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
         &[Vst3SubCategory::Fx, Vst3SubCategory::Tools];
 }
 
-nih_export_clap!(AudioAlign);
-nih_export_vst3!(AudioAlign);
+nih_export_clap!(ConjureAlign);
+nih_export_vst3!(ConjureAlign);
 
 // AudioUnit v2, macOS only. clap-wrapper wraps the `clap_entry` above behind
 // `GetPluginFactoryAUV2`, an AudioComponentFactoryFunction — so this one dylib

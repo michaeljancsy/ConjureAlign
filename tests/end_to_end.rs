@@ -3,9 +3,9 @@
 //! delay line exactly as `process()` would, and measure the residual
 //! misalignment of the output against the reference.
 
-use audio_align::analysis;
-use audio_align::dsp::delay::{AlignDelay, TapSpec};
-use audio_align::dsp::fractional::FIR_CENTER;
+use conjure_align::analysis;
+use conjure_align::dsp::delay::{AlignDelay, TapSpec};
+use conjure_align::dsp::fractional::FIR_CENTER;
 
 /// Deterministic white noise (xorshift).
 fn noise(len: usize, seed: u64) -> Vec<f32> {

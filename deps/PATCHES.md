@@ -27,7 +27,7 @@ validated.
 
 ## The patch: let the AU reach every channel layout
 
-**Problem.** AudioAlign publishes two `AUDIO_IO_LAYOUTS` — Stereo (2 in / 2 out plus a
+**Problem.** ConjureAlign publishes two `AUDIO_IO_LAYOUTS` — Stereo (2 in / 2 out plus a
 2-channel "Reference" sidechain) and Mono (1/1 plus a 1-channel sidechain). nih-plug exposes
 these through CLAP's `audio-ports-config` extension, with the layout index as the config id.
 
@@ -37,7 +37,7 @@ clap-wrapper's AUv2 wrapper never looks at that extension. It derives everything
 capabilities `[2, 2]` and nothing else.
 
 That is not a cosmetic limitation: **Logic filters its Audio FX menu by what a plugin can
-actually instantiate as, so a stereo-only AudioAlign simply does not appear on a mono
+actually instantiate as, so a stereo-only ConjureAlign simply does not appear on a mono
 track.** That was the reported symptom.
 
 **Fix**, all in existing files (no files added or removed):
@@ -110,7 +110,7 @@ elements for every plugin and every host, extension or no extension.
 ## Verifying the patch after a change
 
 ```bash
-cargo xtask bundle audio_align --release   # see CLAUDE.md for the worktree caveat
+cargo xtask bundle conjure_align --release   # see CLAUDE.md for the worktree caveat
 # install to ~/Library/Audio/Plug-Ins/Components/, then:
 killall -9 AudioComponentRegistrar; auval -v aufx ALGN CONJ
 ```

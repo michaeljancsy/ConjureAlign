@@ -35,7 +35,7 @@ pub enum PolarityMode {
 }
 
 #[derive(Params)]
-pub struct AudioAlignParams {
+pub struct ConjureAlignParams {
     /// The host-automation / generic-UI capture control. On = arm; the gated
     /// capture then records while both inputs are above the gate threshold.
     /// The falling edge stops it and analyzes what was recorded (an off-edge
@@ -90,7 +90,7 @@ pub struct AudioAlignParams {
     pub editor_state: Arc<EguiState>,
 }
 
-impl Default for AudioAlignParams {
+impl Default for ConjureAlignParams {
     fn default() -> Self {
         Self {
             capture: BoolParam::new("Capture", false),

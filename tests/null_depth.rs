@@ -8,9 +8,9 @@
 //! null. Integer offsets have no such limit. Run with `--nocapture` to see the
 //! measured table.
 
-use audio_align::analysis;
-use audio_align::dsp::delay::{AlignDelay, TapSpec};
-use audio_align::dsp::fractional::FIR_CENTER;
+use conjure_align::analysis;
+use conjure_align::dsp::delay::{AlignDelay, TapSpec};
+use conjure_align::dsp::fractional::FIR_CENTER;
 
 fn noise(len: usize, seed: u64) -> Vec<f32> {
     let mut state = seed.max(1);

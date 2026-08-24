@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-AudioAlign: a VST3 + CLAP + AudioUnit v2 plugin built on nih-plug that time-aligns a mic signal (the
+ConjureAlign: a VST3 + CLAP + AudioUnit v2 plugin built on nih-plug that time-aligns a mic signal (the
 plugin's main input) to a reference mic (the sidechain "Reference" input) via FFT
 cross-correlation, with sub-sample precision and automatic polarity detection. Typical use:
 two microphones on one guitar amp, one plugin instance on the track to be shifted, the other
@@ -26,11 +26,11 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
 
 ## Commands
 
-- Build + bundle (debug): `cargo xtask bundle audio_align`
-- Build + bundle (release): `cargo xtask bundle audio_align --release`
-  - Bundles land in `target/bundled/AudioAlign.clap`, `.vst3` and (macOS)
+- Build + bundle (debug): `cargo xtask bundle conjure_align`
+- Build + bundle (release): `cargo xtask bundle conjure_align --release`
+  - Bundles land in `target/bundled/ConjureAlign.clap`, `.vst3` and (macOS)
     `.component` — one cdylib with three entry points, copied into three bundles
-- macOS universal binary: `cargo xtask bundle-universal audio_align --release`
+- macOS universal binary: `cargo xtask bundle-universal conjure_align --release`
 - Install locally (macOS): copy bundles to `~/Library/Audio/Plug-Ins/CLAP/`,
   `~/Library/Audio/Plug-Ins/VST3/` and `~/Library/Audio/Plug-Ins/Components/`
   (the AU must live in one of the two `Components` directories; nowhere else works)
@@ -46,10 +46,10 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   (dead space under the control bar, a clipped bar). Or run the plugin
   interactively with `cargo run --bin standalone --features standalone -- --backend dummy`
   (works thanks to the baseview `[patch]` — see Known upstream issues).
-- CLAP validation: `clap-validator validate target/bundled/AudioAlign.clap`
+- CLAP validation: `clap-validator validate target/bundled/ConjureAlign.clap`
   (needs rustc ≥1.95 to `cargo install`; otherwise download the binary from
   free-audio/clap-validator GitHub releases)
-- VST3 validation: `pluginval --strictness-level 10 target/bundled/AudioAlign.vst3`
+- VST3 validation: `pluginval --strictness-level 10 target/bundled/ConjureAlign.vst3`
 - AU validation: install the `.component`, then
   `killall -9 AudioComponentRegistrar; auval -v aufx ALGN CONJ` (add `-strict` for the
   pedantic pass). The `;` is deliberate — `AudioComponentRegistrar` is an on-demand daemon,
@@ -133,7 +133,7 @@ block (capture request swap, progress). The snapshot is deliberately not persist
 session reload the GUI shows the restored detected values but no waveforms until the next
 capture. The editor decimates the raw snapshot per zoom level GUI-side
 (`editor/decimate.rs`, pure + unit-tested); the applied-shift math in `editor::net_shift`
-mirrors `AudioAlign::current_target` — keep the two in sync. Editor window size persists via
+mirrors `ConjureAlign::current_target` — keep the two in sync. Editor window size persists via
 `#[persist = "editor-state"]` (`Arc<EguiState>`).
 
 Sign convention (pinned by the `sign_convention` test in `analysis.rs`):
@@ -193,7 +193,7 @@ clap-wrapper derives `AUChannelInfo` from the *current* CLAP audio-ports config,
 `audio-ports-config::select`, and rejects in `ValidFormat` any stream format whose channel
 count differs from that config's port — pinning the AU to layout 0 and advertising `[2, 2]`
 only. Since Logic filters its Audio FX menu by what a plugin can actually instantiate as,
-that made AudioAlign invisible on mono tracks. `deps/clap-wrapper-rs` is therefore a
+that made ConjureAlign invisible on mono tracks. `deps/clap-wrapper-rs` is therefore a
 vendored copy of the crate carrying a patch that enumerates every config into
 `AUChannelInfo`, accepts their formats, and selects the matching one before activation —
 see `deps/PATCHES.md`. `auval` must report `[2, 2]  [1, 1]`.
@@ -282,27 +282,27 @@ branch the main checkout is on (this shipped a stale headless build once). Worka
 the xtask binary, then run it with `CARGO_MANIFEST_DIR` pointing at a symlink to the worktree
 that lives outside the repo tree, e.g.
 `ln -s <worktree> /tmp/aa && CARGO_MANIFEST_DIR=/tmp/aa ./target/release/xtask bundle
-audio_align --release`; bundles then land in the worktree's own `target/bundled/`. From the
+conjure_align --release`; bundles then land in the worktree's own `target/bundled/`. From the
 main checkout, plain `cargo xtask bundle` is fine.
 
 ## DAW testing notes
 
-- REAPER: add AudioAlign to the target track; open the plugin's pin connector ("2 in 2 out"
+- REAPER: add ConjureAlign to the target track; open the plugin's pin connector ("2 in 2 out"
   button), add input channels 3/4, and route the reference track there via a send. Fastest host
   for iteration; loads both CLAP and VST3.
 - Ableton Live: VST3 build; the device's header exposes a sidechain routing chooser for plugins
   declaring aux inputs — set "Audio From" to the reference track.
 - Bitwig: CLAP build; sidechain chooser in the device header.
-- Logic Pro: AU build. Copy `AudioAlign.component` to `~/Library/Audio/Plug-Ins/Components/`,
+- Logic Pro: AU build. Copy `ConjureAlign.component` to `~/Library/Audio/Plug-Ins/Components/`,
   `killall -9 AudioComponentRegistrar`, restart Logic, and confirm it validates in
   Settings → Plug-in Manager (under **ConjureDSP**; "Reset & Rescan Selection" if not).
-  Insert it as Audio FX → ConjureDSP → AudioAlign → Stereo, then pick the reference track
+  Insert it as Audio FX → ConjureDSP → ConjureAlign → Stereo, then pick the reference track
   in the **Side Chain** menu at the top right of the plugin header — if the track is not
   listed, send it to a bus and pick the bus. Works on both mono and stereo tracks — if it
   is missing from the Audio FX menu, that is the first symptom of the channel-layout
   problem the `deps/` patch fixes; see the AudioUnit v2 section.
 - Null test recipe: duplicate a track, nudge the copy by a known amount (track delay or clip
-  nudge), sidechain the original into AudioAlign on the copy, click Capture (or toggle the
+  nudge), sidechain the original into ConjureAlign on the copy, click Capture (or toggle the
   Capture parameter) and play — recording accumulates only while both inputs clear the Gate
   threshold, so the click can precede playback; click Stop (or toggle the parameter off, or
   let 4 s of signal fill the buffer); after the crossfade, invert one track and sum. Expected depths (measured in

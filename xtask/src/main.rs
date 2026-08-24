@@ -1,4 +1,4 @@
-//! AudioAlign's xtask.
+//! ConjureAlign's xtask.
 //!
 //! `bundle` and `bundle-universal` delegate to `nih_plug_xtask` for the CLAP and VST3
 //! bundles, then — on macOS — assemble the AudioUnit v2 `.component` on top of the very

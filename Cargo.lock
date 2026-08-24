@@ -280,20 +280,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "audio_align"
-version = "0.2.0"
-dependencies = [
- "atomic_float",
- "atomic_refcell",
- "clap-wrapper",
- "egui_kittest",
- "image",
- "nih_plug",
- "nih_plug_egui",
- "realfft",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -684,6 +670,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
+]
+
+[[package]]
+name = "conjure_align"
+version = "0.2.0"
+dependencies = [
+ "atomic_float",
+ "atomic_refcell",
+ "clap-wrapper",
+ "egui_kittest",
+ "image",
+ "nih_plug",
+ "nih_plug_egui",
+ "realfft",
 ]
 
 [[package]]
