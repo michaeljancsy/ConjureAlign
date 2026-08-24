@@ -11,9 +11,9 @@ two microphones on one guitar amp, one plugin instance on the track to be shifte
 track routed into the sidechain. Has a custom egui editor (overlaid capture waveforms, a
 cross-correlation graph with live markers, a comb-filter spectrum panel; all graphs share one
 gesture set — drag/scroll pans, pinch or ⌘-scroll zooms the x-axis (the y-axis is always
-plugin-scaled), ⌥-drag adjusts Trim, double-click fits; note egui's default font lacks the
-Mac modifier/arrow glyphs, so UI text must avoid ⌥/⇧/←/→) but remains fully operable
-headless from the host's generic parameter UI.
+plugin-scaled), ⌥-drag adjusts Trim, double-click fits — see the control-bar cheat sheet,
+which spells modifiers as words because egui's default font renders ⌘ but not ⌥/⇧/←/→)
+but remains fully operable headless from the host's generic parameter UI.
 
 ## Commands
 
