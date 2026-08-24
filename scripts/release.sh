@@ -108,22 +108,27 @@ echo "=== Building installer ==="
 RES="$WORK/resources"
 mkdir -p "$RES"
 cp LICENSE "$RES/license.txt"
+# Installer's HTML renderer assumes Latin-1 without an explicit charset, which turns any
+# UTF-8 byte into mojibake ("—" became "â€""). Both files therefore declare the charset AND
+# spell non-ASCII as HTML entities, so they render correctly either way.
 cat > "$RES/welcome.html" <<EOF
-<html><body style="font-family: -apple-system, sans-serif; font-size: 13px;">
+<html><head><meta charset="utf-8"></head>
+<body style="font-family: -apple-system, sans-serif; font-size: 13px;">
 <p><b>ConjureAlign $VERSION</b> time-aligns a mic signal to a reference mic with sub-sample
 precision and automatic polarity detection.</p>
 <p>This installer places the plugin into the system plug-in folders
 (<tt>/Library/Audio/Plug-Ins</tt>) for all users. All three formats are installed by
 default; click Customize to pick specific ones.</p>
 <ul>
-<li><b>Audio Unit</b> — Logic Pro, GarageBand</li>
-<li><b>VST3</b> — REAPER, Ableton Live, Cubase, Studio One</li>
-<li><b>CLAP</b> — Bitwig, REAPER</li>
+<li><b>Audio Unit</b> &mdash; Logic Pro, GarageBand</li>
+<li><b>VST3</b> &mdash; REAPER, Ableton Live, Cubase, Studio One</li>
+<li><b>CLAP</b> &mdash; Bitwig, REAPER</li>
 </ul>
 </body></html>
 EOF
 cat > "$RES/conclusion.html" <<'EOF'
-<html><body style="font-family: -apple-system, sans-serif; font-size: 13px;">
+<html><head><meta charset="utf-8"></head>
+<body style="font-family: -apple-system, sans-serif; font-size: 13px;">
 <p><b>ConjureAlign is installed.</b> Restart your DAW to pick it up.</p>
 <p>In Logic Pro it appears under Audio FX &rarr; ConjureDSP &rarr; ConjureAlign
 (first launch may revalidate plugins; check Settings &rarr; Plug-in Manager if it is
