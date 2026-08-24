@@ -14,6 +14,19 @@ slider, or with ←/→ while hovering a graph (0.01 ms per tap; hold Shift for 
 
 ![The ConjureAlign editor: overlaid captured waveforms above the cross-correlation curve with the detected peak marked](docs/screenshot.png)
 
+## Installation (macOS)
+
+Download `ConjureAlign-<version>-macOS.pkg` from the
+[latest release](https://github.com/michaeljancsy/ConjureAlign/releases/latest) and
+double-click it. The installer is signed and notarized; it offers all three formats —
+**Audio Unit** (Logic Pro, GarageBand), **VST3** (REAPER, Ableton Live, Cubase, Studio
+One), **CLAP** (Bitwig, REAPER) — and puts them in the system plug-in folders
+(`/Library/Audio/Plug-Ins`). Click Customize to install only some of them. Restart your
+DAW afterwards; in Logic the plugin appears under Audio FX → ConjureDSP → ConjureAlign.
+
+If you previously copied the bundles into `~/Library/Audio/Plug-Ins` by hand, delete
+those copies so your DAW doesn't keep loading the old version.
+
 ## How to use it
 
 1. Put **ConjureAlign on the track you want to shift** (usually the more distant mic).

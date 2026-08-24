@@ -60,6 +60,11 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   sidechain, and it loads the plugin in-process without building the Cocoa view — a green
   `auval` says nothing about the editor or about AU sandboxing. Logic's Plug-in Manager is
   the real test.
+- Release: `./scripts/release.sh` — universal build, sign, notarize, and package into
+  `dist/ConjureAlign-<version>-macOS.pkg`, a signed installer whose component packages
+  target `/Library/Audio/Plug-Ins/{VST3,CLAP,Components}` (AU postinstall clears the
+  AudioComponentRegistrar cache). Signing the pkg needs the "Developer ID **Installer**"
+  cert — a different cert from the "Developer ID Application" one that signs the bundles.
 - Toolchain: stable Rust. nih_plug is a git dependency (not on crates.io); Cargo.lock pins the
   rev. `atomic_float` in Cargo.toml must stay on the same version nih_plug uses, because its
   `AtomicF32` implements nih_plug's `PersistentField`.
