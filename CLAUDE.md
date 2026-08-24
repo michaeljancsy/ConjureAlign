@@ -9,8 +9,10 @@ plugin's main input) to a reference mic (the sidechain "Reference" input) via FF
 cross-correlation, with sub-sample precision and automatic polarity detection. Typical use:
 two microphones on one guitar amp, one plugin instance on the track to be shifted, the other
 track routed into the sidechain. Has a custom egui editor (overlaid capture waveforms, a
-cross-correlation graph with live markers, drag-to-trim) but remains fully operable headless
-from the host's generic parameter UI.
+cross-correlation graph with live markers, a comb-filter spectrum panel; all graphs share one
+gesture set — drag/scroll pans, pinch or ⌘-scroll zooms the x-axis (the y-axis is always
+plugin-scaled), ⌥-drag adjusts Trim, double-click fits — see the control-bar cheat sheet)
+but remains fully operable headless from the host's generic parameter UI.
 
 ## Commands
 
@@ -214,11 +216,19 @@ baseview (both the rev egui-baseview pins, `9a0b42c`, and the older one nih-plug
 THE HOST when the editor window opens: AppKit now attaches the view before it has a window,
 and `msg_send![nil, isKeyWindow]` trips rustc's inserted null check. Fixed upstream one
 commit after `9a0b42c` (RustAudio/baseview#204, rev `3e12973`); Cargo.toml carries a
-`[patch."https://github.com/RustAudio/baseview.git"]` pinning that rev via the
-`michaeljancsy/baseview` fork (an unmodified mirror — cargo forbids patching a git source
-with its own URL). Do NOT remove the patch until nih-plug/egui-baseview advance past the fix;
-without it the editor crashes every host on current macOS even though pluginval passed on
-older systems. The AU path is the likeliest of the three to trip it: clap-wrapper's
+`[patch."https://github.com/RustAudio/baseview.git"]` pointing at the
+`michaeljancsy/baseview` fork's `magnify-as-ctrl-scroll` branch (rev `c1ff57c`), which is
+that fix PLUS ONE LOCAL COMMIT: stock baseview registers no `magnifyWithEvent:` handler, so
+macOS trackpad pinches produce no events at all in the editor — the commit re-encodes them
+as ctrl-scroll `WheelScrolled` events (K = 200 calibrates to egui's default scroll-zoom
+speed of 1/200, giving exp(magnification) — the native AppKit convention). That is what
+makes pinch-zoom work in every host; see deps/PATCHES.md. Do NOT remove the patch when
+nih-plug/egui-baseview advance past the #204 fix — REBASE the magnify commit onto the new
+rev instead (without #204 the editor crashes every host on current macOS; without the
+magnify commit pinch silently dies). Beware when pushing to the fork: its GitHub refs
+predate the pinned revs (objects resolve via the fork network), so pushing a branch uploads
+upstream history that touches `.github/workflows/` and needs a gh token with the `workflow`
+scope. The AU path is the likeliest of the three to trip the null-deref: clap-wrapper's
 `wrappedview.asinclude.mm` calls `gui->set_parent()` on an NSView that is not yet in a
 window, which is exactly the scenario that null-derefs.
 

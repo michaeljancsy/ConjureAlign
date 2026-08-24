@@ -15,22 +15,39 @@ use super::decimate::MinMax;
 use super::freq_scale::{bucket_curve, bucket_edges, fmt_hz, log_ticks};
 use super::waveform_view::{legend_chip, nice_step};
 use super::{
-    LowerPanelTab, PanelOutput, ACCENT_LIVE, CURVE_COLOR, GRID_COLOR, PANEL_BG, TEXT_DIM,
+    view_math, DragKind, LowerPanelTab, PanelOutput, ACCENT_LIVE, CURVE_COLOR, GRID_COLOR,
+    PANEL_BG, TEXT_DIM,
 };
 use crate::shared::AnalysisSnapshot;
 use crate::spectrum::synth_sum_db;
 
-/// Fixed height of the dB axis; the top adapts to the data (see `y_top_db`).
+/// Fixed height of the dB axis; the top adapts to the data (`y_top_db`).
 const SPAN_DB: f32 = 60.0;
 /// Lower bound of the log-frequency axis.
 const LOG_F_LO: f64 = 20.0;
 
+/// Pan/zoom state for the spectrum panel. The dB axis is plugin-scaled,
+/// always.
+#[derive(Default)]
+pub struct SpecViewState {
+    /// `(f_lo, f_hi)` in Hz; `None` = the axis mode's full range. Reset when
+    /// the log/linear mode toggles (the two spaces don't share a view).
+    pub view: Option<(f64, f64)>,
+    /// What the in-flight drag was latched as at drag start. Always `Pan`
+    /// here — a frequency axis has no trim to drag.
+    pub drag: Option<DragKind>,
+}
+
 /// Everything that only changes with the snapshot or the view itself.
+/// (`span_db` is deliberately absent: vertical zoom only moves the y
+/// mapping, never the cached curves.)
 #[derive(PartialEq, Clone, Copy)]
 struct SpecStaticKey {
     snap: usize,
     log: bool,
     cols: usize,
+    f_lo_bits: u64,
+    f_hi_bits: u64,
 }
 
 /// Additionally what the corrected curve depends on. Split from
@@ -75,6 +92,7 @@ pub fn show(
     args: &SpectrumArgs,
     tab: &mut LowerPanelTab,
     log_axis: &mut bool,
+    vs: &mut SpecViewState,
     cache: &mut Option<SpectrumCache>,
 ) -> PanelOutput {
     ui.horizontal(|ui| {
@@ -89,6 +107,8 @@ pub fn show(
                 .clicked()
             {
                 *log_axis = !*log_axis;
+                // The two axis spaces don't share a meaningful view.
+                vs.view = None;
             }
         });
     });
@@ -99,6 +119,12 @@ pub fn show(
     let rect = response.rect.shrink(1.0);
     painter.rect_filled(rect, 4.0, PANEL_BG);
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, GRID_COLOR), StrokeKind::Inside);
+
+    // Always Pan: a frequency axis has no trim to drag, and a stray ⌥
+    // shouldn't dead-zone the gesture.
+    if response.drag_started() {
+        vs.drag = Some(DragKind::Pan);
+    }
 
     let center_message = |text: &str| {
         painter.text(
@@ -114,25 +140,109 @@ pub fn show(
             Some(spec) => spec,
             None => {
                 center_message("No spectrum — the capture was rejected before analysis");
+                if response.drag_stopped() {
+                    vs.drag = None;
+                }
                 return PanelOutput {
                     response,
                     ms_per_px: None,
+                    drag_is_trim: false,
                 };
             }
         },
         None => {
             center_message("The spectrum appears after a capture");
+            if response.drag_stopped() {
+                vs.drag = None;
+            }
             return PanelOutput {
                 response,
                 ms_per_px: None,
+                drag_is_trim: false,
             };
         }
     };
     let snap = args.snapshot.unwrap();
 
     let sr = snap.sample_rate.max(1.0) as f64;
-    let f_hi = sr / 2.0;
-    let f_lo = if log { LOG_F_LO.min(f_hi / 2.0) } else { 0.0 };
+    let base_hi = sr / 2.0;
+    let base_lo = if log { LOG_F_LO.min(base_hi / 2.0) } else { 0.0 };
+
+    // Resolve the view, then apply this frame's gestures to it. Horizontal
+    // pan/zoom operates in ln-f space on the log axis so gestures feel
+    // uniform across the decades.
+    let (mut v_lo, mut v_hi) = match vs.view {
+        Some((lo, hi)) => {
+            let lo = lo.clamp(base_lo, base_hi);
+            (lo, hi.clamp(lo + 1e-6, base_hi))
+        }
+        None => (base_lo, base_hi),
+    };
+    if response.hovered() {
+        let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));
+        if zoom != 1.0 {
+            let frac = response
+                .hover_pos()
+                .map(|p| ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0))
+                .unwrap_or(0.5) as f64;
+            if log {
+                let (bl, bh) = (base_lo.max(1e-9).ln(), base_hi.ln());
+                let l = v_lo.max(1e-9).ln();
+                let (s, sp) = view_math::zoom_about(
+                    l,
+                    v_hi.ln() - l,
+                    frac,
+                    zoom as f64,
+                    std::f64::consts::LN_2 / 2.0, // half an octave
+                    bl,
+                    bh,
+                );
+                v_lo = s.exp();
+                v_hi = (s + sp).exp();
+            } else {
+                let (s, sp) = view_math::zoom_about(
+                    v_lo,
+                    v_hi - v_lo,
+                    frac,
+                    zoom as f64,
+                    200.0,
+                    base_lo,
+                    base_hi,
+                );
+                v_lo = s;
+                v_hi = s + sp;
+            }
+            vs.view = Some((v_lo, v_hi));
+        }
+        let pan_px = if scroll.x.abs() > scroll.y.abs() {
+            scroll.x
+        } else {
+            scroll.y
+        };
+        if pan_px != 0.0 && rect.width() > 1.0 {
+            let (lo, hi) = pan_view(log, v_lo, v_hi, pan_px, rect.width(), base_lo, base_hi);
+            v_lo = lo;
+            v_hi = hi;
+            vs.view = Some((v_lo, v_hi));
+        }
+    }
+    if vs.drag == Some(DragKind::Pan) && response.dragged() {
+        let dx = response.drag_delta().x;
+        if dx != 0.0 && rect.width() > 1.0 {
+            let (lo, hi) = pan_view(log, v_lo, v_hi, dx, rect.width(), base_lo, base_hi);
+            v_lo = lo;
+            v_hi = hi;
+            vs.view = Some((v_lo, v_hi));
+        }
+    }
+    if response.drag_stopped() {
+        vs.drag = None;
+    }
+    if response.double_clicked() {
+        vs.view = None;
+        v_lo = base_lo;
+        v_hi = base_hi;
+    }
 
     // --- Curves (cached; the corrected one is keyed separately so a trim
     // drag re-synthesizes only what changed) ---
@@ -141,6 +251,8 @@ pub fn show(
         snap: Arc::as_ptr(snap) as usize,
         log,
         cols,
+        f_lo_bits: v_lo.to_bits(),
+        f_hi_bits: v_hi.to_bits(),
     };
     let live_key = SpecLiveKey {
         stat: static_key,
@@ -162,7 +274,7 @@ pub fn show(
     });
     if rebuild_static {
         let bin_hz = sr / spec.nfft as f64;
-        c.edges = bucket_edges(f_lo.max(bin_hz * 1e-3), f_hi, bin_hz, cols, log);
+        c.edges = bucket_edges(v_lo.max(bin_hz * 1e-3), v_hi, bin_hz, cols, log);
         synth_sum_db(spec, 0.0, false, &mut c.captured_db);
         c.captured_env = bucket_curve(&c.captured_db, &c.edges);
         let max_db = c.captured_db.iter().fold(f32::MIN, |m, &v| m.max(v));
@@ -180,9 +292,9 @@ pub fn show(
 
     let x_of = |f: f64| -> f32 {
         let t = if log {
-            (f / f_lo.max(1e-9)).ln() / (f_hi / f_lo.max(1e-9)).ln()
+            (f / v_lo.max(1e-9)).ln() / (v_hi / v_lo.max(1e-9)).ln()
         } else {
-            (f - f_lo) / (f_hi - f_lo)
+            (f - v_lo) / (v_hi - v_lo)
         };
         rect.left() + (t as f32).clamp(0.0, 1.0) * rect.width()
     };
@@ -194,12 +306,15 @@ pub fn show(
     // --- Grid ---
     let stroke = Stroke::new(1.0, GRID_COLOR);
     let ticks: Vec<f64> = if log {
-        log_ticks(f_lo, f_hi)
+        log_ticks(v_lo, v_hi)
     } else {
-        let step = nice_step(f_hi - f_lo, 8.0);
+        let step = nice_step(v_hi - v_lo, 8.0);
         let mut ticks = Vec::new();
-        let mut f = step;
-        while f < f_hi {
+        let mut f = (v_lo / step).ceil() * step;
+        if f <= 0.0 {
+            f = step;
+        }
+        while f < v_hi {
             ticks.push(f);
             f += step;
         }
@@ -269,6 +384,31 @@ pub fn show(
     PanelOutput {
         response,
         ms_per_px: None,
+        drag_is_trim: false,
+    }
+}
+
+/// Pans the `(v_lo, v_hi)` frequency view by `px` display pixels, operating
+/// in ln-f space on the log axis so the pan speed is uniform per decade.
+fn pan_view(
+    log: bool,
+    v_lo: f64,
+    v_hi: f64,
+    px: f32,
+    width: f32,
+    base_lo: f64,
+    base_hi: f64,
+) -> (f64, f64) {
+    if log {
+        let (bl, bh) = (base_lo.max(1e-9).ln(), base_hi.ln());
+        let l = v_lo.max(1e-9).ln();
+        let span = v_hi.ln() - l;
+        let s = view_math::pan(l, span, -(px as f64) * span / width as f64, bl, bh);
+        (s.exp(), (s + span).exp())
+    } else {
+        let span = v_hi - v_lo;
+        let s = view_math::pan(v_lo, span, -(px as f64) * span / width as f64, base_lo, base_hi);
+        (s, s + span)
     }
 }
 

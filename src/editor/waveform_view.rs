@@ -13,7 +13,10 @@ use nih_plug_egui::egui::{
 };
 
 use super::decimate::{min_max_decimate, MinMax};
-use super::{PanelOutput, ACCENT_LIVE, ACCENT_MAIN, ACCENT_REF, GRID_COLOR, PANEL_BG, TEXT_DIM};
+use super::{
+    view_math, DragKind, PanelOutput, ACCENT_LIVE, ACCENT_MAIN, ACCENT_REF, GRID_COLOR, PANEL_BG,
+    TEXT_DIM,
+};
 use crate::shared::AnalysisSnapshot;
 
 /// Live capture status drawn over the waveform panel (built by `mod.rs` from
@@ -47,6 +50,8 @@ pub struct WaveViewState {
     /// `None` = fit the whole capture.
     pub view: Option<TimeView>,
     pub cache: Option<WaveCache>,
+    /// What the in-flight drag was latched as at drag start.
+    pub drag: Option<DragKind>,
 }
 
 /// Key for the shift-independent envelopes (reference + unshifted ghost).
@@ -132,6 +137,16 @@ pub fn show(
     painter.rect_filled(rect, 4.0, PANEL_BG);
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, GRID_COLOR), StrokeKind::Inside);
 
+    // Latch the drag mode at gesture start: ⌥ = trim (handled centrally by
+    // mod.rs), plain = pan. A mid-gesture modifier change never switches.
+    if response.drag_started() {
+        vs.drag = Some(if ui.input(|i| i.modifiers.alt) {
+            DragKind::Trim
+        } else {
+            DragKind::Pan
+        });
+    }
+
     let Some(snap) = args.snapshot else {
         painter.text(
             rect.center(),
@@ -141,9 +156,13 @@ pub fn show(
             TEXT_DIM,
         );
         draw_capture_overlay(&painter, rect, &args.overlay);
+        if response.drag_stopped() {
+            vs.drag = None;
+        }
         return PanelOutput {
             response,
             ms_per_px: None,
+            drag_is_trim: false,
         };
     };
 
@@ -156,7 +175,10 @@ pub fn show(
     let min_span = (16.0 / sr).min(len_s.max(1e-3));
     view.span_s = view.span_s.clamp(min_span, len_s.max(1e-3));
 
-    // --- Interactions: zoom about the cursor, scroll to pan, double-click fit.
+    // --- Interactions: drag/scroll to pan, pinch (or ⌘/⌃-scroll — egui
+    // folds both into zoom_delta) to zoom the time axis about the cursor,
+    // double-click to fit. The vertical axis is plugin-scaled, always.
+    let full = len_s.max(1e-3);
     if response.hovered() {
         let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));
         if zoom != 1.0 {
@@ -164,24 +186,43 @@ pub fn show(
                 .hover_pos()
                 .map(|p| ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0))
                 .unwrap_or(0.5) as f64;
-            let t_at = view.start_s + frac * view.span_s;
-            view.span_s = (view.span_s / zoom as f64).clamp(min_span, len_s.max(1e-3));
-            view.start_s = t_at - frac * view.span_s;
+            let (s, sp) = view_math::zoom_about(
+                view.start_s,
+                view.span_s,
+                frac,
+                zoom as f64,
+                min_span,
+                0.0,
+                full,
+            );
+            view.start_s = s;
+            view.span_s = sp;
         }
         let pan_px = if scroll.x.abs() > scroll.y.abs() {
             scroll.x
         } else {
             scroll.y
         };
-        if pan_px != 0.0 {
-            view.start_s -= pan_px as f64 * view.span_s / rect.width() as f64;
+        if pan_px != 0.0 && rect.width() > 1.0 {
+            let delta = -pan_px as f64 * view.span_s / rect.width() as f64;
+            view.start_s = view_math::pan(view.start_s, view.span_s, delta, 0.0, full);
         }
+    }
+    if vs.drag == Some(DragKind::Pan) && response.dragged() {
+        let dx = response.drag_delta().x;
+        if dx != 0.0 && rect.width() > 1.0 {
+            let delta = -dx as f64 * view.span_s / rect.width() as f64;
+            view.start_s = view_math::pan(view.start_s, view.span_s, delta, 0.0, full);
+        }
+    }
+    if response.drag_stopped() {
+        vs.drag = None;
     }
     if response.double_clicked() {
         vs.view = None;
         view = TimeView {
             start_s: 0.0,
-            span_s: len_s.max(1e-3),
+            span_s: full,
         };
     }
     view.start_s = view.start_s.clamp(0.0, (len_s - view.span_s).max(0.0));
@@ -311,6 +352,7 @@ pub fn show(
         // A degenerate panel width would give an absurd (or negative, or
         // non-finite) drag axis; disable the gesture instead.
         ms_per_px: (rect.width() > 1.0).then(|| view.span_s * 1000.0 / rect.width() as f64),
+        drag_is_trim: vs.drag == Some(DragKind::Trim),
     }
 }
 

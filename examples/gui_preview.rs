@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use audio_align::analysis;
-use audio_align::editor::correlation_view::{self, CorrArgs};
-use audio_align::editor::spectrum_view::{self, SpectrumArgs};
+use audio_align::editor::correlation_view::{self, CorrArgs, CorrViewState};
+use audio_align::editor::spectrum_view::{self, SpecViewState, SpectrumArgs};
 use audio_align::editor::waveform_view::{self, CaptureOverlay, WaveArgs, WaveViewState};
 use audio_align::editor::LowerPanelTab;
 use audio_align::shared::AnalysisSnapshot;
@@ -62,11 +62,12 @@ fn main() {
         detected_ms,
         net_ms,
         None,
-        false,
+        None,
         LowerPanelTab::Correlation,
     );
-    // Scene 2: zoomed to one burst + correlation zoomed to the peak — the
-    // view where the trim slide and the ghost offset are actually visible.
+    // Scene 2: zoomed to one burst + correlation zoomed to the peak (the
+    // same ±15 ms view the Peak button sets) — the view where the trim slide
+    // and the ghost offset are actually visible.
     let zoom = waveform_view::TimeView {
         start_s: 0.98,
         span_s: 0.05,
@@ -78,7 +79,7 @@ fn main() {
         detected_ms,
         net_ms,
         Some(zoom),
-        true,
+        Some((-10.0, 30.0)),
         LowerPanelTab::Correlation,
     );
     // Scene 3: spectrum tab at trim 0 — the captured sum combs with notches
@@ -90,7 +91,7 @@ fn main() {
         detected_ms,
         detected_ms,
         None,
-        false,
+        None,
         LowerPanelTab::Spectrum,
     );
     // Scene 4: trim knocks the corrected sum off-peak by 1.5 ms — it re-combs
@@ -102,7 +103,7 @@ fn main() {
         detected_ms,
         net_ms,
         None,
-        false,
+        None,
         LowerPanelTab::Spectrum,
     );
 }
@@ -114,19 +115,23 @@ fn render_scene(
     detected_ms: f32,
     net_ms: f32,
     wave_view: Option<waveform_view::TimeView>,
-    zoom_peak: bool,
+    corr_view: Option<(f64, f64)>,
     lower: LowerPanelTab,
 ) {
     let snapshot = snapshot.clone();
     let mut wave_state = WaveViewState {
         view: wave_view,
-        cache: None,
+        ..Default::default()
     };
     let mut show_raw = true;
     let mut corr_cache = None;
-    let mut zoom_peak = zoom_peak;
+    let mut corr_state = CorrViewState {
+        view: corr_view,
+        ..Default::default()
+    };
     let mut tab = lower;
     let mut spectrum_log = true;
+    let mut spec_state = SpecViewState::default();
     let mut spectrum_cache = None;
 
     let mut harness = egui_kittest::Harness::builder()
@@ -157,7 +162,7 @@ fn render_scene(
                         200.0,
                         &corr_args,
                         &mut tab,
-                        &mut zoom_peak,
+                        &mut corr_state,
                         &mut corr_cache,
                     );
                 }
@@ -174,6 +179,7 @@ fn render_scene(
                         &spec_args,
                         &mut tab,
                         &mut spectrum_log,
+                        &mut spec_state,
                         &mut spectrum_cache,
                     );
                 }

@@ -13,6 +13,7 @@ pub mod correlation_view;
 pub mod decimate;
 pub mod freq_scale;
 pub mod spectrum_view;
+pub mod view_math;
 pub mod waveform_view;
 
 use std::sync::atomic::Ordering;
@@ -31,8 +32,8 @@ use crate::capture::{
 use crate::params::{AudioAlignParams, PolarityMode, TRIM_RANGE_MS};
 use crate::shared::{AnalysisSnapshot, GuiShared};
 
-use correlation_view::{CorrArgs, CorrCache};
-use spectrum_view::{SpectrumArgs, SpectrumCache};
+use correlation_view::{CorrArgs, CorrCache, CorrViewState};
+use spectrum_view::{SpecViewState, SpectrumArgs, SpectrumCache};
 use waveform_view::{quiet_label, CaptureOverlay, WaveArgs, WaveViewState};
 
 use egui::Color32;
@@ -54,6 +55,19 @@ pub struct PanelOutput {
     /// Milliseconds of the panel's own x-axis per pixel; `None` when the
     /// panel had nothing to draw (drag does nothing then).
     pub ms_per_px: Option<f64>,
+    /// The in-flight drag was latched as a Trim gesture (⌥ held at drag
+    /// start). Plain drags pan inside the panel and must never open a trim
+    /// automation gesture.
+    pub drag_is_trim: bool,
+}
+
+/// What a drag gesture was latched as when it started. ⌥ at `drag_started`
+/// means Trim; anything else pans. A mid-gesture modifier change never
+/// switches modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragKind {
+    Pan,
+    Trim,
 }
 
 /// Which graph occupies the lower panel.
@@ -93,8 +107,9 @@ struct EditorState {
     /// pointer each frame.
     snapshot: Option<Arc<AnalysisSnapshot>>,
     wave: WaveViewState,
-    corr_zoom_peak: bool,
+    corr_view: CorrViewState,
     corr_cache: Option<CorrCache>,
+    spec_view: SpecViewState,
     show_raw: bool,
     lower_tab: LowerPanelTab,
     spectrum_log: bool,
@@ -114,8 +129,9 @@ impl Default for EditorState {
         Self {
             snapshot: None,
             wave: WaveViewState::default(),
-            corr_zoom_peak: false,
+            corr_view: CorrViewState::default(),
             corr_cache: None,
+            spec_view: SpecViewState::default(),
             show_raw: false,
             lower_tab: LowerPanelTab::default(),
             spectrum_log: true,
@@ -153,7 +169,9 @@ pub fn create(
             if changed {
                 state.snapshot = latest;
                 state.wave = WaveViewState::default();
+                state.corr_view = CorrViewState::default();
                 state.corr_cache = None;
+                state.spec_view = SpecViewState::default();
                 state.spectrum_cache = None;
             }
 
@@ -280,7 +298,7 @@ fn draw_ui(
                     corr_h,
                     &corr_args,
                     &mut state.lower_tab,
-                    &mut state.corr_zoom_peak,
+                    &mut state.corr_view,
                     &mut state.corr_cache,
                 )
             })
@@ -302,6 +320,7 @@ fn draw_ui(
                     &spec_args,
                     &mut state.lower_tab,
                     &mut state.spectrum_log,
+                    &mut state.spec_view,
                     &mut state.spectrum_cache,
                 )
             })
@@ -505,6 +524,27 @@ fn control_bar(
                 (PolarityMode::Inverted, "Invert"),
             ],
         );
+        // Gesture cheat-sheet; .truncate() so it clips (never wraps) when
+        // the Stop/Cancel buttons crowd this row at the minimum width —
+        // CONTROL_BAR_H is a fixed budget.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("⌥ drag: trim · ⌘ scroll: zoom")
+                        .small()
+                        .color(TEXT_DIM),
+                )
+                .truncate(),
+            )
+            .on_hover_text(
+                "Graph gestures:\n\
+                 • drag / scroll — pan\n\
+                 • pinch or ⌘-scroll — zoom the time/frequency axis\n\
+                 • ⌥ drag — adjust Trim (⇧ for fine)\n\
+                 • ← / → while hovering — nudge Trim (⇧ ×10)\n\
+                 • double-click — fit",
+            );
+        });
     });
     ui.horizontal(|ui| {
         ui.label("Trim");
@@ -582,7 +622,9 @@ fn handle_trim_gestures(
     }
     let Some(ms_per_px) = panel.ms_per_px else { return };
 
-    if response.drag_started() {
+    // Only ⌥-drags belong to trim (latched by the panel at drag start);
+    // plain drags pan inside the panel and must not open a host gesture.
+    if response.drag_started() && panel.drag_is_trim {
         if drag.is_some() {
             // A previous gesture never closed (defensive); balance it.
             setter.end_set_parameter(&params.trim);
@@ -611,8 +653,12 @@ fn handle_trim_gestures(
 
     // Arrow-key nudge while hovering: ±0.01 ms, Shift for ±0.1 ms. Skipped
     // while something else (e.g. a ParamSlider's text entry) owns the
-    // keyboard.
-    if response.hovered() && drag.is_none() && !ui.ctx().wants_keyboard_input() {
+    // keyboard, and during a pan drag.
+    if response.hovered()
+        && drag.is_none()
+        && !response.dragged()
+        && !ui.ctx().wants_keyboard_input()
+    {
         let (left, right, shift) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowLeft),
