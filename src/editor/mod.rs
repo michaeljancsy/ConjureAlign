@@ -120,6 +120,11 @@ struct EditorState {
     /// base follow-up edits on this instead of the (possibly stale)
     /// parameter; cleared once the parameter catches up.
     pending_trim: Option<f32>,
+    /// Measured control-bar height from the previous frame; the panel split
+    /// uses it so no dead space accumulates at the window bottom.
+    control_bar_h: f32,
+    /// Measured width of the Capture/Align/Polarity row, for centering it.
+    capture_row_w: f32,
 }
 
 // Manual because `spectrum_log` defaults to true; everything else matches
@@ -138,6 +143,9 @@ impl Default for EditorState {
             spectrum_cache: None,
             trim_drag: None,
             pending_trim: None,
+            // Estimates for the first frame only; measured thereafter.
+            control_bar_h: 84.0,
+            capture_row_w: 300.0,
         }
     }
 }
@@ -178,7 +186,12 @@ pub fn create(
             ResizableWindow::new("audio-align-resize")
                 .min_size(egui::Vec2::new(600.0, 460.0))
                 .show(ctx, egui_state.as_ref(), |ui| {
-                    draw_ui(ui, setter, state, &params, &shared, &capture);
+                    // Breathing room against the window border.
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            draw_ui(ui, setter, state, &params, &shared, &capture);
+                        });
                 });
 
             // Keep animating through captures/analysis and drags even if the
@@ -212,10 +225,13 @@ fn draw_ui(
     status_strip(ui, params, capture, shared, state.snapshot.as_deref(), net_ms, net_clamped);
     ui.separator();
 
-    // Fixed-height control bar at the bottom; panels split the rest.
-    const CONTROL_BAR_H: f32 = 78.0;
+    // Control bar at the bottom; the panels split the rest. Its height is
+    // MEASURED (last frame's, stored in state) rather than budgeted, so the
+    // window bottom never shows dead space when the bar's real height and a
+    // hardcoded estimate disagree.
     const PANEL_HEADER_H: f32 = 26.0;
-    let avail = (ui.available_height() - CONTROL_BAR_H - 2.0 * PANEL_HEADER_H).max(180.0);
+    let avail =
+        (ui.available_height() - state.control_bar_h - 2.0 * PANEL_HEADER_H).max(180.0);
     let wave_h = (avail * 0.58).max(110.0);
     let corr_h = (avail - wave_h - 12.0).max(80.0);
 
@@ -337,7 +353,10 @@ fn draw_ui(
     );
 
     ui.add_space(6.0);
-    control_bar(ui, setter, params, capture, phase);
+    let bar = ui.scope(|ui| {
+        control_bar(ui, setter, params, capture, phase, &mut state.capture_row_w)
+    });
+    state.control_bar_h = bar.response.rect.height() + 6.0;
 }
 
 /// The currently applied shift in ms and whether the window clamp kicked in.
@@ -468,8 +487,14 @@ fn control_bar(
     params: &AudioAlignParams,
     capture: &CaptureHandle,
     phase: u8,
+    capture_row_w: &mut f32,
 ) {
     ui.horizontal(|ui| {
+        // Center the row using its measured width from the previous frame
+        // (content-driven, so it converges immediately and never oscillates).
+        let pad = ((ui.available_width() - *capture_row_w) / 2.0).max(0.0);
+        ui.add_space(pad);
+        let row_start = ui.cursor().left();
         match phase {
             // Stop analyzes what was recorded; Cancel discards. A host that
             // stops processing mid-capture freezes the phase machine, and a
@@ -524,27 +549,7 @@ fn control_bar(
                 (PolarityMode::Inverted, "Invert"),
             ],
         );
-        // Gesture cheat-sheet; .truncate() so it clips (never wraps) when
-        // the Stop/Cancel buttons crowd this row at the minimum width —
-        // CONTROL_BAR_H is a fixed budget.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new("⌥ drag: trim · ⌘ scroll: zoom")
-                        .small()
-                        .color(TEXT_DIM),
-                )
-                .truncate(),
-            )
-            .on_hover_text(
-                "Graph gestures:\n\
-                 • drag / scroll — pan\n\
-                 • pinch or ⌘-scroll — zoom the time/frequency axis\n\
-                 • ⌥ drag — adjust Trim (⇧ for fine)\n\
-                 • ← / → while hovering — nudge Trim (⇧ ×10)\n\
-                 • double-click — fit",
-            );
-        });
+        *capture_row_w = ui.cursor().left() - row_start - ui.spacing().item_spacing.x;
     });
     ui.horizontal(|ui| {
         ui.label("Trim");
@@ -569,6 +574,21 @@ fn control_bar(
             "How far the track can be shifted, earlier or later, and how far the \
              analysis searches for the offset. Larger values add more latency for \
              the host to compensate. Takes effect the next time the session loads.",
+        );
+    });
+    // The gesture legend, fully visible (not hidden behind a tooltip).
+    ui.add_space(4.0);
+    ui.vertical_centered(|ui| {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "drag / scroll: pan  ·  pinch or ⌘ scroll: zoom  ·  ⌥ drag: trim \
+                     (⇧ fine)  ·  ← / →: nudge trim  ·  double-click: fit",
+                )
+                .small()
+                .color(TEXT_DIM),
+            )
+            .truncate(),
         );
     });
 }
