@@ -565,7 +565,11 @@ fn control_bar(
             [130.0, 18.0],
             widgets::ParamSlider::for_param(&params.max_shift, setter),
         )
-        .on_hover_text("Applies on the next activation (e.g. session reload)");
+        .on_hover_text(
+            "How far the track can be shifted, earlier or later, and how far the \
+             analysis searches for the offset. Larger values add more latency for \
+             the host to compensate. Takes effect the next time the session loads.",
+        );
     });
 }
 
