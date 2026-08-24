@@ -576,21 +576,6 @@ fn control_bar(
              the host to compensate. Takes effect the next time the session loads.",
         );
     });
-    // The gesture legend, fully visible (not hidden behind a tooltip).
-    ui.add_space(4.0);
-    ui.vertical_centered(|ui| {
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(
-                    "drag / scroll: pan  ·  pinch or ⌘ scroll: zoom  ·  ⌥ drag: trim \
-                     (⇧ fine)  ·  ← / →: nudge trim  ·  double-click: fit",
-                )
-                .small()
-                .color(TEXT_DIM),
-            )
-            .truncate(),
-        );
-    });
 }
 
 fn bool_toggle(ui: &mut egui::Ui, setter: &ParamSetter, param: &BoolParam, label: &str) {
