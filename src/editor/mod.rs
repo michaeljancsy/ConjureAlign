@@ -29,7 +29,7 @@ use crate::capture::{
     CaptureHandle, GATE_MAIN_QUIET, GATE_OPEN, GATE_REF_QUIET, PHASE_ANALYZING, PHASE_ARMED,
     PHASE_CAPTURING, PHASE_IDLE,
 };
-use crate::params::{AudioAlignParams, PolarityMode, TRIM_RANGE_MS};
+use crate::params::{ConjureAlignParams, PolarityMode, TRIM_RANGE_MS};
 use crate::shared::{AnalysisSnapshot, GuiShared};
 
 use correlation_view::{CorrArgs, CorrCache, CorrViewState};
@@ -175,7 +175,7 @@ impl EditorState {
 }
 
 pub fn create(
-    params: Arc<AudioAlignParams>,
+    params: Arc<ConjureAlignParams>,
     shared: Arc<GuiShared>,
     capture: CaptureHandle,
 ) -> Option<Box<dyn Editor>> {
@@ -207,7 +207,7 @@ pub fn create(
                 state.spectrum_cache = None;
             }
 
-            ResizableWindow::new("audio-align-resize")
+            ResizableWindow::new("conjure-align-resize")
                 .min_size(egui::Vec2::new(600.0, 460.0))
                 .show(ctx, egui_state.as_ref(), |ui| {
                     // Breathing room against the window border.
@@ -233,7 +233,7 @@ pub fn draw_ui(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
     state: &mut EditorState,
-    params: &AudioAlignParams,
+    params: &ConjureAlignParams,
     shared: &GuiShared,
     capture: &CaptureHandle,
 ) {
@@ -256,7 +256,7 @@ pub fn draw_ui(
     // guess at — which is what used to leave dead black space under the bar.
     // Bottom first: a central panel claims whatever the panels above and
     // below it did not.
-    egui::TopBottomPanel::bottom("audio-align-controls")
+    egui::TopBottomPanel::bottom("conjure-align-controls")
         .frame(egui::Frame::new())
         .show_inside(ui, |ui| {
             ui.add_space(6.0);
@@ -277,7 +277,7 @@ fn graphs(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
     state: &mut EditorState,
-    params: &AudioAlignParams,
+    params: &ConjureAlignParams,
     shared: &GuiShared,
     capture: &CaptureHandle,
     net_ms: f32,
@@ -395,8 +395,8 @@ fn graphs(
 }
 
 /// The currently applied shift in ms and whether the window clamp kicked in.
-/// Mirrors `AudioAlign::current_target()` — keep the two in sync.
-fn net_shift(params: &AudioAlignParams, shared: &GuiShared) -> (f32, bool) {
+/// Mirrors `ConjureAlign::current_target()` — keep the two in sync.
+fn net_shift(params: &ConjureAlignParams, shared: &GuiShared) -> (f32, bool) {
     if !params.align_on.value() {
         return (0.0, false);
     }
@@ -480,7 +480,7 @@ fn capture_toggle(label: &str, fill: Color32, text: Color32) -> egui::Button<'_>
 
 fn status_strip(
     ui: &mut egui::Ui,
-    params: &AudioAlignParams,
+    params: &ConjureAlignParams,
     capture: &CaptureHandle,
     shared: &GuiShared,
     snapshot: Option<&AnalysisSnapshot>,
@@ -590,7 +590,7 @@ fn status_strip(
 fn control_bar(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
-    params: &AudioAlignParams,
+    params: &ConjureAlignParams,
     capture_row_w: &mut f32,
 ) {
     ui.horizontal(|ui| {
@@ -673,7 +673,7 @@ fn handle_trim_nudge(
     ui: &egui::Ui,
     panel: &PanelOutput,
     setter: &ParamSetter,
-    params: &AudioAlignParams,
+    params: &ConjureAlignParams,
     pending_trim: &mut Option<f32>,
 ) {
     let response = &panel.response;

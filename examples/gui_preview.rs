@@ -6,15 +6,15 @@
 
 use std::sync::Arc;
 
-use audio_align::analysis;
-use audio_align::editor::correlation_view::{self, CorrArgs, CorrViewState};
-use audio_align::editor::spectrum_view::{self, SpecViewState, SpectrumArgs};
-use audio_align::editor::waveform_view::{self, CaptureOverlay, WaveArgs, WaveViewState};
-use audio_align::editor::LowerPanelTab;
-use audio_align::capture::CaptureState;
-use audio_align::params::AudioAlignParams;
-use audio_align::shared::{AnalysisSnapshot, GuiShared};
-use audio_align::spectrum;
+use conjure_align::analysis;
+use conjure_align::editor::correlation_view::{self, CorrArgs, CorrViewState};
+use conjure_align::editor::spectrum_view::{self, SpecViewState, SpectrumArgs};
+use conjure_align::editor::waveform_view::{self, CaptureOverlay, WaveArgs, WaveViewState};
+use conjure_align::editor::LowerPanelTab;
+use conjure_align::capture::CaptureState;
+use conjure_align::params::ConjureAlignParams;
+use conjure_align::shared::{AnalysisSnapshot, GuiShared};
+use conjure_align::spectrum;
 use nih_plug::prelude::{GuiContext, ParamPtr, ParamSetter, PluginApi, PluginState};
 use nih_plug_egui::egui;
 
@@ -140,7 +140,7 @@ impl GuiContext for StubGuiContext {
 /// Renders `editor::draw_ui` at the real minimum window size, one window
 /// margin in — the same wrapping the editor's own `create()` uses.
 fn render_full(out: &str, snapshot: &Arc<AnalysisSnapshot>, detected_ms: f32) {
-    let params = AudioAlignParams::default();
+    let params = ConjureAlignParams::default();
     params
         .detected_offset_ms
         .store(detected_ms, std::sync::atomic::Ordering::Relaxed);
@@ -151,7 +151,7 @@ fn render_full(out: &str, snapshot: &Arc<AnalysisSnapshot>, detected_ms: f32) {
     shared.set_window(960, snapshot.sample_rate);
     *shared.snapshot.lock().unwrap() = Some(snapshot.clone());
     let capture = Arc::new(CaptureState::new()).handle();
-    let mut state = audio_align::editor::EditorState::with_snapshot(snapshot.clone());
+    let mut state = conjure_align::editor::EditorState::with_snapshot(snapshot.clone());
 
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::Vec2::new(600.0, 460.0))
@@ -162,7 +162,7 @@ fn render_full(out: &str, snapshot: &Arc<AnalysisSnapshot>, detected_ms: f32) {
             egui::Frame::new()
                 .inner_margin(egui::Margin::symmetric(10, 8))
                 .show(ui, |ui| {
-                    audio_align::editor::draw_ui(
+                    conjure_align::editor::draw_ui(
                         ui, &setter, &mut state, &params, &shared, &capture,
                     );
                 });

@@ -1,4 +1,4 @@
-# AudioAlign
+# ConjureAlign
 
 A free VST3 / CLAP / AudioUnit plugin that automatically time-aligns two recordings of the same source
 captured by different microphones — e.g., a close mic and a room mic on one guitar amp —
@@ -8,12 +8,15 @@ Sub-sample precision, automatic polarity detection, and support for *negative* s
 
 The plugin window shows both captured waveforms overlaid (the main signal slides as the
 alignment changes) and the cross-correlation curve with a marker at the detected peak plus a
-live marker that tracks the applied shift — drag either display left/right to adjust Manual
-Trim, hold Shift for fine control, scroll/pinch to pan and zoom.
+live marker that tracks the applied shift. All graphs share one gesture set: drag or scroll
+to pan, pinch or ⌘-scroll to zoom, double-click to fit. Manual Trim is adjusted with its
+slider, or with ←/→ while hovering a graph (0.01 ms per tap; hold Shift for 0.1 ms).
+
+![The ConjureAlign editor: overlaid captured waveforms above the cross-correlation curve with the detected peak marked](docs/screenshot.png)
 
 ## How to use it
 
-1. Put **AudioAlign on the track you want to shift** (usually the more distant mic).
+1. Put **ConjureAlign on the track you want to shift** (usually the more distant mic).
 2. Route the **reference track into the plugin's sidechain** ("Reference") input:
    - **REAPER**: open the plugin's pin connector, add inputs 3/4, send the reference track there.
    - **Ableton Live** (VST3): choose the reference track in the device header's sidechain chooser.
@@ -59,12 +62,12 @@ plugin on mono tracks. See `deps/PATCHES.md`.
 Stable Rust required.
 
 ```bash
-cargo xtask bundle audio_align --release
+cargo xtask bundle conjure_align --release
 ```
 
-Bundles appear in `target/bundled/`; on macOS copy `AudioAlign.clap` to
-`~/Library/Audio/Plug-Ins/CLAP/`, `AudioAlign.vst3` to `~/Library/Audio/Plug-Ins/VST3/`, and
-`AudioAlign.component` to `~/Library/Audio/Plug-Ins/Components/`. After replacing an
+Bundles appear in `target/bundled/`; on macOS copy `ConjureAlign.clap` to
+`~/Library/Audio/Plug-Ins/CLAP/`, `ConjureAlign.vst3` to `~/Library/Audio/Plug-Ins/VST3/`, and
+`ConjureAlign.component` to `~/Library/Audio/Plug-Ins/Components/`. After replacing an
 installed `.component`, run `killall -9 AudioComponentRegistrar` and restart the host, or
 macOS will keep serving the cached registration.
 
@@ -74,4 +77,5 @@ Run the DSP test suite with `cargo test --release`. To eyeball the GUI panels wi
 
 ## License
 
-GPL-3.0-or-later.
+GPL-3.0-or-later. Third-party components and their licenses are listed in
+[THIRD-PARTY.md](THIRD-PARTY.md).
