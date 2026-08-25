@@ -69,12 +69,19 @@ jobs:
         shell: bash
         run: |
           CV=$(find validators -iname 'clap-validator*.exe' | head -1)
+          # clap-validator exits non-zero whenever any test fails, and this shell
+          # runs with -e -o pipefail — neutralize that so the known-failure gate
+          # below is what decides the step's outcome.
           "$CV" validate target/bundled/ConjureAlign.clap 2>&1 \
-            | sed 's/\x1b\[[0-9;]*m//g' | tee clapval.txt
-          SUMMARY=$(grep -E '[0-9]+ tests run' clapval.txt)
-          FAILED=$(echo "$SUMMARY" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+')
+            | sed 's/\x1b\[[0-9;]*m//g' | tee clapval.txt || true
+          SUMMARY=$(grep -E '[0-9]+ tests run' clapval.txt || true)
+          if [ -z "$SUMMARY" ]; then
+            echo "::error::clap-validator produced no summary (crashed?)"
+            exit 1
+          fi
+          FAILED=$(echo "$SUMMARY" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo 0)
           echo "$SUMMARY"
-          if [ "${FAILED:-0}" -gt 4 ]; then
+          if [ "$FAILED" -gt 4 ]; then
             echo "::error::$FAILED CLAP validation failures — more than the 4 known upstream nih-plug issues"
             exit 1
           fi
