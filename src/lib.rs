@@ -6,6 +6,7 @@
 //! `shared.rs`, and `CLAUDE.md`.
 
 pub mod analysis;
+pub mod analytics;
 pub mod capture;
 pub mod dsp;
 pub mod editor;
@@ -50,6 +51,9 @@ pub struct ConjureAlign {
     /// transition with samples already written marks a splice seam.
     prev_record: bool,
     last_latency: u32,
+    /// Opt-in usage analytics. Inert until the user consents; never touched
+    /// from `process()`.
+    analytics: Arc<analytics::AnalyticsHandle>,
 }
 
 pub enum Task {
@@ -78,6 +82,7 @@ impl Default for ConjureAlign {
             prev_capture: false,
             prev_record: false,
             last_latency: 0,
+            analytics: Arc::new(analytics::AnalyticsHandle::new()),
         }
     }
 }
@@ -183,8 +188,13 @@ impl Plugin for ConjureAlign {
         let capture = self.capture.clone();
         let params = self.params.clone();
         let shared = self.shared.clone();
+        let analytics = self.analytics.clone();
         Box::new(move |task| match task {
             Task::Analyze => {
+                // Built inside the borrow below, sent after it drops:
+                // serializing and queueing an event is cheap, but it has no
+                // business happening while the capture buffers are borrowed.
+                let event;
                 // Everything that reads `data` stays inside this scope; the
                 // snapshot mutex is deliberately touched only AFTER the
                 // borrow drops. The GUI locks that mutex every frame, and
@@ -220,12 +230,17 @@ impl Plugin for ConjureAlign {
                                 if result.inverted { "inverted" } else { "normal" },
                                 result.confidence
                             );
+                            event = analytics::AnalyticsEvent::CaptureCompleted {
+                                confidence: result.confidence,
+                                offset_ms,
+                            };
                         }
                         Err(reason) => {
                             nih_log!(
                                 "ConjureAlign: analysis rejected ({:?}); keeping previous offset",
                                 reason
                             );
+                            event = analytics::AnalyticsEvent::CaptureRejected { reason };
                         }
                     }
                     // Freeze everything the GUI needs. Copying here — on the
@@ -252,6 +267,7 @@ impl Plugin for ConjureAlign {
                 };
                 *shared.snapshot.lock().unwrap() = Some(snapshot);
                 capture.phase.store(PHASE_IDLE, Ordering::Release);
+                analytics.track(event);
             }
         })
     }
@@ -318,6 +334,10 @@ impl Plugin for ConjureAlign {
         // If the session was saved with Capture left on, don't fire a
         // spurious re-analysis on the first process() call.
         self.prev_capture = self.params.capture.value();
+
+        // Idempotent per instance, so the host re-initializing (state loads,
+        // sample-rate changes) doesn't inflate the session count.
+        self.analytics.note_session(self.sample_rate);
 
         true
     }

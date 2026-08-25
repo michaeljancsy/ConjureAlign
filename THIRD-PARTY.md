@@ -19,6 +19,9 @@ distributed.
 | [rustfft](https://github.com/ejmahler/RustFFT) / [realfft](https://github.com/HEnquist/realfft) | MIT (realfft), MIT OR Apache-2.0 (rustfft) | FFT for cross-correlation analysis |
 | `atomic_refcell` | MIT OR Apache-2.0 | |
 | `atomic_float` | MIT OR Apache-2.0 OR Zlib | |
+| [native-tls](https://github.com/sfackler/rust-native-tls) | MIT OR Apache-2.0 | TLS for the opt-in analytics sender; binds the OS stack via `security-framework` (MIT OR Apache-2.0, macOS) and `schannel` (MIT, Windows). macOS/Windows only |
+| `serde_json` | MIT OR Apache-2.0 | Analytics payload |
+| `getrandom` | MIT OR Apache-2.0 | Random analytics device id |
 
 Where a component is dual-licensed MIT OR Apache-2.0, it is used under the MIT license.
 The full MIT/ISC license texts require reproduction of the copyright notice, which the

@@ -112,7 +112,40 @@ fn main() {
     // Scene 5: the WHOLE editor — status strip, both panels and the control
     // bar — which is the only way to see the vertical budget (dead space at
     // the window bottom, a clipped control bar) rather than just the graphs.
-    render_full(&out.replace(".png", "_full.png"), &snapshot, detected_ms);
+    render_full(
+        &out.replace(".png", "_full.png"),
+        &snapshot,
+        detected_ms,
+        Overlay::None,
+    );
+    // Scene 6: the first-run analytics prompt over that same editor. It is
+    // drawn outside `draw_ui` so it can never appear in the scenes above,
+    // which makes this the only way to review its copy and fit headless.
+    render_full(
+        &out.replace(".png", "_consent.png"),
+        &snapshot,
+        detected_ms,
+        Overlay::Consent,
+    );
+    // Scene 7: the ⚙ popover, the standing way to change that answer. It
+    // needs a click, so nothing else would ever render it — and it opens
+    // upward from a control-bar button close to the window edge, which is
+    // exactly the fit worth checking.
+    render_full(
+        &out.replace(".png", "_settings.png"),
+        &snapshot,
+        detected_ms,
+        Overlay::Settings,
+    );
+}
+
+/// Which of the editor's two floating surfaces a full-editor scene draws on
+/// top; both live outside `draw_ui`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Overlay {
+    None,
+    Consent,
+    Settings,
 }
 
 /// A `GuiContext` that goes nowhere: `ParamSetter` needs one, and the editor
@@ -139,7 +172,7 @@ impl GuiContext for StubGuiContext {
 
 /// Renders `editor::draw_ui` at the real minimum window size, one window
 /// margin in — the same wrapping the editor's own `create()` uses.
-fn render_full(out: &str, snapshot: &Arc<AnalysisSnapshot>, detected_ms: f32) {
+fn render_full(out: &str, snapshot: &Arc<AnalysisSnapshot>, detected_ms: f32, overlay: Overlay) {
     let params = ConjureAlignParams::default();
     params
         .detected_offset_ms
@@ -166,6 +199,13 @@ fn render_full(out: &str, snapshot: &Arc<AnalysisSnapshot>, detected_ms: f32) {
                         ui, &setter, &mut state, &params, &shared, &capture,
                     );
                 });
+            match overlay {
+                Overlay::None => {}
+                Overlay::Consent => conjure_align::editor::consent_modal(ui.ctx()),
+                // Opened before the bar is drawn on the next pass, so the
+                // popover is already up when the harness renders.
+                Overlay::Settings => conjure_align::editor::open_settings_popup(ui.ctx()),
+            }
         });
 
     harness.run();

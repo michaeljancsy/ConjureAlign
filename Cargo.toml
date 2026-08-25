@@ -30,6 +30,10 @@ atomic_float = "0.1"
 # dev-deps so plain `cargo test` never builds the wgpu stack.
 egui_kittest = { version = "0.31", features = ["wgpu"], optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+# Opt-in usage analytics (src/analytics.rs): the Mixpanel payload and the random
+# device id. The TLS stack is target-gated below — see the note there.
+serde_json = "1.0"
+getrandom = "0.4"
 
 # AudioUnit v2 export (macOS only). clap-wrapper re-exports the `clap_entry` that
 # `nih_export_clap!` already emits behind an AudioComponentFactoryFunction named
@@ -47,6 +51,18 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 # in without taking an unreleased git rev.
 [target.'cfg(target_os = "macos")'.dependencies]
 clap-wrapper = { path = "deps/clap-wrapper-rs", default-features = false, features = ["auv2", "parallel"] }
+
+# TLS for the analytics sender, on the two platforms that ship binaries. native-tls
+# is a thin binding to the OS stack — Security.framework on macOS, SChannel on
+# Windows — so it needs no build tooling (unlike rustls/ring, which wants nasm on
+# the Windows CI) and bundles no root-certificate store to go stale.
+#
+# Deliberately NOT a plain dependency: on other targets native-tls pulls in openssl
+# and its system headers, and Linux is a build-from-source platform here. Analytics
+# is compiled out entirely there instead (`analytics::config_path` returns None, and
+# the sender is a no-op) — see src/analytics.rs.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+native-tls = "0.2"
 
 [features]
 # Dev-only: run the plugin (and its GUI) as a standalone app, no DAW needed:

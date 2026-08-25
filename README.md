@@ -65,6 +65,29 @@ the residual is entirely above ~19 kHz, where fractional delay is mathematically
 any plugin. In the audible band the null is −70 dB or deeper (measured in
 `tests/null_depth.rs`). A lowpass at ~19 kHz on the null bus shows the true audible-band depth.
 
+## Privacy
+
+ConjureAlign can report anonymous usage data, and asks once — the first time you open its
+window — whether you want it to. **It is off unless you say yes**, and it never sends anything
+before you answer. There is no account, no login, and no identifier tied to you: events carry
+a random ID generated on the machine when you opt in.
+
+| | |
+|---|---|
+| Sent | Plugin version, operating system, sample rate, and whether a capture succeeded or why it was rejected (bucketed — "0.9+" confidence, "1–10 ms" offset, not the actual figures). |
+| Never sent | Your audio, any measurement of it, file or project names, host or machine names, IP-derived identity, or anything else. |
+
+Change your mind at any time with the **⚙** button in the plugin's control bar. Your answer is
+stored in `~/Library/Application Support/ConjureDSP/ConjureAlign/analytics.json` on macOS and
+`%APPDATA%\ConjureDSP\ConjureAlign\analytics.json` on Windows; deleting that file makes the
+plugin ask again. Declining stores the "no" and nothing else — no ID is generated. If you never
+open the editor (running headless from the host's generic parameter UI), you are never asked
+and nothing is ever sent. Analytics are compiled out entirely on platforms other than macOS and
+Windows.
+
+The code is all in [`src/analytics.rs`](src/analytics.rs), and the payload is built in one
+function (`build_payload`) if you want to read exactly what leaves the machine.
+
 The Audio Unit build is produced by [clap-wrapper](https://github.com/free-audio/clap-wrapper),
 which re-exports the CLAP plugin behind an AU entry point. It carries a local patch so that
 both the mono and stereo layouts are reachable from AU hosts — without it Logic hides the
@@ -91,7 +114,8 @@ but are less road-tested in real DAWs than the macOS ones — bug reports welcom
 
 Run the DSP test suite with `cargo test --release`. To eyeball the GUI panels without a DAW,
 `cargo run --example gui_preview --features gui-preview` renders them with synthetic data to
-`gui_preview.png` / `gui_preview_zoom.png`.
+`gui_preview.png` / `gui_preview_zoom.png`, plus the whole editor (`_full`), the first-run
+privacy prompt (`_consent`) and the ⚙ popover (`_settings`).
 
 ## License
 
