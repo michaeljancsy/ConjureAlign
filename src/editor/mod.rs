@@ -25,6 +25,7 @@ use nih_plug_egui::{
 };
 
 use crate::analysis::{RejectReason, CONFIDENCE_THRESHOLD};
+use crate::analytics;
 use crate::capture::{
     CaptureHandle, GATE_MAIN_QUIET, GATE_OPEN, GATE_REF_QUIET, PHASE_ANALYZING, PHASE_ARMED,
     PHASE_CAPTURING, PHASE_IDLE,
@@ -219,6 +220,14 @@ pub fn create(
                             draw_ui(ui, setter, state, &params, &shared, &capture);
                         });
                 });
+
+            // Asked once per install, the first time anyone opens the editor.
+            // Deliberately outside `draw_ui`: the gui-preview example renders
+            // that directly, and a consent dialog has no business in a
+            // screenshot of the panels.
+            if analytics::consent().is_none() {
+                consent_modal(ctx);
+            }
 
             // Keep animating through captures/analysis and drags even if the
             // host stops delivering input events.
@@ -480,6 +489,124 @@ fn capture_toggle(label: &str, fill: Color32, text: Color32) -> egui::Button<'_>
     egui::Button::new(egui::RichText::new(label).strong().color(text)).fill(fill)
 }
 
+/// The one-time analytics prompt. It has no dismiss and no default: closing
+/// the plugin window leaves the question unanswered and asks again next time,
+/// which is the only reading of silence that isn't a "yes" by attrition.
+///
+/// Public for the same reason as [`draw_ui`] — it is deliberately drawn
+/// outside `draw_ui`, so the `gui-preview` example is the only way to see it
+/// without a DAW.
+pub fn consent_modal(ctx: &egui::Context) {
+    egui::Modal::new(egui::Id::new("conjure-align-consent")).show(ctx, |ui| {
+        ui.set_max_width(400.0);
+        ui.heading("Share anonymous usage data?");
+        ui.add_space(8.0);
+        ui.label(
+            "It shows me how often ConjureAlign is used and how often a capture \
+             fails, which is what tells me where to spend effort.",
+        );
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(
+                "Sent: plugin version, operating system, sample rate, and whether a \
+                 capture succeeded or why it was rejected — labelled with a random ID.",
+            )
+            .small()
+            .color(TEXT_DIM),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Never sent: your audio, any measurement of it, file or project names, \
+                 or anything that identifies you.",
+            )
+            .small()
+            .color(TEXT_DIM),
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui.button("No thanks").clicked() {
+                analytics::set_consent(false);
+            }
+            if ui
+                .add(capture_toggle(
+                    "Share usage data",
+                    CAPTURE_GREEN,
+                    Color32::BLACK,
+                ))
+                .clicked()
+            {
+                analytics::set_consent(true);
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("You can change this any time under ⚙.")
+                .small()
+                .color(TEXT_DIM),
+        );
+    });
+}
+
+/// About + privacy, tucked into a popover. Consent must be as easy to withdraw
+/// as it was to give, but it doesn't earn permanent space in the main UI.
+fn settings_popup_id() -> egui::Id {
+    egui::Id::new("conjure-align-settings")
+}
+
+/// Preview-only: opens the ⚙ popover, which otherwise needs a click. Lets the
+/// `gui-preview` example render it (see [`draw_ui`]).
+pub fn open_settings_popup(ctx: &egui::Context) {
+    ctx.memory_mut(|mem| mem.open_popup(settings_popup_id()));
+}
+
+fn settings_menu(ui: &mut egui::Ui) {
+    let popup_id = settings_popup_id();
+    let button = ui.small_button("⚙").on_hover_text("About and privacy");
+    if button.clicked() {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+    }
+    // Upward: egui places popups where it is told and never flips them, and
+    // this gear sits in the control bar a few dozen pixels off the window
+    // bottom — downward would open it straight out of the window.
+    egui::popup_above_or_below_widget(
+        ui,
+        popup_id,
+        &button,
+        egui::AboveOrBelow::Above,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(280.0);
+            ui.label(
+                egui::RichText::new(concat!("ConjureAlign v", env!("CARGO_PKG_VERSION"))).strong(),
+            );
+            ui.separator();
+            if analytics::is_supported() {
+                let mut share = analytics::enabled();
+                if ui
+                    .checkbox(&mut share, "Share anonymous usage data")
+                    .changed()
+                {
+                    analytics::set_consent(share);
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Plugin version, OS, sample rate and capture outcomes, labelled \
+                         with a random ID. Never your audio.",
+                    )
+                    .small()
+                    .color(TEXT_DIM),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new("Usage analytics are not available on this platform.")
+                        .small()
+                        .color(TEXT_DIM),
+                );
+            }
+        },
+    );
+}
+
 fn status_strip(
     ui: &mut egui::Ui,
     params: &ConjureAlignParams,
@@ -615,6 +742,14 @@ fn control_bar(
             ],
         );
         *capture_row_w = ui.cursor().left() - row_start - ui.spacing().item_spacing.x;
+        // Rides the slack this centered row leaves on its right. The status
+        // strip has none at the 600 px minimum — its labels already reach the
+        // Capture button and overflow rather than truncate — so a gear there
+        // would be drawn through. Measured above, so this cannot disturb the
+        // centering.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            settings_menu(ui);
+        });
     });
     ui.horizontal(|ui| {
         ui.label("Trim");

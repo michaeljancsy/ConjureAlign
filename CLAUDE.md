@@ -43,7 +43,9 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   renderer: the panels alone (`gui_preview.png`, `_zoom`, `_spectrum`, `_spectrum_trim`)
   and — via a stub `GuiContext` behind a `ParamSetter` — the WHOLE editor at its 600×460
   minimum window (`_full.png`), which is the only scene that shows the vertical budget
-  (dead space under the control bar, a clipped bar). Or run the plugin
+  (dead space under the control bar, a clipped bar), plus the two floating surfaces that
+  live outside `draw_ui` and would otherwise need a DAW and a click to see: the first-run
+  privacy prompt (`_consent.png`) and the ⚙ popover (`_settings.png`). Or run the plugin
   interactively with `cargo run --bin standalone --features standalone -- --backend dummy`
   (works thanks to the baseview `[patch]` — see Known upstream issues).
 - CLAP validation: `clap-validator validate target/bundled/ConjureAlign.clap`
@@ -79,6 +81,7 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
 
 ## Architecture
 
+- `src/analytics.rs` — opt-in Mixpanel telemetry (see its own section below);
 - `src/lib.rs` — Plugin impl and orchestration; `src/params.rs` — the whole state model;
   `src/capture.rs` — capture buffers + phase machine + the GUI-safe `CaptureHandle`;
   `src/analysis.rs` — offset estimation (background thread only); `src/shared.rs` — the
@@ -168,6 +171,61 @@ breaking that invariant desynchronizes the applied shift from host PDC.
 `detected_offset` is persisted in MILLISECONDS so sessions survive sample-rate changes. Delay
 lines and capture buffers are sized in `initialize()` for the parameter maxima
 (`MAX_SHIFT_MAX_MS`, 4 s captures), so no parameter change ever allocates on the audio thread.
+
+### Analytics (opt-in, `src/analytics.rs`)
+
+Anonymous Mixpanel events, OFF until the user consents. Three invariants, all load-bearing:
+
+1. **The audio thread never touches analytics.** Events are raised from `initialize()` (main
+   thread) and from the `Task::Analyze` arm of `task_executor()` — the capture event is built
+   inside the `data` borrow but *sent* after it drops and after the phase returns to Idle, so
+   neither the borrow nor `initialize()`'s spin is extended. `process()` has no analytics code,
+   which is what keeps `assert_process_allocs` meaningful.
+2. **Consent is tri-state and install-wide** — never asked / granted / declined — stored in
+   `~/Library/Application Support/ConjureDSP/ConjureAlign/analytics.json` (`%APPDATA%\…` on
+   Windows), NOT in `#[persist]` state, which is per-DAW-session. `None` (no file, or an
+   unparseable one) is what shows the first-run prompt; **declining must write the file** or the
+   prompt returns forever. Declining stores no device id. The file is read once per process into
+   a `OnceLock`, so a change in one running DAW reaches other processes at their next launch.
+3. **No thread outlives the dylib.** One worker thread per process, shared by every instance via
+   a `Mutex<Weak<Worker>>` registry; each `AnalyticsHandle` holds a strong ref. `Worker::drop`
+   sets a shutdown flag, drops the sender (which is what wakes a worker parked in `recv()` —
+   joining before disconnecting would deadlock), then joins. Sends are `try_send` on a 32-slot
+   bounded channel: a wedged network drops events, never blocks a caller or grows a backlog.
+
+Transport is a hand-written HTTP/1.1 POST over `native-tls` rather than an HTTP client crate:
+the request is one fire-and-forget JSON body to a fixed host, and native-tls binds the OS stack
+(Security.framework / SChannel) so there is no `ring`/nasm build-tooling risk on the Windows CI
+and no bundled root store to go stale. **`native-tls` is target-gated to macOS+Windows** — on
+other targets it would drag in openssl, and Linux is a build-from-source platform here, so
+`config_path()` returns `None`, `consent()` reports a settled `Some(false)`, and the whole
+feature is inert. `CONJURE_ALIGN_ANALYTICS_URL` overrides the endpoint for a local sink.
+
+The payload is bucketed on purpose (`confidence_bucket`, `offset_bucket`): raw figures would
+describe the user's material. `MIXPANEL_TOKEN` holds the ConjureAlign project's token;
+client-side tokens are public by design (write-only ingestion, no read access).
+
+Three events: **`Plugin Loaded`** (once per instance, from `initialize()`), **`Capture
+Completed`**, **`Capture Rejected`**. The first is deliberately NOT called "Session Start" —
+Mixpanel ships a built-in virtual event, `$session_start`, whose *display name* is exactly
+"Session Start", so a custom event by that name is indistinguishable from it in the event
+picker. Check `Get-Events` before naming anything new. Verify ingestion with
+`cargo test --release -- --ignored --nocapture smoke_test`, which asks Mixpanel for
+`verbose=1` and asserts `"status": 1` — a bad token otherwise reads as a silent bare `0`.
+**It writes one real event to the live project**, tagged `smoke-test`.
+
+UI: the first-run prompt (`editor::consent_modal`) and the ⚙ popover (`settings_menu`) are both
+drawn OUTSIDE `draw_ui` / from the control bar respectively, and both are `pub` so
+`examples/gui_preview.rs` can render them headless (`_consent.png`, `_settings.png`) — a
+consent dialog has no business in the panel screenshots. Two layout constraints learned the
+hard way: the status strip has **zero slack at the 600×460 minimum** (its labels already reach
+the Capture button and *overflow* rather than truncate, so anything parked there gets drawn
+through), which is why the gear rides the centered control-bar row's spare width instead; and
+egui never flips a popup, so the gear's popover is explicitly `AboveOrBelow::Above` or it opens
+out through the window bottom.
+
+Never use a native OS dialog (`NSAlert`/`MessageBox`) for consent: headless scanners (`auval`,
+`pluginval`, Logic's scan) instantiate the plugin with no GUI, and a modal there hangs the scan.
 
 ### AudioUnit v2 (clap-wrapper)
 
