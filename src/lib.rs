@@ -8,6 +8,7 @@
 pub mod analysis;
 pub mod analytics;
 pub mod capture;
+pub mod crash;
 pub mod dsp;
 pub mod editor;
 pub mod params;
@@ -54,6 +55,10 @@ pub struct ConjureAlign {
     /// Opt-in usage analytics. Inert until the user consents; never touched
     /// from `process()`.
     analytics: Arc<analytics::AnalyticsHandle>,
+    /// Opt-in crash reporting, on the same consent answer as `analytics`.
+    /// `process()` takes one of its scope guards, which is a thread-local
+    /// counter and nothing else — see the rules in `crash.rs`.
+    crash: Arc<crash::CrashHandle>,
 }
 
 pub enum Task {
@@ -83,6 +88,7 @@ impl Default for ConjureAlign {
             prev_record: false,
             last_latency: 0,
             analytics: Arc::new(analytics::AnalyticsHandle::new()),
+            crash: Arc::new(crash::CrashHandle::new()),
         }
     }
 }
@@ -181,6 +187,7 @@ impl Plugin for ConjureAlign {
             self.params.clone(),
             self.shared.clone(),
             self.capture.handle(),
+            self.crash.clone(),
         )
     }
 
@@ -191,6 +198,11 @@ impl Plugin for ConjureAlign {
         let analytics = self.analytics.clone();
         Box::new(move |task| match task {
             Task::Analyze => {
+                // Everything below runs on nih-plug's shared `bg-worker`
+                // thread, which serves every plugin instance in the process.
+                // The guard is what tells the panic hook that a panic on this
+                // thread right now is ours and not another plugin's.
+                let _scope = crash::scope();
                 // Built inside the borrow below, sent after it drops:
                 // serializing and queueing an event is cheap, but it has no
                 // business happening while the capture buffers are borrowed.
@@ -278,6 +290,8 @@ impl Plugin for ConjureAlign {
         buffer_config: &BufferConfig,
         context: &mut impl InitContext<Self>,
     ) -> bool {
+        let _scope = crash::scope();
+
         self.sample_rate = buffer_config.sample_rate;
         let channels = audio_io_layout
             .main_input_channels
@@ -298,11 +312,22 @@ impl Plugin for ConjureAlign {
         // across the FFI boundary if it collided (hosts re-run initialize()
         // after state loads with no task drain). Analysis takes tens of
         // milliseconds — wait it out, bounded in case something is wedged.
+        let mut wedged = true;
         for _ in 0..500 {
             if self.capture.phase.load(Ordering::Acquire) != PHASE_ANALYZING {
+                wedged = false;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if wedged {
+            // The spin above is the guard against `allocate()`'s `borrow_mut()`
+            // colliding with the background task's borrow. Reaching the end of
+            // it still holding PHASE_ANALYZING means the guard has failed and
+            // the `AtomicRefCell` panic — across the FFI boundary — is the next
+            // thing that happens. It is invisible in the field otherwise.
+            nih_log!("ConjureAlign: analysis still running after 500 ms; proceeding anyway");
+            crash::report_issue("initialize(): capture buffers still borrowed after 500 ms");
         }
         // Drop any stale GUI capture/stop request and progress so a click
         // made while the host wasn't processing can't fire a surprise
@@ -338,6 +363,14 @@ impl Plugin for ConjureAlign {
         // Idempotent per instance, so the host re-initializing (state loads,
         // sample-rate changes) doesn't inflate the session count.
         self.analytics.note_session(self.sample_rate);
+        // Arms or tears down crash reporting to match the stored answer. The
+        // editor re-syncs every frame, which is what picks up a consent change
+        // made while the plugin is already running.
+        self.crash.sync_consent();
+        // AU reports as CLAP: clap-wrapper translates AU calls into calls on
+        // our own `clap_entry`, so nih-plug never sees an AU-specific api.
+        self.crash
+            .set_host_context(&context.plugin_api().to_string(), self.sample_rate);
 
         true
     }
@@ -368,6 +401,13 @@ impl Plugin for ConjureAlign {
         aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        // Marks this thread as ours for the duration of the block, so that a
+        // panic here — the `AtomicRefCell` borrows below being the likeliest —
+        // is reported as ours rather than left invisible. A thread-local
+        // increment and decrement: no allocation, no syscall, nothing that
+        // weakens `assert_process_allocs`.
+        let _scope = crash::scope();
+
         let num_samples = buffer.samples();
         if num_samples == 0 {
             return ProcessStatus::Normal;

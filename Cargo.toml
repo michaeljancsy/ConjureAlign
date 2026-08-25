@@ -52,17 +52,48 @@ getrandom = "0.4"
 [target.'cfg(target_os = "macos")'.dependencies]
 clap-wrapper = { path = "deps/clap-wrapper-rs", default-features = false, features = ["auv2", "parallel"] }
 
-# TLS for the analytics sender, on the two platforms that ship binaries. native-tls
-# is a thin binding to the OS stack — Security.framework on macOS, SChannel on
-# Windows — so it needs no build tooling (unlike rustls/ring, which wants nasm on
-# the Windows CI) and bundles no root-certificate store to go stale.
+# Networking for the two opt-in reporters, on the two platforms that ship binaries.
+# native-tls is a thin binding to the OS stack — Security.framework on macOS,
+# SChannel on Windows — so it needs no build tooling (unlike rustls/ring, which wants
+# nasm on the Windows CI) and bundles no root-certificate store to go stale.
 #
-# Deliberately NOT a plain dependency: on other targets native-tls pulls in openssl
-# and its system headers, and Linux is a build-from-source platform here. Analytics
-# is compiled out entirely there instead (`analytics::config_path` returns None, and
-# the sender is a no-op) — see src/analytics.rs.
+# Deliberately NOT plain dependencies: on other targets native-tls pulls in openssl
+# and its system headers, and Linux is a build-from-source platform here. Both
+# reporters are compiled out entirely there instead (`analytics::config_path` returns
+# None, the sender is a no-op, and `crash` is a stub) — see src/analytics.rs and
+# src/crash.rs.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 native-tls = "0.2"
+# Opt-in crash reporting (src/crash.rs), gated on the SAME consent answer as
+# analytics. `default-features = false` is load-bearing: the default set includes
+# `transport`, which is `["reqwest", "native-tls"]`, and `reqwest` pulls `tokio` —
+# a whole async runtime inside every DAW that loads the plugin. `ureq` is declared
+# `default-features = false` upstream, so `native-tls` here binds the same OS stack
+# the analytics sender already uses: no rustls, no `ring`, and the Windows CI still
+# needs no nasm.
+#
+# `release-health` is what turns crashes into a crash-free session rate, which is the
+# one thing the Mixpanel side cannot derive — "Plugin Loaded" counts loads but has no
+# idea which of them ended in a panic. `logs` is deliberately absent (nih-plug already
+# holds the global `log` logger slot, so sentry-log cannot have it), and so is
+# `metrics` (it would only duplicate the bucketed outcomes analytics already sends).
+sentry = { version = "0.49.1", default-features = false, features = [
+    "backtrace", "contexts", "debug-images", "panic", "release-health",
+    "ureq",
+] }
+# Sentry's own ureq transport configures TLS and proxying but sets NO timeouts, and
+# every ureq timeout defaults to None. That matters because `TransportThread::drop`
+# joins its worker unconditionally: with a wedged network (captive portal, a firewall
+# that blackholes the connection) the join never returns, and the thread it blocks is
+# whichever host thread is unloading the plugin. `crash::BoundedUreq` rebuilds the
+# agent with the same TLS/proxy setup plus explicit timeouts, which is the only reason
+# this is a direct dependency. Version and features mirror what sentry itself asks for,
+# so the two unify onto one `ureq::Agent` type.
+# `native-tls-no-default` rather than `native-tls`: the latter also pulls
+# `webpki-root-certs`, a bundled Mozilla root store that ureq then uses INSTEAD of
+# the OS one. Selecting the TLS provider here rather than through sentry's own
+# `native-tls` feature is what keeps that out of the binary — see BoundedUreq.
+ureq = { version = "3", default-features = false, features = ["native-tls-no-default"] }
 
 [features]
 # Dev-only: run the plugin (and its GUI) as a standalone app, no DAW needed:
@@ -101,7 +132,14 @@ baseview = { git = "https://github.com/michaeljancsy/baseview.git", rev = "c1ff5
 
 [profile.release]
 lto = "thin"
+# The shipped binary carries no symbols, but the Mach-O UUID / PE build id survives
+# stripping, and that is what lets Sentry match an uploaded debug file. Without these
+# two lines a release stack trace is a column of bare addresses. `packed` runs
+# dsymutil, so the debuginfo lands in a .dSYM beside the binary rather than in it —
+# scripts/release.sh and the Windows workflow upload that, they do not ship it.
 strip = "symbols"
+debug = "limited"
+split-debuginfo = "packed"
 
 [profile.profiling]
 inherits = "release"

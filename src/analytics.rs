@@ -195,7 +195,10 @@ pub fn set_consent(granted: bool) {
     }
 }
 
-fn device_id() -> Option<String> {
+/// The random per-install id minted on consent. Public because
+/// [`crate::crash`] labels its reports with the *same* id rather than minting a
+/// second identifier — one opt-in, one identifier, one thing to explain.
+pub fn device_id() -> Option<String> {
     config().lock().unwrap().device_id.clone()
 }
 
