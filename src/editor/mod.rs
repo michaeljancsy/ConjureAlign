@@ -104,16 +104,18 @@ pub(crate) fn gesture_legend(ui: &mut egui::Ui) {
         size,
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
+            // egui maps its zoom modifier to cmd on macOS and ctrl everywhere
+            // else, so the legend names whichever applies.
+            const LEGEND: &str = if cfg!(target_os = "macos") {
+                "drag / scroll: pan  ·  pinch or cmd-scroll: zoom  ·  \
+                 arrow keys: nudge trim  ·  double-click: fit"
+            } else {
+                "drag / scroll: pan  ·  pinch or ctrl-scroll: zoom  ·  \
+                 arrow keys: nudge trim  ·  double-click: fit"
+            };
             ui.add(
-                egui::Label::new(
-                    egui::RichText::new(
-                        "drag / scroll: pan  ·  pinch or cmd-scroll: zoom  ·  \
-                         arrow keys: nudge trim  ·  double-click: fit",
-                    )
-                    .small()
-                    .color(TEXT_DIM),
-                )
-                .truncate(),
+                egui::Label::new(egui::RichText::new(LEGEND).small().color(TEXT_DIM))
+                    .truncate(),
             );
         },
     );
