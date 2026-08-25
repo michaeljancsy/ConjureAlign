@@ -227,6 +227,82 @@ out through the window bottom.
 Never use a native OS dialog (`NSAlert`/`MessageBox`) for consent: headless scanners (`auval`,
 `pluginval`, Logic's scan) instantiate the plugin with no GUI, and a modal there hangs the scan.
 
+### Crash reporting (opt-in, `src/crash.rs`)
+
+Sentry, gated on the **same** consent answer as analytics — `analytics::enabled()`, the same
+`analytics.json`, one question in the UI. There is no second toggle and no second identifier:
+reports are labelled with `analytics::device_id()`, the same random install id.
+
+The two analytics invariants above hold here too (nothing before consent; no thread outliving
+the dylib — `Reporter` is held through a `Mutex<Weak<Reporter>>` registry exactly like
+`Worker`, and dropping the last strong ref closes the client, which ends the release-health
+session and joins Sentry's transport thread). Three things are specific to panics:
+
+1. **The hook is scoped, not blanket.** A plugin shares its process with the DAW and every other
+   plugin. Sentry's stock `PanicIntegration` installs a hook that captures *any* panic anywhere
+   in that process, which would file the host's bugs — and every other Rust plugin's — as ours.
+   So `default_integrations` is `false`, the other four integrations are listed by hand, and
+   `PanicIntegration` is only ever *constructed* (for `event_from_panic_info`), never
+   registered. Our own hook reports only when `crash::in_plugin_code()` — a thread-local depth
+   counter raised by the `crash::scope()` guards in `initialize()`, `process()`, the
+   `task_executor` closure and the editor draw closure.
+2. **The hook must chain, and must be installed late.** nih-plug installs a global hook of its
+   own from the CLAP `clap_entry.init` / VST3 `bundleEntry` dylib entry points (`setup_logger()`
+   → `log_panics()`), long before `Plugin::default()`. Ours is installed on consent, so
+   `take_hook()` picks that one up and always calls it — nih-plug's stderr/`NIH_LOG` panic
+   logging keeps working. Installing from a library constructor would run *before* nih-plug and
+   be silently replaced.
+3. **The hook body is wrapped in `permit_alloc`.** A panic can originate on the audio thread —
+   the `AtomicRefCell` borrows in `process()` are the likeliest failure in this codebase — where
+   `assert_process_allocs` would otherwise turn the report into a second panic inside the first.
+   nih-plug's own hook does the same. The `scope()` guard itself is just a thread-local
+   increment, so `process()` still allocates nothing.
+
+`before_send` (`crash::scrub`) is the last gate before anything leaves, and each line in it
+backs a promise in the README/consent copy: `server_name` is nulled (`sentry-contexts` fills it
+from the `hostname` crate), `user` is reduced to the device id, and `debug_meta.images` is
+trimmed to our own dylib — `debug-images` otherwise enumerates every shared library in the
+process, i.e. every other plugin the user owns. **Changing what is sent means changing
+`consent_modal`, `settings_menu` and the README Privacy table too.**
+
+`RejectReason` is NOT an error: it is an expected user outcome, already logged and already a
+Mixpanel event. Routing it here would bury real crashes. Only panics and genuine
+should-not-happen conditions (`crash::report_issue`) go to Sentry.
+
+The `sentry` dep is target-gated to macOS+Windows for the same reason `native-tls` is, and uses
+`default-features = false`: the default `transport` feature is `["reqwest", "native-tls"]` and
+`reqwest` pulls `tokio`, i.e. an async runtime inside every DAW. The `ureq` transport is
+declared `default-features = false` upstream, so no `rustls`, no `ring`, no nasm on the Windows
+CI. `CONJURE_ALIGN_SENTRY_DSN` overrides the DSN for a local sink (see
+`tests/crash_consent.rs`).
+
+**`crash::BoundedUreq` exists because sentry's stock ureq agent is wrong for a plugin in two
+ways.** Do not simplify it back to the default transport:
+
+- **No timeouts.** Sentry's transport configures TLS and proxying but sets none, and every
+  `ureq` timeout defaults to `None`. `TransportThread::drop` then joins its worker with
+  `handle.join().unwrap()` — unbounded — so one request that never completes (captive portal, a
+  firewall that blackholes the connection) blocks the drop forever, on whichever host thread is
+  unloading the plugin. A DAW would hang instead of quitting. `CONNECT_TIMEOUT`/`REQUEST_TIMEOUT`
+  bound the worst-case unload stall to `SHUTDOWN_TIMEOUT` plus one in-flight request.
+- **`RootCerts` defaults to `WebPki`.** That makes ureq call `disable_built_in_roots(true)` and
+  trust a *bundled Mozilla store* — the exact thing choosing native-tls was meant to avoid.
+  `BoundedUreq` sets `RootCerts::PlatformVerifier` so TLS rides the OS trust store. Relatedly,
+  `ureq` is a direct dependency on `native-tls-no-default` (not `native-tls`) and sentry's own
+  `native-tls` feature is OFF: sentry's feature would re-add `webpki-root-certs`, which is dead
+  weight and a CDLA-Permissive-2.0 licence in the attribution table. Selecting the provider in
+  `BoundedUreq` is what makes that possible.
+
+**Release builds symbolicate to nothing without a debug-file upload.** `[profile.release]` keeps
+`strip = "symbols"`; `debug = "limited"` + `split-debuginfo = "packed"` leave a `.dSYM`/`.pdb`
+beside the binary that the shipped bundle does not contain, and the Mach-O UUID / PE build id is
+what matches the two up. `scripts/release.sh` and `.github/workflows/windows.yml` upload them
+via `sentry-cli` and both **skip with a warning** rather than failing when
+`SENTRY_AUTH_TOKEN`/`SENTRY_ORG`/`SENTRY_PROJECT` are absent. The Sentry `release` is
+`conjure_align@<CARGO_PKG_VERSION>` and must stay in step with what the upload tags. Adding the
+dep cost ~1.8 MB per architecture slice (4.996 → 6.803 MB), i.e. ~10.8 MB on the macOS pkg (two
+architectures × three bundles) and ~3.6 MB on the Windows zip.
+
 ### AudioUnit v2 (clap-wrapper)
 
 `clap_wrapper::export_auv2!()` at the bottom of `lib.rs` adds a third exported entry point,

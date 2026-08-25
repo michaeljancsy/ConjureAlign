@@ -22,6 +22,10 @@ distributed.
 | [native-tls](https://github.com/sfackler/rust-native-tls) | MIT OR Apache-2.0 | TLS for the opt-in analytics sender; binds the OS stack via `security-framework` (MIT OR Apache-2.0, macOS) and `schannel` (MIT, Windows). macOS/Windows only |
 | `serde_json` | MIT OR Apache-2.0 | Analytics payload |
 | `getrandom` | MIT OR Apache-2.0 | Random analytics device id |
+| [sentry-rust](https://github.com/getsentry/sentry-rust) (`sentry`, `sentry-core`, `sentry-types`, `sentry-backtrace`, `sentry-contexts`, `sentry-debug-images`, `sentry-panic`) | MIT | Opt-in crash reporting. © Functional Software, Inc. macOS/Windows only |
+| [ureq](https://github.com/algesten/ureq) (`ureq`, `ureq-proto`) | MIT OR Apache-2.0 | HTTP client for the crash reporter, on the same OS TLS stack as `native-tls` above. macOS/Windows only |
+| `findshlibs`, `debugid`, `uuid`, `hostname`, `os_info`, `uname` | MIT OR Apache-2.0 (`debugid`: Apache-2.0; `hostname`, `os_info`: MIT) | Crash-report metadata (loaded images, build ids, OS name) |
+| `rand`, `rand_chacha`, `rand_core`, `ppv-lite86`, `hex`, `httpdate`, `http`, `httparse`, `base64`, `base64ct`, `der`, `pem-rfc7468`, `rustls-pki-types`, `zeroize`, `utf8-zero` | MIT OR Apache-2.0 | Transitively required by the two above |
 
 Where a component is dual-licensed MIT OR Apache-2.0, it is used under the MIT license.
 The full MIT/ISC license texts require reproduction of the copyright notice, which the
@@ -29,7 +33,11 @@ links above provide; the Apache-2.0 text is available at
 <https://www.apache.org/licenses/LICENSE-2.0>.
 
 The complete dependency graph (including transitive crates, all MIT/Apache-2.0-compatible)
-is recorded in `Cargo.lock`; `cargo metadata` lists each crate's license expression.
+is recorded in `Cargo.lock`; `cargo metadata` lists each crate's license expression. Note that
+`Cargo.lock` is a superset of what ships: it pins optional dependencies that no enabled feature
+selects (`tokio`, `reqwest`, `hyper`, `actix-web` and friends arrive that way via `sentry` and
+are never compiled). `cargo tree -e normal --target <triple>` is what actually lists the linked
+set.
 
 VST® is a trademark of Steinberg Media Technologies GmbH. This plugin's VST3 support is
 built from the GPLv3-licensed `vst3-sys` bindings, not the proprietary Steinberg VST3 SDK

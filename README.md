@@ -80,26 +80,33 @@ any plugin. In the audible band the null is −70 dB or deeper (measured in
 
 ## Privacy
 
-ConjureAlign can report anonymous usage data, and asks once — the first time you open its
-window — whether you want it to. **It is off unless you say yes**, and it never sends anything
-before you answer. There is no account, no login, and no identifier tied to you: events carry
-a random ID generated on the machine when you opt in.
+ConjureAlign can report anonymous usage data and crash reports, and asks once — the first
+time you open its window — whether you want it to. **It is off unless you say yes**, and it
+never sends anything before you answer. One answer covers both. There is no account, no login,
+and no identifier tied to you: everything carries a random ID generated on the machine when you
+opt in.
 
 | | |
 |---|---|
-| Sent | Plugin version, operating system, sample rate, and whether a capture succeeded or why it was rejected (bucketed — "0.9+" confidence, "1–10 ms" offset, not the actual figures). |
-| Never sent | Your audio, any measurement of it, file or project names, host or machine names, IP-derived identity, or anything else. |
+| Sent | Plugin version, operating system, sample rate, and whether a capture succeeded or why it was rejected (bucketed — "0.9+" confidence, "1–10 ms" offset, not the actual figures). Whether a run ended in a crash. If it did: the error, and the ConjureAlign functions and source lines that led to it. |
+| Never sent | Your audio, any measurement of it, your file or project names, host or machine names, IP-derived identity, or anything else. |
+
+A crash report names ConjureAlign's *own* code — its functions, and paths inside its source
+tree as it was built. It carries nothing from your machine: the list of other plugins loaded
+alongside it is stripped before sending, and so is your computer's name.
 
 Change your mind at any time with the **⚙** button in the plugin's control bar. Your answer is
 stored in `~/Library/Application Support/ConjureDSP/ConjureAlign/analytics.json` on macOS and
 `%APPDATA%\ConjureDSP\ConjureAlign\analytics.json` on Windows; deleting that file makes the
 plugin ask again. Declining stores the "no" and nothing else — no ID is generated. If you never
 open the editor (running headless from the host's generic parameter UI), you are never asked
-and nothing is ever sent. Analytics are compiled out entirely on platforms other than macOS and
+and nothing is ever sent. Both are compiled out entirely on platforms other than macOS and
 Windows.
 
-The code is all in [`src/analytics.rs`](src/analytics.rs), and the payload is built in one
-function (`build_payload`) if you want to read exactly what leaves the machine.
+The code is all in [`src/analytics.rs`](src/analytics.rs) and [`src/crash.rs`](src/crash.rs).
+The usage payload is built in one function (`build_payload`), and every crash report passes
+through one more (`scrub`) on its way out, if you want to read exactly what leaves the
+machine.
 
 The Audio Unit build is produced by [clap-wrapper](https://github.com/free-audio/clap-wrapper),
 which re-exports the CLAP plugin behind an AU entry point. It carries a local patch so that

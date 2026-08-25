@@ -49,6 +49,27 @@ jobs:
         shell: bash
         run: cargo xtask bundle conjure_align --release
 
+      # Turns a shipped crash report into function names. [profile.release] keeps
+      # `strip = "symbols"`, so the .dll carries none and the .pdb beside it holds
+      # everything; Sentry matches the two by build id.
+      #
+      # Skips itself when the credentials are absent rather than failing, so forks
+      # and PRs (which get no secrets) still build green. SENTRY_ORG / SENTRY_PROJECT
+      # are repository variables, not secrets — they are slugs, not credentials.
+      - name: Upload debug symbols to Sentry
+        shell: bash
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
+        run: |
+          if [ -z "${SENTRY_AUTH_TOKEN:-}" ] || [ -z "${SENTRY_ORG:-}" ] || [ -z "${SENTRY_PROJECT:-}" ]; then
+            echo "SENTRY_AUTH_TOKEN / SENTRY_ORG / SENTRY_PROJECT not all set; skipping symbol upload."
+            exit 0
+          fi
+          npm install -g @sentry/cli
+          sentry-cli debug-files upload --include-sources target/release
+
       - name: Download validators
         shell: bash
         env:

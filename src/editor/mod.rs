@@ -30,6 +30,7 @@ use crate::capture::{
     CaptureHandle, GATE_MAIN_QUIET, GATE_OPEN, GATE_REF_QUIET, PHASE_ANALYZING, PHASE_ARMED,
     PHASE_CAPTURING, PHASE_IDLE,
 };
+use crate::crash;
 use crate::params::{ConjureAlignParams, PolarityMode, TRIM_RANGE_MS};
 use crate::shared::{AnalysisSnapshot, GuiShared};
 
@@ -181,6 +182,7 @@ pub fn create(
     params: Arc<ConjureAlignParams>,
     shared: Arc<GuiShared>,
     capture: CaptureHandle,
+    crash: Arc<crash::CrashHandle>,
 ) -> Option<Box<dyn Editor>> {
     let egui_state: Arc<EguiState> = params.editor_state.clone();
     create_egui_editor(
@@ -228,6 +230,12 @@ pub fn create(
             if analytics::consent().is_none() {
                 consent_modal(ctx);
             }
+
+            // After both surfaces that can change the answer — the modal above
+            // and the settings popover inside `draw_ui` — so a click takes
+            // effect on this frame rather than at the next activation. Costs an
+            // atomic load and an uncontended lock when nothing has changed.
+            crash.sync_consent();
 
             // Keep animating through captures/analysis and drags even if the
             // host stops delivering input events.
@@ -489,7 +497,8 @@ fn capture_toggle(label: &str, fill: Color32, text: Color32) -> egui::Button<'_>
     egui::Button::new(egui::RichText::new(label).strong().color(text)).fill(fill)
 }
 
-/// The one-time analytics prompt. It has no dismiss and no default: closing
+/// The one-time privacy prompt, covering both usage analytics and crash
+/// reporting — one question, one answer. It has no dismiss and no default: closing
 /// the plugin window leaves the question unanswered and asks again next time,
 /// which is the only reading of silence that isn't a "yes" by attrition.
 ///
@@ -499,25 +508,27 @@ fn capture_toggle(label: &str, fill: Color32, text: Color32) -> egui::Button<'_>
 pub fn consent_modal(ctx: &egui::Context) {
     egui::Modal::new(egui::Id::new("conjure-align-consent")).show(ctx, |ui| {
         ui.set_max_width(400.0);
-        ui.heading("Share anonymous usage data?");
+        ui.heading("Share anonymous usage and crash data?");
         ui.add_space(8.0);
         ui.label(
-            "It shows me how often ConjureAlign is used and how often a capture \
-             fails, which is what tells me where to spend effort.",
+            "It shows me how often ConjureAlign is used, how often a capture fails, \
+             and when it crashes — which is what tells me where to spend effort.",
         );
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new(
-                "Sent: plugin version, operating system, sample rate, and whether a \
-                 capture succeeded or why it was rejected — labelled with a random ID.",
+                "Sent: plugin version, operating system, sample rate, whether a capture \
+                 succeeded or why it was rejected, and whether a run ended in a crash. \
+                 A crash also sends the error and the ConjureAlign code that led to it \
+                 — labelled with a random ID.",
             )
             .small()
             .color(TEXT_DIM),
         );
         ui.label(
             egui::RichText::new(
-                "Never sent: your audio, any measurement of it, file or project names, \
-                 or anything that identifies you.",
+                "Never sent: your audio, any measurement of it, your file or project \
+                 names, your computer's name, or anything that identifies you.",
             )
             .small()
             .color(TEXT_DIM),
@@ -529,7 +540,7 @@ pub fn consent_modal(ctx: &egui::Context) {
             }
             if ui
                 .add(capture_toggle(
-                    "Share usage data",
+                    "Share anonymous data",
                     CAPTURE_GREEN,
                     Color32::BLACK,
                 ))
@@ -583,24 +594,26 @@ fn settings_menu(ui: &mut egui::Ui) {
             if analytics::is_supported() {
                 let mut share = analytics::enabled();
                 if ui
-                    .checkbox(&mut share, "Share anonymous usage data")
+                    .checkbox(&mut share, "Share usage and crash data")
                     .changed()
                 {
                     analytics::set_consent(share);
                 }
                 ui.label(
                     egui::RichText::new(
-                        "Plugin version, OS, sample rate and capture outcomes, labelled \
-                         with a random ID. Never your audio.",
+                        "Plugin version, OS, sample rate, capture outcomes and crash \
+                         reports, labelled with a random ID. Never your audio.",
                     )
                     .small()
                     .color(TEXT_DIM),
                 );
             } else {
                 ui.label(
-                    egui::RichText::new("Usage analytics are not available on this platform.")
-                        .small()
-                        .color(TEXT_DIM),
+                    egui::RichText::new(
+                        "Usage and crash reporting are not available on this platform.",
+                    )
+                    .small()
+                    .color(TEXT_DIM),
                 );
             }
         },

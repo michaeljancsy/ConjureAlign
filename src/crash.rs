@@ -1,0 +1,453 @@
+//! Opt-in crash reporting (Sentry).
+//!
+//! This rides the *same* consent answer as [`crate::analytics`] — one question,
+//! one stored yes/no, both features — so it adds no permission surface of its
+//! own. Everything here is inert until [`crate::analytics::enabled`] is true.
+//!
+//! Three rules shape it, two of them inherited from the analytics module and
+//! one specific to panics:
+//!
+//! 1. **The audio thread never allocates or does I/O here.** `process()` does
+//!    take a [`scope`] guard, which is a thread-local counter increment and
+//!    nothing else — no allocation, no atomics, no consent read — so
+//!    `assert_process_allocs` stays meaningful. Every *report* is raised from
+//!    the main thread, the editor thread, or the background analysis task.
+//! 2. **No thread outlives the dylib.** Sentry's transport owns a background
+//!    thread tied to the client, so the client is owned by [`CrashHandle`]s
+//!    through a `Weak` registry, exactly like `analytics::Worker`. The last
+//!    plugin instance to drop closes the client and joins the thread.
+//! 3. **We report our own panics, not the host's.** A plugin shares its
+//!    process with the DAW and every other plugin in the session. Sentry's
+//!    stock `PanicIntegration` installs a hook that captures *any* panic
+//!    anywhere in that process, which would file the host's bugs — and every
+//!    other Rust plugin's — as ours. Instead the hook here reports only when a
+//!    [`Scope`] guard says the panicking thread is currently inside our code.
+//!
+//! ## Ordering against nih-plug's own panic hook
+//!
+//! nih-plug installs a global hook of its own (`setup_logger()` ->
+//! `log_panics()`) from the CLAP `clap_entry.init` / VST3 `bundleEntry` dylib
+//! entry points, long before `Plugin::default()` runs. Ours is installed later,
+//! on consent, which is what lets it chain: it takes the previous hook and
+//! always calls it, so nih-plug's stderr panic logging survives. Installing
+//! from a library constructor instead would run *before* nih-plug and get
+//! silently replaced.
+
+use std::cell::Cell;
+use std::marker::PhantomData;
+
+/// Sentry DSN for the "ConjureAlign" project. Like `analytics::MIXPANEL_TOKEN`,
+/// a DSN is public by design — it is write-only ingestion, grants no read
+/// access, and ships in every binary regardless of what we do here.
+pub const SENTRY_DSN: &str =
+    "https://d5c574afb565fb671e6ec70e673eedf0@o4511091371081728.ingest.us.sentry.io/4511972827136000";
+
+/// Points the reporter at a local sink for tests and manual QA, mirroring
+/// `analytics::ENDPOINT_ENV`.
+const DSN_ENV: &str = "CONJURE_ALIGN_SENTRY_DSN";
+
+// ---------------------------------------------------------------------------
+// Scope: which threads are "inside the plugin" right now
+// ---------------------------------------------------------------------------
+//
+// Deliberately unconditional — a `Cell<u32>` costs nothing and keeping it off
+// the cfg split means `lib.rs` can take a guard without any cfg of its own.
+
+thread_local! {
+    static DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// RAII marker saying "this thread is currently executing ConjureAlign code".
+/// Not `Send`: the guard must be dropped on the thread that took it, or the
+/// depth counter would drift.
+#[must_use = "the scope ends as soon as the guard is dropped"]
+pub struct Scope {
+    _not_send: PhantomData<*const ()>,
+}
+
+/// Take a scope guard. Cheap enough for the audio thread: one thread-local
+/// read and one write, no allocation and no synchronization.
+pub fn scope() -> Scope {
+    DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+    Scope {
+        _not_send: PhantomData,
+    }
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Whether the calling thread is inside a [`scope`]. This is the whole
+/// difference between reporting our own crashes and reporting the host's.
+pub fn in_plugin_code() -> bool {
+    DEPTH.with(|d| d.get()) > 0
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod imp {
+    use std::sync::{Arc, Mutex, Once, OnceLock, Weak};
+    use std::time::Duration;
+
+    use sentry::protocol::{DebugImage, Event, User};
+    use sentry::types::Scheme;
+    use sentry::{
+        ClientInitGuard, ClientOptions, Level, Transport, TransportFactory, TransportOptions,
+    };
+
+    use super::{in_plugin_code, DSN_ENV, SENTRY_DSN};
+    use crate::analytics;
+
+    /// How long a panic report may hold the panicking thread while it goes over
+    /// the wire. A plugin panic usually precedes the host aborting, so a
+    /// fire-and-forget send would simply be lost — but the thread is already on
+    /// its way to a crash, so the wait must still be bounded and short.
+    const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Matches the flush budget: `ClientInitGuard::drop` closes the client with
+    /// this, which is what joins the transport thread on unload.
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Bounds on a single request to Sentry. These exist to bound something much
+    /// less obvious than a slow report — see [`BoundedUreq`]. Between them the
+    /// worst case unload stall is SHUTDOWN_TIMEOUT plus one in-flight request.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// The stock `ureq` transport with timeouts, which it otherwise has none of:
+    /// sentry configures TLS and proxying on its agent but no timeouts, and every
+    /// `ureq` timeout defaults to `None`.
+    ///
+    /// That would be a slow-report problem in an application and is a hang in a
+    /// plugin. `TransportThread::drop` joins its worker with
+    /// `handle.join().unwrap()` — no timeout — so an in-flight request that never
+    /// completes blocks the drop forever, and the thread doing that drop is
+    /// whichever host thread is unloading us. A DAW quitting against a captive
+    /// portal would hang instead of quitting.
+    ///
+    /// Proxy handling mirrors `UreqHttpTransport`'s own agent setup. Root certs
+    /// deliberately do NOT: `RootCerts` defaults to `WebPki`, which makes ureq
+    /// call `disable_built_in_roots(true)` and trust a bundled Mozilla store
+    /// instead of the OS one. This project picked native-tls precisely so that
+    /// TLS rides the OS trust store (Security.framework / SChannel) and no
+    /// bundled store can go stale — see the analytics note in Cargo.toml — so
+    /// `PlatformVerifier` is set explicitly.
+    struct BoundedUreq;
+
+    impl TransportFactory for BoundedUreq {
+        fn create_transport_with_options(&self, options: TransportOptions) -> Arc<dyn Transport> {
+            let proxy = match (
+                options.dsn.scheme(),
+                &options.http_proxy,
+                &options.https_proxy,
+            ) {
+                (Scheme::Https, _, Some(proxy)) => ureq::Proxy::new(proxy).ok(),
+                (_, Some(proxy), _) => ureq::Proxy::new(proxy).ok(),
+                _ => None,
+            };
+            let agent = ureq::Agent::config_builder()
+                .timeout_connect(Some(CONNECT_TIMEOUT))
+                .timeout_global(Some(REQUEST_TIMEOUT))
+                .tls_config(
+                    ureq::tls::TlsConfig::builder()
+                        .provider(ureq::tls::TlsProvider::NativeTls)
+                        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                        .disable_verification(options.accept_invalid_certs)
+                        .build(),
+                )
+                .proxy(proxy)
+                .build()
+                .new_agent();
+            Arc::new(
+                sentry::transports::UreqHttpTransportOptions::from(options)
+                    .with_agent(agent)
+                    .build(),
+            )
+        }
+    }
+
+    /// Owns the Sentry client for as long as any plugin instance is alive.
+    /// Dropping it ends the release-health session, flushes, and joins the
+    /// transport thread — see rule 2 in the module docs.
+    struct Reporter {
+        _guard: ClientInitGuard,
+    }
+
+    fn options() -> ClientOptions {
+        let dsn = std::env::var(DSN_ENV)
+            .ok()
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| SENTRY_DSN.to_owned());
+
+        // `ClientOptions` is #[non_exhaustive], so this is field-by-field
+        // rather than a struct literal.
+        let mut opts = ClientOptions::default();
+        opts.dsn = dsn.parse().ok();
+        // Must match what `sentry-cli debug-files upload` associates the
+        // dSYM/PDB with, or release builds symbolicate to nothing.
+        opts.release = Some(concat!("conjure_align@", env!("CARGO_PKG_VERSION")).into());
+        // Rule 3: no `PanicIntegration`. The default set would install the
+        // process-wide hook that captures the host's panics as ours; the other
+        // four are exactly the defaults, listed explicitly so that adding one
+        // is a deliberate act.
+        opts.default_integrations = false;
+        opts.integrations = vec![
+            Arc::new(sentry::integrations::backtrace::AttachStacktraceIntegration),
+            Arc::new(sentry::integrations::debug_images::DebugImagesIntegration::default()),
+            Arc::new(sentry::integrations::contexts::ContextIntegration::default()),
+            Arc::new(sentry::integrations::backtrace::ProcessStacktraceIntegration),
+        ];
+        // The README promises no machine name and no identity beyond the random
+        // install id. `send_default_pii` off is what stops Sentry backfilling
+        // the client IP; `server_name` is nulled here and again in
+        // `before_send`, because `sentry-contexts` fills it from the `hostname`
+        // crate.
+        opts.send_default_pii = false;
+        opts.server_name = None;
+        // nih-plug owns the global `log` logger, so there is no breadcrumb
+        // source wired up at all. Pinned to zero so that stays true by
+        // construction rather than by accident.
+        opts.max_breadcrumbs = 0;
+        // One session per process: it opens here (i.e. on consent, so only
+        // opted-in users ever have one) and closes in `Reporter::drop` when the
+        // last instance unloads. That is what makes a crash-free rate
+        // meaningful — see the note in Cargo.toml.
+        opts.auto_session_tracking = true;
+        opts.session_mode = sentry::SessionMode::Application;
+        opts.shutdown_timeout = SHUTDOWN_TIMEOUT;
+        opts.transport = Some(Arc::new(BoundedUreq));
+        opts.before_send = Some(Arc::new(scrub));
+        opts
+    }
+
+    /// Where the plugin is running, as `initialize()` saw it. Applied in
+    /// `scrub` rather than through `configure_scope`, because a scope belongs
+    /// to the thread that set it: `initialize()` runs on the host's main
+    /// thread, while panics are captured from the audio thread and from
+    /// nih-plug's `bg-worker`, which would not see it.
+    fn host_context() -> &'static Mutex<Option<(String, f32)>> {
+        static HOST: OnceLock<Mutex<Option<(String, f32)>>> = OnceLock::new();
+        HOST.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Last gate before anything leaves the machine. Everything dropped here is
+    /// something the consent copy in the editor promises not to send.
+    fn scrub(mut event: Event<'static>) -> Option<Event<'static>> {
+        // `sentry-contexts` fills this from the `hostname` crate.
+        event.server_name = None;
+
+        // The random install id and nothing else — no username, no IP, no email.
+        event.user = analytics::device_id().map(|id| User {
+            id: Some(id),
+            ..Default::default()
+        });
+
+        // `debug-images` enumerates every shared library in the process, which
+        // in a DAW is every other plugin the user owns. Ours is the only one we
+        // have any business knowing about, and the only one we upload symbols
+        // for.
+        let images = &mut event.debug_meta.to_mut().images;
+        images.retain(|image| image_name(image).is_some_and(is_ours));
+
+        if let Some((plugin_api, sample_rate)) = host_context().lock().unwrap().clone() {
+            event.tags.insert("plugin_api".into(), plugin_api);
+            event
+                .tags
+                .insert("sample_rate".into(), (sample_rate as u32).to_string());
+        }
+
+        Some(event)
+    }
+
+    fn image_name(image: &DebugImage) -> Option<&str> {
+        match image {
+            DebugImage::Symbolic(i) => Some(i.name.as_str()),
+            DebugImage::Apple(i) => Some(i.name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Covers every name the one cdylib is loaded under: `ConjureAlign` inside
+    /// the three bundles, `libconjure_align.dylib` / `conjure_align.dll` for
+    /// tests, examples and the standalone binary.
+    fn is_ours(name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        name.contains("conjure_align") || name.contains("conjurealign")
+    }
+
+    // -----------------------------------------------------------------------
+    // Panic hook
+    // -----------------------------------------------------------------------
+
+    static HOOK: Once = Once::new();
+
+    /// Installed once per process, and only after consent — an opted-out user's
+    /// host never gets our hook at all.
+    fn install_hook() {
+        HOOK.call_once(|| {
+            let next = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                // A panic can originate on the audio thread: `process()` holds
+                // the `AtomicRefCell` borrows whose collision is the loudest
+                // failure this codebase has. There, `assert_process_allocs`
+                // would turn our own reporting into a second panic inside the
+                // first. nih-plug's hook wraps itself for the same reason.
+                nih_plug::util::permit_alloc(|| {
+                    if in_plugin_code() && analytics::enabled() {
+                        // Constructed, never registered: registering it would
+                        // run `Integration::setup`, which installs the blanket
+                        // hook this whole module exists to avoid. All we want
+                        // is its panic-info-to-event conversion, which carries
+                        // the backtrace and the panic location.
+                        let integration = sentry::integrations::panic::PanicIntegration::default();
+                        sentry::capture_event(integration.event_from_panic_info(info));
+                        if let Some(client) = sentry::Hub::current().client() {
+                            client.flush(Some(FLUSH_TIMEOUT));
+                        }
+                    }
+                });
+                // Always — nih-plug's hook logs the panic to stderr and to
+                // NIH_LOG, and that must keep working whether or not we
+                // reported anything.
+                next(info);
+            }));
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Client lifetime
+    // -----------------------------------------------------------------------
+
+    fn registry() -> &'static Mutex<Weak<Reporter>> {
+        static REGISTRY: OnceLock<Mutex<Weak<Reporter>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(Weak::new()))
+    }
+
+    fn reporter() -> Arc<Reporter> {
+        let registry = registry();
+        let mut slot = registry.lock().unwrap();
+        if let Some(existing) = slot.upgrade() {
+            return existing;
+        }
+        install_hook();
+        let fresh = Arc::new(Reporter {
+            _guard: sentry::init(options()),
+        });
+        *slot = Arc::downgrade(&fresh);
+        fresh
+    }
+
+    /// One per plugin instance. Constructing it does no I/O, starts no thread
+    /// and reads no consent, so plugin scanners and opted-out users pay
+    /// nothing.
+    #[derive(Default)]
+    pub struct CrashHandle {
+        /// Holds the process-wide client alive for this instance's lifetime.
+        reporter: Mutex<Option<Arc<Reporter>>>,
+    }
+
+    impl CrashHandle {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Bring this instance in line with the stored consent answer: arm on
+        /// yes, tear down on no.
+        ///
+        /// Called from `initialize()` and from the editor's draw closure. The
+        /// editor is where consent is actually given or withdrawn (the
+        /// first-run modal and the settings popover), so syncing there is what
+        /// makes a click take effect on the next frame rather than the next
+        /// session — and it cannot be forgotten the way a call bolted onto
+        /// each button would be.
+        pub fn sync_consent(&self) {
+            let mut slot = self.reporter.lock().unwrap();
+            match (analytics::enabled(), slot.is_some()) {
+                (true, false) => *slot = Some(reporter()),
+                // Dropping the last strong reference is what closes the client,
+                // ending the session and joining the transport thread.
+                (false, true) => *slot = None,
+                _ => {}
+            }
+        }
+
+        /// Records what the report should say about *where* it happened. Both
+        /// values are already inside the analytics disclosure, so this adds no
+        /// new surface. Stored unconditionally — consent may arrive later, and
+        /// a report raised then should still say where it came from.
+        pub fn set_host_context(&self, plugin_api: &str, sample_rate: f32) {
+            *host_context().lock().unwrap() = Some((plugin_api.to_owned(), sample_rate));
+        }
+    }
+
+    /// A condition that should not happen and that we cannot see any other way.
+    /// Deliberately NOT used for `RejectReason`: a rejected capture is an
+    /// ordinary user outcome, already logged and already an analytics event,
+    /// and routing it here would bury real crashes.
+    pub fn report_issue(message: &str) {
+        if !analytics::enabled() {
+            return;
+        }
+        sentry::capture_message(message, Level::Error);
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+mod imp {
+    //! No binaries ship for this platform, so there is no consent to collect
+    //! and nothing to report. The API is kept so `lib.rs` and the editor need
+    //! no `cfg` of their own; `Scope` above is real everywhere and simply has
+    //! nothing reading it here.
+
+    #[derive(Default)]
+    pub struct CrashHandle;
+
+    impl CrashHandle {
+        pub fn new() -> Self {
+            Self
+        }
+        pub fn sync_consent(&self) {}
+        pub fn set_host_context(&self, _plugin_api: &str, _sample_rate: f32) {}
+    }
+
+    pub fn report_issue(_message: &str) {}
+}
+
+pub use imp::{report_issue, CrashHandle};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_is_off_by_default_and_nests() {
+        // The panic hook reads this to decide whether a panic is ours. Getting
+        // it wrong in the "off" direction loses our own crashes; in the "on"
+        // direction it files the host's crashes as ours.
+        assert!(!in_plugin_code());
+        {
+            let _outer = scope();
+            assert!(in_plugin_code());
+            {
+                // `process()` inside `initialize()` is not a real call graph,
+                // but the editor draw closure calling into scoped helpers is,
+                // and an inner guard must not end the outer one.
+                let _inner = scope();
+                assert!(in_plugin_code());
+            }
+            assert!(in_plugin_code());
+        }
+        assert!(!in_plugin_code());
+    }
+
+    #[test]
+    fn scope_is_per_thread() {
+        let _guard = scope();
+        assert!(in_plugin_code());
+        // A scope on the audio thread must not make the analysis thread's
+        // panics look like ours, and vice versa.
+        assert!(!std::thread::spawn(in_plugin_code).join().unwrap());
+    }
+}

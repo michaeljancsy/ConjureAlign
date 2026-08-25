@@ -53,6 +53,34 @@ fi
 echo "=== ConjureAlign $VERSION: universal release build ==="
 cargo xtask bundle-universal conjure_align --release
 
+# Sentry needs the debug files to turn a shipped crash report into function names:
+# [profile.release] keeps `strip = "symbols"`, so the binaries themselves carry none, and
+# `split-debuginfo = "packed"` leaves a .dSYM per architecture beside each slice. The
+# Mach-O UUID survives stripping, which is what lets Sentry match the two up.
+#
+# Never fatal. A release that ships is worth more than a symbolicated crash report, and
+# the upload can be repeated afterwards from the same build tree.
+echo "=== Uploading debug symbols to Sentry ==="
+if ! command -v sentry-cli >/dev/null 2>&1; then
+    echo "  WARNING: sentry-cli not installed; skipping."
+    echo "  Install it with: brew install getsentry/tools/sentry-cli"
+elif [ -z "${SENTRY_AUTH_TOKEN:-}" ] || [ -z "${SENTRY_ORG:-}" ] || [ -z "${SENTRY_PROJECT:-}" ]; then
+    echo "  WARNING: SENTRY_AUTH_TOKEN / SENTRY_ORG / SENTRY_PROJECT not all set; skipping."
+    echo "  Release $VERSION will report crashes as bare addresses until these are uploaded."
+else
+    # Both slices: bundle-universal builds each arch separately before lipo, so each has
+    # its own .dSYM and its own UUID. --include-sources ships the source context too,
+    # which is public anyway (GPL-3.0, and the repo is public).
+    if sentry-cli debug-files upload \
+        --include-sources \
+        target/aarch64-apple-darwin/release \
+        target/x86_64-apple-darwin/release; then
+        echo "  uploaded (release conjure_align@$VERSION)"
+    else
+        echo "  WARNING: symbol upload failed; continuing with the release."
+    fi
+fi
+
 echo "=== Signing bundles (hardened runtime) ==="
 for b in "${BUNDLES[@]}"; do
     codesign --force --options runtime --timestamp -s "$IDENTITY_APP" "target/bundled/$b"
