@@ -9,7 +9,7 @@ Sub-sample precision, automatic polarity detection, and support for *negative* s
 The plugin window shows both captured waveforms overlaid (the main signal slides as the
 alignment changes) and the cross-correlation curve with a marker at the detected peak plus a
 live marker that tracks the applied shift. All graphs share one gesture set: drag or scroll
-to pan, pinch or ⌘-scroll to zoom, double-click to fit. Manual Trim is adjusted with its
+to pan, pinch or ⌘-scroll (Ctrl-scroll on Windows) to zoom, double-click to fit. Manual Trim is adjusted with its
 slider, or with ←/→ while hovering a graph (0.01 ms per tap; hold Shift for 0.1 ms).
 
 ![The ConjureAlign editor: overlaid captured waveforms above the cross-correlation curve with the detected peak marked](docs/screenshot.png)
@@ -83,6 +83,11 @@ Bundles appear in `target/bundled/`; on macOS copy `ConjureAlign.clap` to
 `ConjureAlign.component` to `~/Library/Audio/Plug-Ins/Components/`. After replacing an
 installed `.component`, run `killall -9 AudioComponentRegistrar` and restart the host, or
 macOS will keep serving the cached registration.
+
+On Windows the same command produces `ConjureAlign.vst3` and `ConjureAlign.clap` (no AU —
+that layer is macOS-only); copy them to `C:\Program Files\Common Files\VST3\` and
+`C:\Program Files\Common Files\CLAP\`. Windows builds compile and pass the validators in CI,
+but are less road-tested in real DAWs than the macOS ones — bug reports welcome.
 
 Run the DSP test suite with `cargo test --release`. To eyeball the GUI panels without a DAW,
 `cargo run --example gui_preview --features gui-preview` renders them with synthetic data to

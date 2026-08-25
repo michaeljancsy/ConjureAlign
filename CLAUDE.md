@@ -10,7 +10,7 @@ cross-correlation, with sub-sample precision and automatic polarity detection. T
 two microphones on one guitar amp, one plugin instance on the track to be shifted, the other
 track routed into the sidechain. Has a custom egui editor (overlaid capture waveforms, a
 cross-correlation graph with live markers, a comb-filter spectrum panel; all graphs share one
-gesture set — drag/scroll pans, pinch or ⌘-scroll zooms the x-axis, the y-axis is always
+gesture set — drag/scroll pans, pinch or ⌘-scroll (ctrl-scroll off macOS) zooms the x-axis, the y-axis is always
 plugin-scaled, double-click fits; Trim is adjusted via its slider or ←/→ while hovering a
 graph, there is no drag-to-trim; the lower panel's header row carries a legend spelling
 the gesture set out — it rides in that already-budgeted row rather than a line of its own,
@@ -50,6 +50,12 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   (needs rustc ≥1.95 to `cargo install`; otherwise download the binary from
   free-audio/clap-validator GitHub releases)
 - VST3 validation: `pluginval --strictness-level 10 target/bundled/ConjureAlign.vst3`
+- Windows: no local toolchain — `.github/workflows/windows.yml` builds, tests, bundles and
+  validates (pluginval `--skip-gui-tests`; clap-validator tolerating exactly the 4 known
+  upstream failures) on `windows-latest`, uploads `ConjureAlign-<v>-Windows.zip` as an
+  artifact, and attaches it to the GitHub Release on `v*` tag pushes (warns if the release
+  doesn't exist yet — create it and re-run the job). The editor is untestable in CI (no
+  GPU); GUI checks need a real Windows machine.
 - AU validation: install the `.component`, then
   `killall -9 AudioComponentRegistrar; auval -v aufx ALGN CONJ` (add `-strict` for the
   pedantic pass). The `;` is deliberate — `AudioComponentRegistrar` is an on-demand daemon,

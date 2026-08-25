@@ -1,0 +1,129 @@
+# Windows build: compile, test, bundle, validate, and package the VST3 + CLAP.
+#
+# No AU job: clap-wrapper is cfg-gated to macOS and drops out of Windows builds.
+# pluginval runs with --skip-gui-tests because the hosted runners have no GPU —
+# the editor (baseview Win32 + egui_glow) may fail to create a GL context there,
+# and a headless CI pass would say nothing about it anyway; the GUI needs real
+# hardware. clap-validator exits 0 even with failures, so the step counts them
+# and tolerates exactly the 4 known upstream nih-plug issues (see CLAUDE.md,
+# "Known upstream issues"); a 5th failure fails the build.
+#
+# On a v* tag push, the zip is attached to that tag's GitHub Release if one
+# exists (create the release first, or re-run the job after creating it).
+
+name: Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test (release)
+        shell: bash
+        run: cargo test --release
+
+      - name: Bundle
+        shell: bash
+        run: cargo xtask bundle conjure_align --release
+
+      - name: Download validators
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p validators
+          gh release download v1.0.4 --repo Tracktion/pluginval --pattern 'pluginval_Windows.zip' --dir validators
+          gh release download 0.4.1 --repo free-audio/clap-validator --pattern '*windows.zip' --dir validators
+          (cd validators && 7z x -y pluginval_Windows.zip >/dev/null && 7z x -y clap-validator-*.zip >/dev/null)
+
+      - name: pluginval (VST3, strictness 10)
+        shell: bash
+        run: |
+          PV=$(find validators -iname 'pluginval*.exe' | head -1)
+          "$PV" --strictness-level 10 --skip-gui-tests --validate target/bundled/ConjureAlign.vst3
+
+      - name: clap-validator (CLAP)
+        shell: bash
+        run: |
+          CV=$(find validators -iname 'clap-validator*.exe' | head -1)
+          # clap-validator exits non-zero whenever any test fails, and this shell
+          # runs with -e -o pipefail — neutralize that so the known-failure gate
+          # below is what decides the step's outcome.
+          "$CV" validate target/bundled/ConjureAlign.clap 2>&1 \
+            | sed 's/\x1b\[[0-9;]*m//g' | tee clapval.txt || true
+          SUMMARY=$(grep -E '[0-9]+ tests run' clapval.txt || true)
+          if [ -z "$SUMMARY" ]; then
+            echo "::error::clap-validator produced no summary (crashed?)"
+            exit 1
+          fi
+          FAILED=$(echo "$SUMMARY" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo 0)
+          echo "$SUMMARY"
+          if [ "$FAILED" -gt 4 ]; then
+            echo "::error::$FAILED CLAP validation failures — more than the 4 known upstream nih-plug issues"
+            exit 1
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          STAGE="ConjureAlign-$VERSION"
+          mkdir -p "$STAGE" dist
+          cp -R target/bundled/ConjureAlign.vst3 target/bundled/ConjureAlign.clap "$STAGE/"
+          cp LICENSE THIRD-PARTY.md "$STAGE/"
+          cat > "$STAGE/INSTALL.txt" <<'EOF'
+          ConjureAlign — installation (Windows)
+
+          Copy each bundle to the matching folder (create it if missing):
+
+            ConjureAlign.vst3 -> C:\Program Files\Common Files\VST3\
+            ConjureAlign.clap -> C:\Program Files\Common Files\CLAP\
+
+          Then restart your DAW and rescan plugins if it does not appear.
+
+          The Windows build compiles and passes automated validation, but has had
+          less real-DAW testing than the macOS build. Please report problems at
+          https://github.com/michaeljancsy/ConjureAlign/issues
+
+          Usage: https://github.com/michaeljancsy/ConjureAlign#how-to-use-it
+          EOF
+          7z a -tzip "dist/ConjureAlign-$VERSION-Windows.zip" "$STAGE" >/dev/null
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ConjureAlign-${{ env.VERSION }}-Windows
+          path: dist/*.zip
+
+      - name: Attach to release (tag builds)
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" dist/*.zip --clobber \
+            || echo "::warning::no release exists for $GITHUB_REF_NAME yet — create it, then re-run this job to attach the zip"
