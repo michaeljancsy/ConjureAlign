@@ -27,6 +27,19 @@ DAW afterwards; in Logic the plugin appears under Audio FX → ConjureDSP → Co
 If you previously copied the bundles into `~/Library/Audio/Plug-Ins` by hand, delete
 those copies so your DAW doesn't keep loading the old version.
 
+## Installation (Windows — beta)
+
+Download `ConjureAlign-<version>-Windows.zip` from the
+[latest release](https://github.com/michaeljancsy/ConjureAlign/releases/latest), unzip it,
+and copy `ConjureAlign.vst3` to `C:\Program Files\Common Files\VST3\` and
+`ConjureAlign.clap` to `C:\Program Files\Common Files\CLAP\` (there is no Audio Unit build —
+that format is macOS-only). Restart your DAW and rescan plugins if it doesn't appear.
+
+The Windows build passes the full DSP test suite, pluginval at strictness 10, and CLAP
+validation automatically on every release, but it has had far less real-DAW testing than
+the macOS build — [reports of anything odd](https://github.com/michaeljancsy/ConjureAlign/issues)
+are genuinely useful, especially about the plugin window.
+
 ## How to use it
 
 1. Put **ConjureAlign on the track you want to shift** (usually the more distant mic).
@@ -108,9 +121,7 @@ installed `.component`, run `killall -9 AudioComponentRegistrar` and restart the
 macOS will keep serving the cached registration.
 
 On Windows the same command produces `ConjureAlign.vst3` and `ConjureAlign.clap` (no AU —
-that layer is macOS-only); copy them to `C:\Program Files\Common Files\VST3\` and
-`C:\Program Files\Common Files\CLAP\`. Windows builds compile and pass the validators in CI,
-but are less road-tested in real DAWs than the macOS ones — bug reports welcome.
+that layer is macOS-only).
 
 Run the DSP test suite with `cargo test --release`. To eyeball the GUI panels without a DAW,
 `cargo run --example gui_preview --features gui-preview` renders them with synthetic data to
