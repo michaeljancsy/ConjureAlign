@@ -10,7 +10,7 @@
 use atomic_float::AtomicF32;
 use nih_plug::prelude::*;
 use nih_plug_egui::EguiState;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 
 /// Upper bound of the Max Shift parameter; delay lines and capture buffers are
@@ -23,6 +23,11 @@ pub const TRIM_RANGE_MS: f32 = 10.0;
 pub const CAPTURE_MAX_SECS: usize = 4;
 pub const GATE_THRESHOLD_MIN_DB: f32 = -90.0;
 pub const GATE_THRESHOLD_MAX_DB: f32 = -30.0;
+/// The Spectrum panel's fixed FFT segment sizes (its selector also offers
+/// Auto = 0, i.e. `spectrum::pick_nfft`'s ≈6 Hz-bin choice). All powers of
+/// two within `pick_nfft`'s own output range (256..=32768 across supported
+/// sample rates and the 4 s capture cap).
+pub const SPECTRUM_NFFT_OPTIONS: [u32; 6] = [1024, 2048, 4096, 8192, 16384, 32768];
 
 #[derive(Enum, Debug, PartialEq, Clone, Copy)]
 pub enum PolarityMode {
@@ -83,6 +88,15 @@ pub struct ConjureAlignParams {
     #[persist = "detected-confidence"]
     pub detected_confidence: Arc<AtomicF32>,
 
+    /// The Spectrum panel's FFT segment size selection: 0 = Auto (the
+    /// analysis task's `pick_nfft` choice), else one of
+    /// [`SPECTRUM_NFFT_OPTIONS`]. A visualization preference, not a host
+    /// parameter — but persisted so the choice survives editor close and
+    /// session reload. Written by the editor, read by the background
+    /// analysis task at snapshot time.
+    #[persist = "spectrum-nfft"]
+    pub spectrum_nfft: Arc<AtomicU32>,
+
     /// Editor window state (size), persisted so the window reopens as the
     /// user left it. Additive to the state format: old sessions without the
     /// key fall back to the default.
@@ -131,6 +145,7 @@ impl Default for ConjureAlignParams {
             detected_offset_ms: Arc::new(AtomicF32::new(0.0)),
             detected_polarity: Arc::new(AtomicBool::new(false)),
             detected_confidence: Arc::new(AtomicF32::new(0.0)),
+            spectrum_nfft: Arc::new(AtomicU32::new(0)),
             editor_state: EguiState::from_size(820, 560),
         }
     }

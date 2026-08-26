@@ -137,6 +137,11 @@ pub struct EditorState {
     lower_tab: LowerPanelTab,
     spectrum_log: bool,
     spectrum_cache: Option<SpectrumCache>,
+    /// Per-snapshot FFT-selector state (fit bound + GUI-side Welch
+    /// re-estimates). Self-invalidating on the snapshot pointer inside
+    /// `spectrum_view::show`, so it needs no entry in the snapshot-changed
+    /// block below.
+    spectrum_reestimates: Option<spectrum_view::SpectrumReestimates>,
     /// Last trim value this editor sent. `set_parameter` only queues the
     /// change until the audio thread drains the event queue, so the nudge
     /// bases follow-up edits on this instead of the (possibly stale)
@@ -160,6 +165,7 @@ impl Default for EditorState {
             lower_tab: LowerPanelTab::default(),
             spectrum_log: true,
             spectrum_cache: None,
+            spectrum_reestimates: None,
             pending_trim: None,
             // Estimate for the first frame only; measured thereafter.
             capture_row_w: 300.0,
@@ -210,6 +216,8 @@ pub fn create(
                 state.corr_cache = None;
                 state.spec_view = SpecViewState::default();
                 state.spectrum_cache = None;
+                // (spectrum_reestimates self-invalidates on the snapshot
+                // pointer inside spectrum_view::show.)
             }
 
             ResizableWindow::new("conjure-align-resize")
@@ -393,6 +401,7 @@ fn graphs(
                 net_ms,
                 flip_main,
                 align_on: params.align_on.value(),
+                nfft_choice: &params.spectrum_nfft,
             };
             // Its own stable push_id (vs "corr-panel"): switching tabs must
             // not alias the two panels' widget state or Response identity.
@@ -404,6 +413,7 @@ fn graphs(
                     &mut state.lower_tab,
                     &mut state.spectrum_log,
                     &mut state.spec_view,
+                    &mut state.spectrum_reestimates,
                     &mut state.spectrum_cache,
                 )
             })

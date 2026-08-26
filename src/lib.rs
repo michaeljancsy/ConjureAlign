@@ -259,12 +259,20 @@ impl Plugin for ConjureAlign {
                     // background thread, inside the Analyzing phase where this
                     // task owns the borrow — is the only path waveform data
                     // ever takes to the editor.
+                    // Honor the panel's persisted FFT-size selection so a
+                    // fresh snapshot already matches it; the GUI only
+                    // re-estimates when the selector changes afterwards.
+                    let nfft_override = match params.spectrum_nfft.load(Ordering::Relaxed) {
+                        0 => None,
+                        n => Some(n as usize),
+                    };
                     let spectrum = spectrum::welch_for_capture(
                         &data.main[..data.filled],
                         &data.reference[..data.filled],
                         data.sample_rate,
                         &report,
                         &data.splices,
+                        nfft_override,
                     );
                     Arc::new(AnalysisSnapshot {
                         main: data.main[..data.filled].to_vec(),
