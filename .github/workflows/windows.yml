@@ -68,7 +68,27 @@ jobs:
             exit 0
           fi
           npm install -g @sentry/cli
-          sentry-cli debug-files upload --include-sources target/release
+          # Only our own cdylib. Pointing this at target/release uploads the whole
+          # build tree — 334 files on the first run, of which 3 mattered; the rest
+          # were every dependency's build_script_build, the proc-macro dlls, the
+          # test binaries and xtask. None of those can ever appear in a plugin
+          # crash report, and --include-sources bundles their source as well.
+          # Cargo uplifts the artifact to target/release but also leaves it in
+          # deps/, and which one exists is not worth depending on; Sentry dedupes
+          # by debug id, so listing both is free.
+          PATHS=""
+          for f in target/release/conjure_align.pdb \
+                   target/release/conjure_align.dll \
+                   target/release/deps/conjure_align.pdb \
+                   target/release/deps/conjure_align.dll; do
+            [ -e "$f" ] && PATHS="$PATHS $f"
+          done
+          if [ -z "$PATHS" ]; then
+            echo "WARNING: no conjure_align debug files found; skipping upload."
+            exit 0
+          fi
+          echo "Uploading:$PATHS"
+          sentry-cli debug-files upload --include-sources $PATHS
 
       - name: Download validators
         shell: bash

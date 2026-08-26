@@ -74,17 +74,26 @@ elif ! sentry-cli info >/dev/null 2>&1; then
     echo "  Run: sentry-cli login"
     echo "  Release $VERSION will report crashes as bare addresses until these are uploaded."
 else
-    # Both slices: bundle-universal builds each arch separately before lipo, so each has
-    # its own .dSYM and its own UUID. --include-sources ships the source context too,
-    # which is public anyway (GPL-3.0, and the repo is public).
+    # Both slices, and ONLY our own dylib: bundle-universal builds each arch separately
+    # before lipo, so each has its own dSYM and its own UUID. Naming the files rather
+    # than the release directory is load-bearing — pointing sentry-cli at a whole
+    # release tree sweeps up every dependency's build script, the proc-macro dylibs and
+    # the test binaries, none of which can appear in a plugin crash report, and
+    # `--include-sources` then bundles their source as well.
     #
-    # Org and project likewise come from either the environment or ~/.sentryclirc's
-    # [defaults]; `sentry-cli login` sets neither, so this is the likeliest way a
-    # correctly-authenticated machine still fails here.
-    if sentry-cli debug-files upload \
-        --include-sources \
-        target/aarch64-apple-darwin/release \
-        target/x86_64-apple-darwin/release; then
+    # Org and project come from either the environment or ~/.sentryclirc's [defaults];
+    # `sentry-cli login` sets neither, so that is the likeliest way a correctly
+    # authenticated machine still fails the upload below.
+    SYMS=""
+    for t in aarch64-apple-darwin x86_64-apple-darwin; do
+        for f in "target/$t/release/libconjure_align.dylib.dSYM" \
+                 "target/$t/release/libconjure_align.dylib"; do
+            [ -e "$f" ] && SYMS="$SYMS $f"
+        done
+    done
+    if [ -z "$SYMS" ]; then
+        echo "  WARNING: no libconjure_align dSYM found under target/*/release; skipping."
+    elif sentry-cli debug-files upload --include-sources $SYMS; then
         echo "  uploaded (release conjure_align@$VERSION)"
     else
         echo "  WARNING: symbol upload failed; continuing with the release."

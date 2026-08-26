@@ -311,6 +311,12 @@ Note that `login` sets the token but NOT the org/project defaults, so those stil
 the environment or in `~/.sentryclirc`'s `[defaults]`; that is the likeliest way an
 authenticated machine still fails the upload.
 
+Both call sites name the plugin's own binary and dSYM/PDB explicitly rather than pointing at a
+release directory. That is not tidiness: `sentry-cli` searches paths recursively, so a whole
+release tree uploads every dependency's `build_script_build`, the proc-macro dylibs, the test
+binaries and `xtask` — 334 files on the run that caught this, of which 3 were ours — and
+`--include-sources` bundles their source too.
+
 The Sentry `release` is `conjure_align@<CARGO_PKG_VERSION>` and must stay in step with what the
 upload tags. **macOS has no CI**, so a macOS release only ever gets symbols if this machine is
 configured — and debug files match by build id, so a release shipped without them cannot be
