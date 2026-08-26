@@ -5,8 +5,12 @@
 //! correction) and with the currently applied shift + polarity (which
 //! follows trim drags live). Both curves are synthesized per display width
 //! from the snapshot's Welch spectra — see `spectrum.rs` for the math; no
-//! FFT runs on the GUI thread.
+//! FFT runs on the GUI thread per frame. The one exception is the header's
+//! FFT-size selector: picking a size that differs from the snapshot's runs a
+//! single Welch re-estimate here, cached per (snapshot, size), so switching
+//! back and forth never repeats an FFT.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use nih_plug_egui::egui::{self, Align2, FontId, Pos2, Sense, Stroke, StrokeKind, Ui, Vec2};
@@ -18,8 +22,9 @@ use super::{
     view_math, LowerPanelTab, PanelOutput, ACCENT_LIVE, CURVE_COLOR, GRID_COLOR, PANEL_BG,
     TEXT_DIM,
 };
+use crate::params::SPECTRUM_NFFT_OPTIONS;
 use crate::shared::AnalysisSnapshot;
-use crate::spectrum::synth_sum_db;
+use crate::spectrum::{estimate_with_seam_fallback, prealign_lag, synth_sum_db, SpectrumData};
 
 /// Fixed height of the dB axis; the top adapts to the data (`y_top_db`).
 const SPAN_DB: f32 = 60.0;
@@ -41,6 +46,9 @@ pub struct SpecViewState {
 #[derive(PartialEq, Clone, Copy)]
 struct SpecStaticKey {
     snap: usize,
+    /// The resolved segment size — (snap, nfft) identifies the source
+    /// spectra, so an FFT-selector change invalidates both curves.
+    nfft: usize,
     log: bool,
     cols: usize,
     f_lo_bits: u64,
@@ -78,10 +86,16 @@ pub struct SpectrumArgs<'a> {
     /// Polarity as displayed (mirrors the waveform panel's flip).
     pub flip_main: bool,
     pub align_on: bool,
+    /// The persisted FFT-size selection (0 = Auto, else a fixed segment
+    /// size); read every frame and written by the header's selector.
+    pub nfft_choice: &'a AtomicU32,
 }
 
 /// Header row + canvas. `height` is the panel's TOTAL height, header row
-/// included.
+/// included. `reestimates` caches GUI-side Welch re-estimates per selected
+/// nfft (inner `None` = that size failed, don't retry); the caller clears it
+/// when the snapshot changes.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     height: f32,
@@ -89,8 +103,28 @@ pub fn show(
     tab: &mut LowerPanelTab,
     log_axis: &mut bool,
     vs: &mut SpecViewState,
+    reestimates: &mut Vec<(usize, Option<SpectrumData>)>,
     cache: &mut Option<SpectrumCache>,
 ) -> PanelOutput {
+    // Pre-alignment lag and the largest segment that fully fits, for the
+    // FFT selector and the re-estimation below. `None` until a capture with
+    // a correlation curve exists (mirrors the rejected-before-analysis
+    // treatment of the canvas). `nfft <= usable` is exactly `estimate`'s
+    // a-full-segment-fits condition, so enabled options cannot come back
+    // empty.
+    let fit = args.snapshot.and_then(|s| {
+        if s.corr.is_empty() {
+            return None;
+        }
+        let d = prealign_lag(&s.outcome, &s.corr, s.max_shift_samples);
+        let usable = s
+            .main
+            .len()
+            .min(s.reference.len())
+            .saturating_sub(d.unsigned_abs() as usize);
+        Some((d, usable))
+    });
+
     let header = ui.horizontal(|ui| {
         super::lower_tab_selector(ui, tab);
         ui.add_space(8.0);
@@ -106,6 +140,7 @@ pub fn show(
                 // The two axis spaces don't share a meaningful view.
                 vs.view = None;
             }
+            nfft_selector(ui, args.nfft_choice, fit);
             // Fills the row's dead middle, so the legend costs no height.
             ui.add_space(8.0);
             super::gesture_legend(ui);
@@ -133,7 +168,7 @@ pub fn show(
             TEXT_DIM,
         );
     };
-    let spec = match args.snapshot {
+    let auto_spec = match args.snapshot {
         Some(s) => match &s.spectrum {
             Some(spec) => spec,
             None => {
@@ -147,6 +182,32 @@ pub fn show(
         }
     };
     let snap = args.snapshot.unwrap();
+
+    // Resolve the FFT-size selection against this snapshot. A selection the
+    // snapshot already matches (or that doesn't fit this capture — kept, not
+    // clobbered: the next capture may fit it again) displays the analysis
+    // task's spectrum untouched; otherwise re-estimate once and cache per
+    // size — the only FFT that ever runs on the GUI thread.
+    let choice = args.nfft_choice.load(Ordering::Relaxed) as usize;
+    let spec: &SpectrumData = match (choice, fit) {
+        (0, _) | (_, None) => auto_spec,
+        (n, _) if n == auto_spec.nfft => auto_spec,
+        (n, Some((d, usable))) if n <= usable => {
+            if !reestimates.iter().any(|(k, _)| *k == n) {
+                let s =
+                    estimate_with_seam_fallback(&snap.main, &snap.reference, d, n, &snap.splices);
+                reestimates.push((n, s));
+            }
+            reestimates
+                .iter()
+                .find_map(|(k, s)| (*k == n).then_some(s.as_ref()))
+                .flatten()
+                // Defensive only: `n <= usable` means a segment fits and the
+                // seam fallback covers the all-crossed case.
+                .unwrap_or(auto_spec)
+        }
+        _ => auto_spec,
+    };
 
     let sr = snap.sample_rate.max(1.0) as f64;
     let base_hi = sr / 2.0;
@@ -230,6 +291,7 @@ pub fn show(
     let cols = (rect.width().floor() as usize).max(8);
     let static_key = SpecStaticKey {
         snap: Arc::as_ptr(snap) as usize,
+        nfft: spec.nfft,
         log,
         cols,
         f_lo_bits: v_lo.to_bits(),
@@ -363,6 +425,50 @@ pub fn show(
     );
 
     PanelOutput { response }
+}
+
+/// The header's FFT segment-size ComboBox. Writes the persisted selection
+/// (0 = Auto); `fit` gates which fixed sizes are selectable for the current
+/// capture (`None` = no analyzed capture yet, whole combo disabled — the
+/// choice stays visible so the row doesn't jump when the first capture
+/// lands).
+fn nfft_selector(ui: &mut Ui, choice: &AtomicU32, fit: Option<(i32, usize)>) {
+    let current = choice.load(Ordering::Relaxed);
+    let mut selected = current;
+    ui.add_enabled_ui(fit.is_some(), |ui| {
+        egui::ComboBox::from_id_salt("spec-nfft")
+            .width(94.0)
+            .selected_text(if current == 0 {
+                "FFT: Auto".to_owned()
+            } else {
+                format!("FFT: {current}")
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut selected, 0, "Auto")
+                    .on_hover_text("≈6 Hz bins (8192 at 44.1/48 kHz)");
+                for &n in &SPECTRUM_NFFT_OPTIONS {
+                    let fits = fit.is_some_and(|(_, usable)| n as usize <= usable);
+                    if ui
+                        .add_enabled(
+                            fits,
+                            egui::SelectableLabel::new(selected == n, n.to_string()),
+                        )
+                        .on_disabled_hover_text("Capture too short for this FFT size")
+                        .clicked()
+                    {
+                        selected = n;
+                    }
+                }
+            })
+            .response
+            .on_hover_text(
+                "FFT segment size: larger = finer frequency resolution \
+                 but fewer averaged segments (noisier curve)",
+            );
+    });
+    if selected != current {
+        choice.store(selected, Ordering::Relaxed);
+    }
 }
 
 /// Pans the `(v_lo, v_hi)` frequency view by `px` display pixels, operating

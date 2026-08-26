@@ -2,7 +2,9 @@
 //! ("Spectrum") panel.
 //!
 //! Runs on the background analysis thread (estimation) and the GUI thread
-//! (synthesis); the audio thread never calls into this module. Same sign
+//! (synthesis — plus one cached re-estimation per user-selected FFT size
+//! when the panel's selector diverges from the snapshot); the audio thread
+//! never calls into this module. Same sign
 //! convention as `analysis.rs`: `detected offset = t_ref − t_main`, positive
 //! ⇒ main leads and gets delayed, `ref[n] ≈ main[n − offset]`.
 //!
@@ -195,16 +197,42 @@ pub fn estimate(
     })
 }
 
+/// [`estimate`], falling back to ignoring the seams when every segment
+/// crosses one (short chunks vs. the segment length): a slightly smeared
+/// spectrum beats an empty panel. Shared by [`welch_for_capture`] and the
+/// panel's GUI-side re-estimation at a user-selected segment size, so both
+/// apply the same policy.
+pub fn estimate_with_seam_fallback(
+    main: &[f32],
+    reference: &[f32],
+    prealign_samples: i32,
+    nfft: usize,
+    splices: &[usize],
+) -> Option<SpectrumData> {
+    estimate(main, reference, prealign_samples, nfft, splices).or_else(|| {
+        if splices.is_empty() {
+            None
+        } else {
+            estimate(main, reference, prealign_samples, nfft, &[])
+        }
+    })
+}
+
 /// The one-call wrapper both snapshot construction sites use: gate on the
 /// report having a correlation curve (mirroring the correlation panel's
 /// rejected-before-analysis treatment), then pre-align, pick a segment size,
-/// estimate.
+/// estimate. `nfft_override` is the user's fixed segment size (the Spectrum
+/// panel's FFT selector); it is honored when a full segment fits and
+/// otherwise falls back to the automatic [`pick_nfft`] choice — never to
+/// `None`, so an over-large selection degrades to Auto instead of an empty
+/// panel.
 pub fn welch_for_capture(
     main: &[f32],
     reference: &[f32],
     sample_rate: f32,
     report: &AnalysisReport,
     splices: &[usize],
+    nfft_override: Option<usize>,
 ) -> Option<SpectrumData> {
     if report.corr_curve.is_empty() {
         return None;
@@ -214,17 +242,14 @@ pub fn welch_for_capture(
         .len()
         .min(reference.len())
         .saturating_sub(d.unsigned_abs() as usize);
-    let nfft = pick_nfft(sample_rate, usable)?;
-    // If every segment crosses a seam (short chunks vs. the segment length),
-    // fall back to ignoring the seams: a slightly smeared spectrum beats an
-    // empty panel.
-    estimate(main, reference, d, nfft, splices).or_else(|| {
-        if splices.is_empty() {
-            None
-        } else {
-            estimate(main, reference, d, nfft, &[])
-        }
-    })
+    let nfft = match nfft_override {
+        // `nfft <= usable` is exactly `estimate`'s no-full-segment-fits
+        // bound (`s_hi >= s_lo`), so a fitting override cannot come back
+        // empty (modulo the seam fallback, which the helper handles).
+        Some(n) if n >= MIN_NFFT && n <= usable => n,
+        _ => pick_nfft(sample_rate, usable)?,
+    };
+    estimate_with_seam_fallback(main, reference, d, nfft, splices)
 }
 
 /// dB magnitude spectrum of the summed signal `p·main[n − δ] + ref[n]`:
@@ -546,9 +571,16 @@ mod tests {
         let report = analyze_detailed(&main, &reference, 960);
         let detected = report.outcome.expect("must detect").offset_samples;
         assert!((detected - 240.0).abs() < 0.1);
-        let spec = welch_for_capture(&main, &reference, 48_000.0, &report, &[]).unwrap();
+        let spec = welch_for_capture(&main, &reference, 48_000.0, &report, &[], None).unwrap();
         assert_eq!(spec.nfft, 8192);
         assert_eq!(spec.prealign_samples, 240);
+
+        // A fitting override is honored; an over-large or under-minimum one
+        // degrades to the automatic pick, never to an empty panel.
+        for (over, want) in [(2048, 2048), (1 << 20, 8192), (64, 8192)] {
+            let s = welch_for_capture(&main, &reference, 48_000.0, &report, &[], Some(over));
+            assert_eq!(s.unwrap().nfft, want, "override {over}");
+        }
         let mut db = Vec::new();
         synth_sum_db(&spec, detected, false, &mut db);
         let max_pmm = spec.pmm.iter().fold(0.0f32, |m, &v| m.max(v));
@@ -606,9 +638,12 @@ mod tests {
         // one, so the seam-aware estimate is impossible...
         let seams: Vec<usize> = (1..20).map(|i| i * 1000).collect();
         assert!(estimate(&main, &reference, 16, 8192, &seams).is_none());
-        // ...and welch_for_capture falls back to ignoring the seams.
+        // ...and the fallback helper ignores the seams instead.
+        let spec = estimate_with_seam_fallback(&main, &reference, 16, 8192, &seams).unwrap();
+        assert!(spec.segments > 0);
+        // welch_for_capture routes through the same helper.
         let report = analyze_detailed(&main, &reference, 960);
-        let spec = welch_for_capture(&main, &reference, 48_000.0, &report, &seams).unwrap();
+        let spec = welch_for_capture(&main, &reference, 48_000.0, &report, &seams, None).unwrap();
         assert!(spec.segments > 0);
     }
 

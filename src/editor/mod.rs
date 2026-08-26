@@ -137,6 +137,12 @@ pub struct EditorState {
     lower_tab: LowerPanelTab,
     spectrum_log: bool,
     spectrum_cache: Option<SpectrumCache>,
+    /// GUI-side Welch re-estimates for the Spectrum panel's FFT selector,
+    /// keyed by nfft; inner `None` caches a failure so it isn't retried
+    /// every frame. Cleared with the other caches on snapshot change, which
+    /// is what scopes it to the current snapshot. (≤ the handful of fixed
+    /// sizes; a plain Vec.)
+    spectrum_reestimates: Vec<(usize, Option<crate::spectrum::SpectrumData>)>,
     /// Last trim value this editor sent. `set_parameter` only queues the
     /// change until the audio thread drains the event queue, so the nudge
     /// bases follow-up edits on this instead of the (possibly stale)
@@ -160,6 +166,7 @@ impl Default for EditorState {
             lower_tab: LowerPanelTab::default(),
             spectrum_log: true,
             spectrum_cache: None,
+            spectrum_reestimates: Vec::new(),
             pending_trim: None,
             // Estimate for the first frame only; measured thereafter.
             capture_row_w: 300.0,
@@ -210,6 +217,7 @@ pub fn create(
                 state.corr_cache = None;
                 state.spec_view = SpecViewState::default();
                 state.spectrum_cache = None;
+                state.spectrum_reestimates.clear();
             }
 
             ResizableWindow::new("conjure-align-resize")
@@ -393,6 +401,7 @@ fn graphs(
                 net_ms,
                 flip_main,
                 align_on: params.align_on.value(),
+                nfft_choice: &params.spectrum_nfft,
             };
             // Its own stable push_id (vs "corr-panel"): switching tabs must
             // not alias the two panels' widget state or Response identity.
@@ -404,6 +413,7 @@ fn graphs(
                     &mut state.lower_tab,
                     &mut state.spectrum_log,
                     &mut state.spec_view,
+                    &mut state.spectrum_reestimates,
                     &mut state.spectrum_cache,
                 )
             })

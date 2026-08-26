@@ -42,7 +42,7 @@ fn main() {
         "synthetic capture: outcome ok = {}, detected = {detected_ms:.3} ms (expected +5)",
         report.outcome.is_ok()
     );
-    let spectrum = spectrum::welch_for_capture(&main, &reference, sr, &report, &[]);
+    let spectrum = spectrum::welch_for_capture(&main, &reference, sr, &report, &[], None);
     let snapshot = Arc::new(AnalysisSnapshot {
         main,
         reference,
@@ -235,6 +235,8 @@ fn render_scene(
     let mut tab = lower;
     let mut spectrum_log = true;
     let mut spec_state = SpecViewState::default();
+    let spectrum_nfft = std::sync::atomic::AtomicU32::new(0);
+    let mut spectrum_reestimates = Vec::new();
     let mut spectrum_cache = None;
 
     let mut harness = egui_kittest::Harness::builder()
@@ -276,6 +278,7 @@ fn render_scene(
                         net_ms,
                         flip_main: false,
                         align_on: true,
+                        nfft_choice: &spectrum_nfft,
                     };
                     spectrum_view::show(
                         ui,
@@ -284,6 +287,7 @@ fn render_scene(
                         &mut tab,
                         &mut spectrum_log,
                         &mut spec_state,
+                        &mut spectrum_reestimates,
                         &mut spectrum_cache,
                     );
                 }
