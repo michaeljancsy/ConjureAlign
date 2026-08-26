@@ -236,7 +236,7 @@ fn render_scene(
     let mut spectrum_log = true;
     let mut spec_state = SpecViewState::default();
     let spectrum_nfft = std::sync::atomic::AtomicU32::new(0);
-    let mut spectrum_reestimates = Vec::new();
+    let mut spectrum_reestimates = None;
     let mut spectrum_cache = None;
 
     let mut harness = egui_kittest::Harness::builder()

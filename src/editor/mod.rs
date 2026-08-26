@@ -137,12 +137,11 @@ pub struct EditorState {
     lower_tab: LowerPanelTab,
     spectrum_log: bool,
     spectrum_cache: Option<SpectrumCache>,
-    /// GUI-side Welch re-estimates for the Spectrum panel's FFT selector,
-    /// keyed by nfft; inner `None` caches a failure so it isn't retried
-    /// every frame. Cleared with the other caches on snapshot change, which
-    /// is what scopes it to the current snapshot. (≤ the handful of fixed
-    /// sizes; a plain Vec.)
-    spectrum_reestimates: Vec<(usize, Option<crate::spectrum::SpectrumData>)>,
+    /// Per-snapshot FFT-selector state (fit bound + GUI-side Welch
+    /// re-estimates). Self-invalidating on the snapshot pointer inside
+    /// `spectrum_view::show`, so it needs no entry in the snapshot-changed
+    /// block below.
+    spectrum_reestimates: Option<spectrum_view::SpectrumReestimates>,
     /// Last trim value this editor sent. `set_parameter` only queues the
     /// change until the audio thread drains the event queue, so the nudge
     /// bases follow-up edits on this instead of the (possibly stale)
@@ -166,7 +165,7 @@ impl Default for EditorState {
             lower_tab: LowerPanelTab::default(),
             spectrum_log: true,
             spectrum_cache: None,
-            spectrum_reestimates: Vec::new(),
+            spectrum_reestimates: None,
             pending_trim: None,
             // Estimate for the first frame only; measured thereafter.
             capture_row_w: 300.0,
@@ -217,7 +216,8 @@ pub fn create(
                 state.corr_cache = None;
                 state.spec_view = SpecViewState::default();
                 state.spectrum_cache = None;
-                state.spectrum_reestimates.clear();
+                // (spectrum_reestimates self-invalidates on the snapshot
+                // pointer inside spectrum_view::show.)
             }
 
             ResizableWindow::new("conjure-align-resize")

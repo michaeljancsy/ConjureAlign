@@ -72,6 +72,16 @@ pub fn pick_nfft(sample_rate: f32, usable_len: usize) -> Option<usize> {
     Some(nfft)
 }
 
+/// Whether a full `nfft`-sample segment fits a capture with `usable`
+/// samples remaining after pre-alignment (`usable = min(len) − |lag|`).
+/// `nfft <= usable` is exactly [`estimate`]'s `s_hi >= s_lo` bound, and the
+/// [`MIN_NFFT`] floor matches [`pick_nfft`]'s. The one definition shared by
+/// [`welch_for_capture`] and the editor's FFT selector, so the two paths
+/// cannot disagree about whether a stored size is valid.
+pub fn nfft_fits(nfft: usize, usable: usize) -> bool {
+    (MIN_NFFT..=usable).contains(&nfft)
+}
+
 /// The integer pre-alignment lag for [`estimate`], from the snapshot's OWN
 /// analysis — never from the persisted detected-offset atomics, which still
 /// hold a *previous* capture's offset after a rejection. `Ok` → the refined
@@ -243,10 +253,9 @@ pub fn welch_for_capture(
         .min(reference.len())
         .saturating_sub(d.unsigned_abs() as usize);
     let nfft = match nfft_override {
-        // `nfft <= usable` is exactly `estimate`'s no-full-segment-fits
-        // bound (`s_hi >= s_lo`), so a fitting override cannot come back
-        // empty (modulo the seam fallback, which the helper handles).
-        Some(n) if n >= MIN_NFFT && n <= usable => n,
+        // A fitting override cannot come back empty (modulo the seam
+        // fallback, which the helper handles).
+        Some(n) if nfft_fits(n, usable) => n,
         _ => pick_nfft(sample_rate, usable)?,
     };
     estimate_with_seam_fallback(main, reference, d, nfft, splices)
