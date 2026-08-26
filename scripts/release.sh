@@ -64,13 +64,23 @@ echo "=== Uploading debug symbols to Sentry ==="
 if ! command -v sentry-cli >/dev/null 2>&1; then
     echo "  WARNING: sentry-cli not installed; skipping."
     echo "  Install it with: brew install getsentry/tools/sentry-cli"
-elif [ -z "${SENTRY_AUTH_TOKEN:-}" ] || [ -z "${SENTRY_ORG:-}" ] || [ -z "${SENTRY_PROJECT:-}" ]; then
-    echo "  WARNING: SENTRY_AUTH_TOKEN / SENTRY_ORG / SENTRY_PROJECT not all set; skipping."
+elif ! sentry-cli info >/dev/null 2>&1; then
+    # Deliberately NOT a test for SENTRY_AUTH_TOKEN. sentry-cli reads its token from the
+    # environment OR from ~/.sentryclirc, and `sentry-cli login` only ever writes the
+    # latter — so an env-var check reports a perfectly authenticated machine as
+    # unconfigured and silently drops the symbols. `info` exits non-zero only when no
+    # token is available by any route, which is the question actually being asked.
+    echo "  WARNING: sentry-cli is not authenticated; skipping."
+    echo "  Run: sentry-cli login"
     echo "  Release $VERSION will report crashes as bare addresses until these are uploaded."
 else
     # Both slices: bundle-universal builds each arch separately before lipo, so each has
     # its own .dSYM and its own UUID. --include-sources ships the source context too,
     # which is public anyway (GPL-3.0, and the repo is public).
+    #
+    # Org and project likewise come from either the environment or ~/.sentryclirc's
+    # [defaults]; `sentry-cli login` sets neither, so this is the likeliest way a
+    # correctly-authenticated machine still fails here.
     if sentry-cli debug-files upload \
         --include-sources \
         target/aarch64-apple-darwin/release \
@@ -78,6 +88,8 @@ else
         echo "  uploaded (release conjure_align@$VERSION)"
     else
         echo "  WARNING: symbol upload failed; continuing with the release."
+        echo "  Check SENTRY_ORG / SENTRY_PROJECT, or the [defaults] in ~/.sentryclirc"
+        echo "  (\`sentry-cli info\` prints what it resolved them to)."
     fi
 fi
 
