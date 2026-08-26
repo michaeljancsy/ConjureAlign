@@ -382,6 +382,26 @@ mod imp {
         }
     }
 
+    #[cfg(test)]
+    mod dsn_tests {
+        use super::*;
+
+        /// A DSN that does not parse leaves `opts.dsn` as `None`, which makes
+        /// `sentry::init` return a *disabled* client — no error, no log, nothing
+        /// on the wire. Everything downstream still behaves as though reporting
+        /// were on, so the only symptom is silence.
+        #[test]
+        fn the_shipped_dsn_parses_and_reaches_the_options() {
+            assert!(
+                SENTRY_DSN.parse::<sentry::types::Dsn>().is_ok(),
+                "SENTRY_DSN does not parse: {SENTRY_DSN}"
+            );
+            let opts = options();
+            let dsn = opts.dsn.expect("options() produced no DSN");
+            assert_eq!(dsn.project_id().value(), "4511972827136000");
+        }
+    }
+
     /// A condition that should not happen and that we cannot see any other way.
     /// Deliberately NOT used for `RejectReason`: a rejected capture is an
     /// ordinary user outcome, already logged and already an analytics event,
