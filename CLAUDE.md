@@ -287,11 +287,25 @@ ways.** Do not simplify it back to the default transport:
   bound the worst-case unload stall to `SHUTDOWN_TIMEOUT` plus one in-flight request.
 - **`RootCerts` defaults to `WebPki`.** That makes ureq call `disable_built_in_roots(true)` and
   trust a *bundled Mozilla store* — the exact thing choosing native-tls was meant to avoid.
-  `BoundedUreq` sets `RootCerts::PlatformVerifier` so TLS rides the OS trust store. Relatedly,
-  `ureq` is a direct dependency on `native-tls-no-default` (not `native-tls`) and sentry's own
-  `native-tls` feature is OFF: sentry's feature would re-add `webpki-root-certs`, which is dead
-  weight and a CDLA-Permissive-2.0 licence in the attribution table. Selecting the provider in
-  `BoundedUreq` is what makes that possible.
+  `BoundedUreq` sets `RootCerts::PlatformVerifier` so TLS rides the OS trust store.
+
+**`ureq` must be taken on the `native-tls` feature, never `native-tls-no-default`.** The latter
+looks equivalent — it pulls the native-tls crate, and the dependency graph reads correctly — but
+ureq's `src/tls/native_tls.rs` is gated on `#[cfg(feature = "native-tls")]`, so the backend is
+simply not compiled. `TlsProvider::NativeTls` then panics on the first https request. Raised on
+sentry's transport thread, that panic becomes a **host abort**: `TransportThread::drop` joins
+with `handle.join().unwrap()`, so the `Err` from the dead worker unwraps on the host's main
+thread and unwinds out of the VST3 `extern "C"` teardown. It crashed Ableton Live on plugin
+removal. `crash::tls_backend_is_compiled_in_not_just_the_crate` guards it offline, by pointing
+the real agent at a local listener that hangs up: a compiled backend errors, a missing one
+panics. The cost is `webpki-root-certs` back in the tree — dead weight only, since
+`PlatformVerifier` means those roots are never consulted.
+
+That last mechanism generalizes: **any** panic on sentry's transport thread — TLS, envelope
+serialization, anything — becomes an abort of the host at unload, because of that unguarded
+`join().unwrap()` upstream. There is no way to catch it from our side, so the only defence is
+that the transport must not panic. Treat changes to `BoundedUreq` or the `ureq` features as
+crash-risk changes and exercise a real TLS connection, not just `cargo tree`.
 
 **Release builds symbolicate to nothing without a debug-file upload.** `[profile.release]` keeps
 `strip = "symbols"`; `debug = "limited"` + `split-debuginfo = "packed"` leave a `.dSYM`/`.pdb`
