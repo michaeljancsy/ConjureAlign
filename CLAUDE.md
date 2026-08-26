@@ -297,9 +297,30 @@ ways.** Do not simplify it back to the default transport:
 `strip = "symbols"`; `debug = "limited"` + `split-debuginfo = "packed"` leave a `.dSYM`/`.pdb`
 beside the binary that the shipped bundle does not contain, and the Mach-O UUID / PE build id is
 what matches the two up. `scripts/release.sh` and `.github/workflows/windows.yml` upload them
-via `sentry-cli` and both **skip with a warning** rather than failing when
-`SENTRY_AUTH_TOKEN`/`SENTRY_ORG`/`SENTRY_PROJECT` are absent. The Sentry `release` is
-`conjure_align@<CARGO_PKG_VERSION>` and must stay in step with what the upload tags. Adding the
+via `sentry-cli`, and both **skip with a warning** rather than failing when the credentials are
+absent — a release that ships beats a symbolicated crash report, and the upload can be repeated
+later from the same build tree.
+
+The two gate on that differently, on purpose. CI reads `secrets.SENTRY_AUTH_TOKEN` plus the
+`SENTRY_ORG`/`SENTRY_PROJECT` repository *variables* (slugs and ids are not credentials) and
+checks the env vars directly, because on a runner that is the only route they can arrive by.
+`release.sh` instead asks `sentry-cli info`, because locally the token usually comes from
+`~/.sentryclirc` — which is the only place `sentry-cli login` writes — and an env-var check
+there reports a perfectly authenticated machine as unconfigured and silently drops the symbols.
+Note that `login` sets the token but NOT the org/project defaults, so those still need to be in
+the environment or in `~/.sentryclirc`'s `[defaults]`; that is the likeliest way an
+authenticated machine still fails the upload.
+
+Both call sites name the plugin's own binary and dSYM/PDB explicitly rather than pointing at a
+release directory. That is not tidiness: `sentry-cli` searches paths recursively, so a whole
+release tree uploads every dependency's `build_script_build`, the proc-macro dylibs, the test
+binaries and `xtask` — 334 files on the run that caught this, of which 3 were ours — and
+`--include-sources` bundles their source too.
+
+The Sentry `release` is `conjure_align@<CARGO_PKG_VERSION>` and must stay in step with what the
+upload tags. **macOS has no CI**, so a macOS release only ever gets symbols if this machine is
+configured — and debug files match by build id, so a release shipped without them cannot be
+symbolicated afterwards without reproducing a byte-identical binary. Adding the
 dep cost ~1.8 MB per architecture slice (4.996 → 6.803 MB), i.e. ~10.8 MB on the macOS pkg (two
 architectures × three bundles) and ~3.6 MB on the Windows zip.
 
