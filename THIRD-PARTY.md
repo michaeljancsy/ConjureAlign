@@ -26,6 +26,7 @@ distributed.
 | [ureq](https://github.com/algesten/ureq) (`ureq`, `ureq-proto`) | MIT OR Apache-2.0 | HTTP client for the crash reporter, on the same OS TLS stack as `native-tls` above. macOS/Windows only |
 | `findshlibs`, `debugid`, `uuid`, `hostname`, `os_info`, `uname` | MIT OR Apache-2.0 (`debugid`: Apache-2.0; `hostname`, `os_info`: MIT) | Crash-report metadata (loaded images, build ids, OS name) |
 | `rand`, `rand_chacha`, `rand_core`, `ppv-lite86`, `hex`, `httpdate`, `http`, `httparse`, `base64`, `base64ct`, `der`, `pem-rfc7468`, `rustls-pki-types`, `zeroize`, `utf8-zero` | MIT OR Apache-2.0 | Transitively required by the two above |
+| [webpki-root-certs](https://github.com/rustls/webpki-roots) | CDLA-Permissive-2.0 | Pulled in unavoidably by `ureq`'s `native-tls` feature. Linked but never consulted: the agent is configured with `RootCerts::PlatformVerifier`, so TLS uses the OS trust store |
 
 Where a component is dual-licensed MIT OR Apache-2.0, it is used under the MIT license.
 The full MIT/ISC license texts require reproduction of the copyright notice, which the

@@ -136,6 +136,24 @@ mod imp {
     /// `PlatformVerifier` is set explicitly.
     struct BoundedUreq;
 
+    /// Split out from [`BoundedUreq`] so the regression test below builds the *same*
+    /// agent; a second copy of this construction would defeat the point of it.
+    fn build_agent(accept_invalid_certs: bool, proxy: Option<ureq::Proxy>) -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_global(Some(REQUEST_TIMEOUT))
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .provider(ureq::tls::TlsProvider::NativeTls)
+                    .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                    .disable_verification(accept_invalid_certs)
+                    .build(),
+            )
+            .proxy(proxy)
+            .build()
+            .new_agent()
+    }
+
     impl TransportFactory for BoundedUreq {
         fn create_transport_with_options(&self, options: TransportOptions) -> Arc<dyn Transport> {
             let proxy = match (
@@ -147,19 +165,7 @@ mod imp {
                 (_, Some(proxy), _) => ureq::Proxy::new(proxy).ok(),
                 _ => None,
             };
-            let agent = ureq::Agent::config_builder()
-                .timeout_connect(Some(CONNECT_TIMEOUT))
-                .timeout_global(Some(REQUEST_TIMEOUT))
-                .tls_config(
-                    ureq::tls::TlsConfig::builder()
-                        .provider(ureq::tls::TlsProvider::NativeTls)
-                        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                        .disable_verification(options.accept_invalid_certs)
-                        .build(),
-                )
-                .proxy(proxy)
-                .build()
-                .new_agent();
+            let agent = build_agent(options.accept_invalid_certs, proxy);
             Arc::new(
                 sentry::transports::UreqHttpTransportOptions::from(options)
                     .with_agent(agent)
@@ -391,6 +397,59 @@ mod imp {
             return;
         }
         sentry::capture_message(message, Level::Error);
+    }
+
+    #[cfg(test)]
+    mod dsn_tests {
+        use super::*;
+
+        /// ureq's native-tls backend lives behind `#[cfg(feature = "native-tls")]`.
+        /// Enabling only `native-tls-no-default` pulls in the native-tls *crate* but
+        /// not that module, so `TlsProvider::NativeTls` has no backend and ureq
+        /// panics on the first https request. Raised on sentry's transport thread,
+        /// that panic becomes a host abort, because `TransportThread::drop` joins
+        /// with `handle.join().unwrap()` — it crashed Ableton Live on plugin
+        /// removal, and the dependency graph looked correct throughout.
+        ///
+        /// Deliberately offline and deterministic: point the real agent at a local
+        /// listener that accepts and hangs up. A working backend gives a TLS error;
+        /// a missing one panics, failing this test.
+        #[test]
+        fn tls_backend_is_compiled_in_not_just_the_crate() {
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                // Accept then hang up, so the handshake fails immediately rather
+                // than waiting out REQUEST_TIMEOUT.
+                for stream in listener.incoming().take(1) {
+                    drop(stream);
+                }
+            });
+
+            let agent = build_agent(false, None);
+            let result = agent.post(&format!("https://127.0.0.1:{port}/")).send(b"");
+            assert!(
+                result.is_err(),
+                "a bare TCP listener somehow completed a TLS handshake"
+            );
+        }
+
+        /// A DSN that does not parse leaves `opts.dsn` as `None`, which makes
+        /// `sentry::init` return a *disabled* client — no error, no log, nothing
+        /// on the wire. Everything downstream still behaves as though reporting
+        /// were on, so the only symptom is silence.
+        #[test]
+        fn the_shipped_dsn_parses_and_reaches_the_options() {
+            assert!(
+                SENTRY_DSN.parse::<sentry::types::Dsn>().is_ok(),
+                "SENTRY_DSN does not parse: {SENTRY_DSN}"
+            );
+            let opts = options();
+            let dsn = opts.dsn.expect("options() produced no DSN");
+            assert_eq!(dsn.project_id().value(), "4511972827136000");
+        }
     }
 }
 

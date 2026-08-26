@@ -89,11 +89,18 @@ sentry = { version = "0.49.1", default-features = false, features = [
 # agent with the same TLS/proxy setup plus explicit timeouts, which is the only reason
 # this is a direct dependency. Version and features mirror what sentry itself asks for,
 # so the two unify onto one `ureq::Agent` type.
-# `native-tls-no-default` rather than `native-tls`: the latter also pulls
-# `webpki-root-certs`, a bundled Mozilla root store that ureq then uses INSTEAD of
-# the OS one. Selecting the TLS provider here rather than through sentry's own
-# `native-tls` feature is what keeps that out of the binary — see BoundedUreq.
-ureq = { version = "3", default-features = false, features = ["native-tls-no-default"] }
+# MUST be `native-tls`, not `native-tls-no-default`. The latter enables the
+# native-tls *crate* but NOT ureq's `src/tls/native_tls.rs`, which is gated on
+# `#[cfg(feature = "native-tls")]` — so `TlsProvider::NativeTls` then has no backend
+# and ureq panics on the first https request with "provider is NativeTls but feature
+# is not enabled". On the sentry transport thread that panic becomes a host abort,
+# because `TransportThread::drop` joins with `handle.join().unwrap()`. It crashed
+# Ableton Live on plugin removal; see the test in src/crash.rs that now guards it.
+#
+# This does drag in `webpki-root-certs` (a bundled Mozilla root store). It is dead
+# weight rather than a behaviour change: BoundedUreq sets
+# `RootCerts::PlatformVerifier`, so TLS still rides the OS trust store.
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
 
 [features]
 # Dev-only: run the plugin (and its GUI) as a standalone app, no DAW needed:
