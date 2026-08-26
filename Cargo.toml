@@ -3,7 +3,7 @@ name = "conjure_align"
 # Bumping this changes the AudioUnit version in the generated Info.plist
 # (0xMMMMmmbb), which is what makes Logic re-read a plugin's capabilities instead
 # of reusing its cached Plug-in Manager entry.
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 authors = ["Michael Jancsy <michaeljancsy@gmail.com>"]
 license = "GPL-3.0-or-later"
