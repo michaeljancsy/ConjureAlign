@@ -245,7 +245,10 @@ mod imp {
         event.server_name = None;
 
         // The random install id and nothing else — no username, no IP, no email.
-        event.user = analytics::device_id().map(|id| User {
+        // The hook-safe accessor: `scrub` runs synchronously on the panicking
+        // thread inside `capture_event`, under the same lock hazards as the
+        // hook itself.
+        event.user = analytics::device_id_in_hook().map(|id| User {
             id: Some(id),
             ..Default::default()
         });
@@ -257,7 +260,15 @@ mod imp {
         let images = &mut event.debug_meta.to_mut().images;
         images.retain(|image| image_name(image).is_some_and(is_ours));
 
-        if let Some((plugin_api, sample_rate)) = host_context().lock().unwrap().clone() {
+        // Same hazards as above: never block and never unwrap on the
+        // panicking thread. On contention the report just goes out without
+        // the host tags.
+        let host = match host_context().try_lock() {
+            Ok(guard) => guard.clone(),
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().clone(),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some((plugin_api, sample_rate)) = host {
             event.tags.insert("plugin_api".into(), plugin_api);
             event
                 .tags
@@ -301,7 +312,11 @@ mod imp {
                 // would turn our own reporting into a second panic inside the
                 // first. nih-plug's hook wraps itself for the same reason.
                 nih_plug::util::permit_alloc(|| {
-                    if in_plugin_code() && analytics::enabled() {
+                    // `enabled_in_hook`, not `enabled`: the panicking frame
+                    // may hold the config lock on this thread, and a blocking
+                    // or poisoned `lock().unwrap()` here is a deadlock or a
+                    // panic-inside-the-hook abort.
+                    if in_plugin_code() && analytics::enabled_in_hook() {
                         // Constructed, never registered: registering it would
                         // run `Integration::setup`, which installs the blanket
                         // hook this whole module exists to avoid. All we want
@@ -384,7 +399,12 @@ mod imp {
         /// new surface. Stored unconditionally — consent may arrive later, and
         /// a report raised then should still say where it came from.
         pub fn set_host_context(&self, plugin_api: &str, sample_rate: f32) {
-            *host_context().lock().unwrap() = Some((plugin_api.to_owned(), sample_rate));
+            // Poison-tolerant: the value is plain data, and one earlier
+            // panic must not disable host tagging for the process's lifetime.
+            *host_context()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((plugin_api.to_owned(), sample_rate));
         }
     }
 

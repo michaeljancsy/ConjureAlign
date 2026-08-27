@@ -244,8 +244,11 @@ session and joins Sentry's transport thread). Three things are specific to panic
    So `default_integrations` is `false`, the other four integrations are listed by hand, and
    `PanicIntegration` is only ever *constructed* (for `event_from_panic_info`), never
    registered. Our own hook reports only when `crash::in_plugin_code()` — a thread-local depth
-   counter raised by the `crash::scope()` guards in `initialize()`, `process()`, the
-   `task_executor` closure and the editor draw closure.
+   counter raised by the `crash::scope()` guards in `initialize()`, `process()`, `reset()`,
+   the `task_executor` closure and the editor's build and draw closures. Everything the hook
+   (and `crash::scrub`) touches on the panicking thread must use the `_in_hook` analytics
+   accessors / `try_lock` — the panicking frame may hold those very locks, so a blocking
+   `lock().unwrap()` there is a same-thread deadlock or a panic-inside-the-hook abort.
 2. **The hook must chain, and must be installed late.** nih-plug installs a global hook of its
    own from the CLAP `clap_entry.init` / VST3 `bundleEntry` dylib entry points (`setup_logger()`
    → `log_panics()`), long before `Plugin::default()`. Ours is installed on consent, so

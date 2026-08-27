@@ -285,7 +285,10 @@ impl Plugin for ConjureAlign {
                         outcome: report.outcome,
                     })
                 };
-                *shared.snapshot.lock().unwrap() = Some(snapshot);
+                *shared
+                    .snapshot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
                 capture.phase.store(PHASE_IDLE, Ordering::Release);
                 analytics.track(event);
             }
@@ -384,6 +387,10 @@ impl Plugin for ConjureAlign {
     }
 
     fn reset(&mut self) {
+        // Audio-thread entry point, same reasoning as `process()`: a panic
+        // here must be attributed to us, not dropped.
+        let _scope = crash::scope();
+
         self.delay.reset();
         // Abort a capture in flight and drop any queued GUI requests:
         // reset() fires when processing resumes, and a click made while the

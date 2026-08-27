@@ -167,6 +167,34 @@ pub fn enabled() -> bool {
     consent() == Some(true)
 }
 
+/// Hook-safe variant of [`enabled`], for the panic hook running on the
+/// panicking thread. `try_lock`, because the panicking frame may hold the
+/// config lock on this very thread (`set_consent` holds it across file I/O)
+/// and a blocking re-lock there is a same-thread deadlock. Poison-tolerant,
+/// because an `unwrap` here would be a panic inside the panic hook — an
+/// immediate, unlogged abort. `WouldBlock` reads as "not enabled": dropping
+/// one report beats hanging the host.
+pub fn enabled_in_hook() -> bool {
+    use std::sync::TryLockError;
+    match config().try_lock() {
+        Ok(cfg) => cfg.consent == Some(true),
+        Err(TryLockError::Poisoned(p)) => p.into_inner().consent == Some(true),
+        Err(TryLockError::WouldBlock) => false,
+    }
+}
+
+/// Hook-safe variant of [`device_id`]; same rules as [`enabled_in_hook`].
+/// `None` on contention: the report goes out unlabelled rather than not at
+/// all.
+pub fn device_id_in_hook() -> Option<String> {
+    use std::sync::TryLockError;
+    match config().try_lock() {
+        Ok(cfg) => cfg.device_id.clone(),
+        Err(TryLockError::Poisoned(p)) => p.into_inner().device_id.clone(),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
 /// False on platforms with no binary release, where consent could not be
 /// stored durably even if it were asked for.
 pub fn is_supported() -> bool {
