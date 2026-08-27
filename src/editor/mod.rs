@@ -201,6 +201,14 @@ pub fn create(
             ctx.set_style(style);
         },
         move |ctx, setter, state| {
+            // Marks this thread as ours for the duration of the frame. The hook
+            // in `crash` reports only while `in_plugin_code()`, so without this
+            // an editor panic is indistinguishable from another plugin's and is
+            // never reported — and the editor is where a panic is most likely to
+            // be user-triggered. Absolute path: `crash` is shadowed here by the
+            // `CrashHandle` parameter of the same name.
+            let _scope = crate::crash::scope();
+
             // Pick up a freshly published snapshot; invalidate the caches and
             // refit the waveform view when it changes.
             let latest = shared.snapshot.lock().unwrap().clone();
