@@ -195,23 +195,31 @@ pub fn create(
         egui_state.clone(),
         EditorState::default(),
         |ctx, _state| {
+            // Same guard as the draw closure below: first-frame/context setup
+            // is a prime spot for a panic, and it must be attributed to us.
+            let _scope = crash::scope();
             let mut style = (*ctx.style()).clone();
             style.visuals = egui::Visuals::dark();
             style.visuals.panel_fill = Color32::from_gray(18);
             ctx.set_style(style);
         },
         move |ctx, setter, state| {
-            // Marks this thread as ours for the duration of the frame. The hook
-            // in `crash` reports only while `in_plugin_code()`, so without this
-            // an editor panic is indistinguishable from another plugin's and is
-            // never reported — and the editor is where a panic is most likely to
-            // be user-triggered. Absolute path: `crash` is shadowed here by the
-            // `CrashHandle` parameter of the same name.
-            let _scope = crate::crash::scope();
+            // Marks this thread as ours for the frame, so the hook in `crash`
+            // attributes editor panics to us — the editor is where a panic is
+            // most likely to be user-triggered. (The `crash` parameter does
+            // not shadow the module here: locals live in the value namespace.)
+            let _scope = crash::scope();
 
             // Pick up a freshly published snapshot; invalidate the caches and
             // refit the waveform view when it changes.
-            let latest = shared.snapshot.lock().unwrap().clone();
+            // Poison-tolerant: a panic in the analysis task while publishing
+            // would otherwise turn every subsequent frame into a panic of its
+            // own — each one now a Sentry report plus a blocking flush.
+            let latest = shared
+                .snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             let changed = match (&state.snapshot, &latest) {
                 (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
                 (None, Some(_)) => true,
