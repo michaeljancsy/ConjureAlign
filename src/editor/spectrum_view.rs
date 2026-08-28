@@ -97,9 +97,11 @@ pub struct SpectrumArgs<'a> {
 /// fit bound (computed ONCE per snapshot — `prealign_lag` scans the whole
 /// correlation curve for a rejected-with-curve capture, far too much for a
 /// per-frame path) plus the GUI-side Welch re-estimates keyed by nfft
-/// (inner `None` = that size failed, don't retry). Self-invalidating: `snap`
-/// is the snapshot's `Arc` pointer, compared in [`show`] every frame, so
-/// there is no caller-side clearing contract to forget.
+/// (inner `None` = that size failed, don't retry). `snap` is the snapshot's
+/// raw `Arc` pointer and is only a same-snapshot check for the frames while
+/// this tab is visible — it does NOT keep the snapshot alive, so a freed
+/// address can recur on a later snapshot (ABA). The editor's snapshot-changed
+/// block therefore clears this cache like every other one.
 pub struct SpectrumReestimates {
     snap: usize,
     /// Integer pre-alignment lag, identical to what the analysis task used
@@ -265,11 +267,16 @@ pub fn show(
     // pan/zoom operates in ln-f space on the log axis so gestures feel
     // uniform across the decades.
     let (mut v_lo, mut v_hi) = match vs.view {
-        Some((lo, hi)) => {
-            let lo = lo.clamp(base_lo, base_hi);
-            (lo, hi.clamp(lo + 1e-6, base_hi))
+        // Ordered bounds only: `lo + 1e-6` exceeds `base_hi` for a stored view
+        // sitting at the top of the range (or one stored before the sample
+        // rate dropped), and `clamp` panics on `min > max`. Non-finite is
+        // dropped rather than clamped — NaN survives `clamp` and would reach
+        // the next frame's bounds.
+        Some((lo, hi)) if lo.is_finite() && hi.is_finite() => {
+            let lo = lo.clamp(base_lo, (base_hi - 1e-6).max(base_lo));
+            (lo, hi.clamp((lo + 1e-6).min(base_hi), base_hi))
         }
-        None => (base_lo, base_hi),
+        _ => (base_lo, base_hi),
     };
     if response.hovered() {
         let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));

@@ -163,7 +163,15 @@ impl AlignDelay {
                     self.active = self.fading_in.take().unwrap();
                     self.fade_pos = 0;
                     if let Some(next) = self.pending.take() {
-                        self.fading_in = Some(Tap::new(next));
+                        // Coalescing can queue the very spec that just
+                        // landed (A→B, then C then B again within one
+                        // fade). That target is already satisfied, and
+                        // "fading" a tap into itself is not a no-op: the
+                        // equal-power gains sum to √2 mid-fade, a +3 dB
+                        // bump. Start a fade only toward a different spec.
+                        if next != self.active.spec {
+                            self.fading_in = Some(Tap::new(next));
+                        }
                     }
                 }
             }
@@ -308,6 +316,74 @@ mod tests {
         // Run long enough for all queued fades to finish.
         process_all(&mut delay, &[vec![0.0; 4096]]);
         assert_eq!(delay.active.spec.delay_samples, 400.0);
+        assert!(delay.fading_in.is_none() && delay.pending.is_none());
+    }
+
+    #[test]
+    fn reland_of_identical_target_starts_no_second_fade() {
+        // A→B, then C then B again within one fade: the pending B equals the
+        // tap that lands, so no second fade may start — a B→B equal-power
+        // crossfade would bump the output by +3 dB (gains sum to √2) at
+        // mid-fade.
+        let fade = 400;
+        let b = TapSpec {
+            delay_samples: 200.0,
+            inverted: false,
+        };
+        let c = TapSpec {
+            delay_samples: 300.0,
+            inverted: false,
+        };
+        let mut delay = AlignDelay::new(1, 4096, fade);
+        // Prime the whole read region with DC so every tap reads exactly 1.0
+        // (the kernel has unity DC gain).
+        process_all(&mut delay, &[vec![1.0; 2048]]);
+        delay.retarget(b);
+        process_all(&mut delay, &[vec![1.0; 100]]); // mid-fade...
+        delay.retarget(c); // ...request C...
+        delay.retarget(b); // ...then coalesce back to B before it lands.
+        assert_eq!(delay.ultimate_target(), b);
+        // 300 samples finish the A→B fade; just past it, nothing may be
+        // fading any more.
+        process_all(&mut delay, &[vec![1.0; 310]]);
+        assert_eq!(delay.active.spec, b);
+        assert!(delay.fading_in.is_none() && delay.pending.is_none());
+        // And the output stays flat: a started B→B fade would peak at ~1.414
+        // in this window.
+        let out = process_all(&mut delay, &[vec![1.0; 700]]);
+        for i in 0..700 {
+            assert!(
+                (out[0][i] - 1.0).abs() < 1e-3,
+                "sample {i}: {} — a B→B fade ran after landing",
+                out[0][i]
+            );
+        }
+    }
+
+    #[test]
+    fn pending_target_unlike_landed_still_fades() {
+        // Control for the test above: a pending target that differs from the
+        // landing tap must still get its fade.
+        let fade = 64;
+        let b = TapSpec {
+            delay_samples: 200.0,
+            inverted: false,
+        };
+        let c = TapSpec {
+            delay_samples: 300.0,
+            inverted: false,
+        };
+        let mut delay = AlignDelay::new(1, 4096, fade);
+        delay.retarget(b);
+        process_all(&mut delay, &[vec![0.0; 16]]); // mid-fade
+        delay.retarget(c);
+        // Just past the first landing: B is active and the C fade is live.
+        process_all(&mut delay, &[vec![0.0; fade - 16 + 8]]);
+        assert_eq!(delay.active.spec, b);
+        assert_eq!(delay.fading_in.as_ref().map(|t| t.spec), Some(c));
+        // And it completes.
+        process_all(&mut delay, &[vec![0.0; 4096]]);
+        assert_eq!(delay.active.spec, c);
         assert!(delay.fading_in.is_none() && delay.pending.is_none());
     }
 }

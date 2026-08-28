@@ -14,6 +14,12 @@ use realfft::RealFftPlanner;
 
 /// Captures whose RMS falls below this (≈ −80 dBFS) are rejected outright.
 pub const SILENCE_RMS_THRESHOLD: f64 = 1e-4;
+/// Captures shorter than this are rejected as [`RejectReason::TooShort`]: a
+/// normalized correlation over a handful of samples is statistically
+/// meaningless (two *unrelated* loud samples score confidence ≈ 1). ~43 ms at
+/// 48 kHz — far below anything the gated capture path produces (the gate's
+/// hold alone is 250 ms); only a near-instant manual Stop ever gets here.
+pub const MIN_ANALYSIS_SAMPLES: usize = 2048;
 /// Normalized correlation below this means the signals are effectively
 /// unrelated (two independent noise sources correlate near 0; two mics on one
 /// source at 0 dB SNR still reach ≈ 0.5). Reject and keep the previous offset.
@@ -32,11 +38,16 @@ pub struct AnalysisResult {
 /// Why an analysis produced no usable offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
-    /// Fewer than two samples or an empty search window.
+    /// Shorter than [`MIN_ANALYSIS_SAMPLES`] or an empty search window.
     TooShort,
     /// Either signal below `SILENCE_RMS_THRESHOLD` (e.g. no sidechain
     /// connected).
     Silence,
+    /// A non-finite sample (NaN/±Inf from a misbehaving upstream plugin)
+    /// reached the capture; the correlation math cannot run on it. Without
+    /// this check the FFT's own input validation rejects the capture with a
+    /// misleading `TooShort`.
+    NonFinite,
     /// Peak normalized correlation below `CONFIDENCE_THRESHOLD`.
     LowConfidence,
 }
@@ -135,12 +146,16 @@ pub fn analyze_detailed(
     };
 
     let n = main.len().min(reference.len());
-    if n < 2 || max_shift_samples == 0 {
+    if n < MIN_ANALYSIS_SAMPLES || max_shift_samples == 0 {
         return reject(RejectReason::TooShort, max_shift_samples);
     }
 
     let e_main: f64 = main[..n].iter().map(|&x| x as f64 * x as f64).sum();
     let e_ref: f64 = reference[..n].iter().map(|&x| x as f64 * x as f64).sum();
+    // Before the silence check: NaN energies fail `<` and would sail past it.
+    if !e_main.is_finite() || !e_ref.is_finite() {
+        return reject(RejectReason::NonFinite, max_shift_samples);
+    }
     let silence_energy = SILENCE_RMS_THRESHOLD * SILENCE_RMS_THRESHOLD * n as f64;
     if e_main < silence_energy || e_ref < silence_energy {
         return reject(RejectReason::Silence, max_shift_samples);
@@ -246,11 +261,30 @@ fn continuous_corr(cross: &[realfft::num_complex::Complex<f64>], nfft: usize, ta
     let w = 2.0 * std::f64::consts::PI * tau / nfft as f64;
     let nyquist = nfft / 2;
     let mut acc = cross[0].re;
+    // The phasor e^{iwk} advances by one complex multiply per bin instead of
+    // a sin/cos pair. This loop runs ~32 times per refinement over up to
+    // nfft/2 bins, and the transcendental version dominated the whole
+    // analysis at high sample rates — eroding the bounded wait budget in
+    // `initialize()`. Reseeded from sin_cos periodically so rounding drift
+    // stays ~1e-12, far below the estimate's noise floor.
+    let (sin_w, cos_w) = w.sin_cos();
+    let (mut ph_re, mut ph_im) = (1.0f64, 0.0f64); // e^{iw·0}
+    const RESEED_EVERY: usize = 4096;
     for (k, c) in cross.iter().enumerate().skip(1) {
-        let phase = w * k as f64;
-        let re = c.re * phase.cos() - c.im * phase.sin();
-        // Real-input FFT stores only positive frequencies; interior bins
-        // represent themselves plus their conjugate mirror.
+        if k % RESEED_EVERY == 0 {
+            let (s, cs) = (w * k as f64).sin_cos();
+            ph_re = cs;
+            ph_im = s;
+        } else {
+            let re = ph_re * cos_w - ph_im * sin_w;
+            let im = ph_re * sin_w + ph_im * cos_w;
+            ph_re = re;
+            ph_im = im;
+        }
+        // Re(c · e^{iwk}) — identical to the direct cos/sin form. Real-input
+        // FFT stores only positive frequencies; interior bins represent
+        // themselves plus their conjugate mirror.
+        let re = c.re * ph_re - c.im * ph_im;
         acc += if k == nyquist { re } else { 2.0 * re };
     }
     acc
@@ -263,9 +297,11 @@ fn golden_section_max(f: impl Fn(f64) -> f64, mut lo: f64, mut hi: f64) -> f64 {
     let mut x2 = lo + INV_PHI * (hi - lo);
     let mut f1 = f(x1);
     let mut f2 = f(x2);
-    // ~50 iterations shrink the bracket by phi^50 ≈ 3e-11 — far below any
-    // meaningful precision; each evaluation is O(nfft) on a background thread.
-    for _ in 0..50 {
+    // 30 iterations shrink the 1.2-sample bracket by phi^30 to ≈ 4e-7
+    // samples — orders of magnitude below the noise floor of the estimate;
+    // each evaluation is O(nfft) on a background thread, so iterations are
+    // the analysis's dominant cost at high sample rates.
+    for _ in 0..30 {
         if f1 > f2 {
             hi = x2;
             x2 = x1;

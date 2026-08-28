@@ -16,6 +16,7 @@ pub mod spectrum_view;
 pub mod view_math;
 pub mod waveform_view;
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -138,9 +139,11 @@ pub struct EditorState {
     spectrum_log: bool,
     spectrum_cache: Option<SpectrumCache>,
     /// Per-snapshot FFT-selector state (fit bound + GUI-side Welch
-    /// re-estimates). Self-invalidating on the snapshot pointer inside
-    /// `spectrum_view::show`, so it needs no entry in the snapshot-changed
-    /// block below.
+    /// re-estimates). Cleared in the snapshot-changed block like every other
+    /// cache: its own pointer check runs only while the Spectrum tab is
+    /// drawn, so it cannot be trusted to self-invalidate — a freed
+    /// snapshot's address can be reused by a later one (ABA) and would serve
+    /// stale spectra.
     spectrum_reestimates: Option<spectrum_view::SpectrumReestimates>,
     /// Last trim value this editor sent. `set_parameter` only queues the
     /// change until the audio thread drains the event queue, so the nudge
@@ -149,6 +152,11 @@ pub struct EditorState {
     pending_trim: Option<f32>,
     /// Measured width of the Capture/Align/Polarity row, for centering it.
     capture_row_w: f32,
+    /// Latched by [`guarded_frame`] once a frame has panicked: from then on
+    /// the editor draws [`panic_screen`] instead of re-entering the drawing
+    /// code, which at 60 Hz would mean a Sentry report and a blocking flush
+    /// per frame.
+    panicked: bool,
 }
 
 // Manual because `spectrum_log` defaults to true; everything else matches
@@ -169,6 +177,7 @@ impl Default for EditorState {
             pending_trim: None,
             // Estimate for the first frame only; measured thereafter.
             capture_row_w: 300.0,
+            panicked: false,
         }
     }
 }
@@ -182,6 +191,25 @@ impl EditorState {
             ..Self::default()
         }
     }
+
+    /// What a panicked frame leaves behind. Everything the failed frame held
+    /// is dropped rather than carried forward: it may be half-updated (a
+    /// freshly published snapshot swapped in with its caches not yet
+    /// cleared, say), and the snapshot is the likeliest *input* to whatever
+    /// panicked — the Ableton crash this containment exists for was
+    /// arithmetic on capture data.
+    pub fn after_panic() -> Self {
+        Self {
+            panicked: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether a frame has panicked and the editor is showing its error
+    /// message. Public for `tests/editor_panic.rs`.
+    pub fn has_panicked(&self) -> bool {
+        self.panicked
+    }
 }
 
 pub fn create(
@@ -194,80 +222,183 @@ pub fn create(
     create_egui_editor(
         egui_state.clone(),
         EditorState::default(),
-        |ctx, _state| {
+        |ctx, state| {
             // Same guard as the draw closure below: first-frame/context setup
             // is a prime spot for a panic, and it must be attributed to us.
             let _scope = crash::scope();
-            let mut style = (*ctx.style()).clone();
-            style.visuals = egui::Visuals::dark();
-            style.visuals.panel_fill = Color32::from_gray(18);
-            ctx.set_style(style);
+            // ...and the same containment, for the same reason: this closure
+            // is called from the window's own callback, so an escaping panic
+            // unwinds through an `extern "C"` frame and aborts the host.
+            guarded_frame(state, |_state| {
+                let mut style = (*ctx.style()).clone();
+                style.visuals = egui::Visuals::dark();
+                style.visuals.panel_fill = Color32::from_gray(18);
+                ctx.set_style(style);
+            });
         },
         move |ctx, setter, state| {
             // Marks this thread as ours for the frame, so the hook in `crash`
             // attributes editor panics to us — the editor is where a panic is
             // most likely to be user-triggered. (The `crash` parameter does
             // not shadow the module here: locals live in the value namespace.)
+            //
+            // Taken OUTSIDE the containment below, which is what keeps that
+            // attribution intact: the panic hook runs at the panic site,
+            // before the unwind `guarded_frame` catches even starts, so it
+            // still sees this guard on the stack.
             let _scope = crash::scope();
 
-            // Pick up a freshly published snapshot; invalidate the caches and
-            // refit the waveform view when it changes.
-            // Poison-tolerant: a panic in the analysis task while publishing
-            // would otherwise turn every subsequent frame into a panic of its
-            // own — each one now a Sentry report plus a blocking flush.
-            let latest = shared
-                .snapshot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            let changed = match (&state.snapshot, &latest) {
-                (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
-                (None, Some(_)) => true,
-                _ => false,
-            };
-            if changed {
-                state.snapshot = latest;
-                state.wave = WaveViewState::default();
-                state.corr_view = CorrViewState::default();
-                state.corr_cache = None;
-                state.spec_view = SpecViewState::default();
-                state.spectrum_cache = None;
-                // (spectrum_reestimates self-invalidates on the snapshot
-                // pointer inside spectrum_view::show.)
-            }
+            let completed = guarded_frame(state, |state| {
+                // An earlier frame panicked. Say so, and do not re-enter the
+                // drawing code until the user asks for it: the input that
+                // panicked (a snapshot, a zoom range) usually still would.
+                if state.panicked {
+                    panic_screen(ctx, state);
+                    return;
+                }
 
-            ResizableWindow::new("conjure-align-resize")
-                .min_size(egui::Vec2::new(600.0, 460.0))
-                .show(ctx, egui_state.as_ref(), |ui| {
-                    // Breathing room against the window border.
-                    egui::Frame::new()
-                        .inner_margin(egui::Margin::symmetric(10, 8))
-                        .show(ui, |ui| {
-                            draw_ui(ui, setter, state, &params, &shared, &capture);
-                        });
-                });
+                // Pick up a freshly published snapshot; invalidate the caches and
+                // refit the waveform view when it changes.
+                // Poison-tolerant: a panic in the analysis task while publishing
+                // would otherwise turn every subsequent frame into a panic of its
+                // own — each one now a Sentry report plus a blocking flush.
+                let latest = shared
+                    .snapshot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let changed = match (&state.snapshot, &latest) {
+                    (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if changed {
+                    state.snapshot = latest;
+                    state.wave = WaveViewState::default();
+                    state.corr_view = CorrViewState::default();
+                    state.corr_cache = None;
+                    state.spec_view = SpecViewState::default();
+                    state.spectrum_cache = None;
+                    // Explicitly, NOT left to spectrum_view's own pointer check:
+                    // that check runs only while the Spectrum tab is drawn, and a
+                    // freed snapshot's address can be reused by a later one (ABA)
+                    // — which rendered an old capture's spectra as the new one's.
+                    state.spectrum_reestimates = None;
+                }
 
-            // Asked once per install, the first time anyone opens the editor.
-            // Deliberately outside `draw_ui`: the gui-preview example renders
-            // that directly, and a consent dialog has no business in a
-            // screenshot of the panels.
-            if analytics::consent().is_none() {
-                consent_modal(ctx);
-            }
+                ResizableWindow::new("conjure-align-resize")
+                    .min_size(egui::Vec2::new(600.0, 460.0))
+                    .show(ctx, egui_state.as_ref(), |ui| {
+                        // Breathing room against the window border.
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                draw_ui(ui, setter, state, &params, &shared, &capture);
+                            });
+                    });
 
-            // After both surfaces that can change the answer — the modal above
-            // and the settings popover inside `draw_ui` — so a click takes
-            // effect on this frame rather than at the next activation. Costs an
-            // atomic load and an uncontended lock when nothing has changed.
-            crash.sync_consent();
+                // Asked once per install, the first time anyone opens the editor.
+                // Deliberately outside `draw_ui`: the gui-preview example renders
+                // that directly, and a consent dialog has no business in a
+                // screenshot of the panels.
+                if analytics::consent().is_none() {
+                    consent_modal(ctx);
+                }
 
-            // Keep animating through captures/analysis and drags even if the
-            // host stops delivering input events.
-            if capture.phase() != PHASE_IDLE {
+                // After both surfaces that can change the answer — the modal above
+                // and the settings popover inside `draw_ui` — so a click takes
+                // effect on this frame rather than at the next activation. Costs an
+                // atomic load and an uncontended lock when nothing has changed.
+                crash.sync_consent();
+
+                // Keep animating through captures/analysis and drags even if the
+                // host stops delivering input events.
+                if capture.phase() != PHASE_IDLE {
+                    ctx.request_repaint();
+                }
+            });
+
+            if !completed {
+                // The frame died half-drawn, so what is on screen is a
+                // fragment of it. Repaint now rather than waiting for the
+                // host's next input event to show the message.
                 ctx.request_repaint();
             }
         },
     )
+}
+
+/// Runs one editor frame with an unwind boundary around it, so that a panic
+/// in the drawing code cannot reach the host.
+///
+/// This is not belt-and-braces. Both editor closures are called from an
+/// `extern "C"` frame — a CFRunLoop timer callback on macOS, a window
+/// procedure on Windows — and a panic unwinding out of one aborts the whole
+/// process: an arithmetic bug in `view_math` (Sentry CONJUREALIGN-3) took
+/// Ableton Live down instantly, with no chance to save. Contained here, the
+/// same bug costs the editor's contents and nothing else — the audio thread
+/// never runs this code, so the alignment already applied keeps running and
+/// every parameter stays reachable from the host's generic controls.
+///
+/// Catching does not weaken the panic hook's attribution: the hook runs at the
+/// panic site, before the unwind begins, so the caller's `crash::scope` guard
+/// (taken outside this call, deliberately) is still on the stack and the
+/// report is still filed as ours. It does bound the *cost* of reporting, via
+/// the latch in [`EditorState::after_panic`]: a panic that recurs every frame
+/// would otherwise mean a Sentry report plus a blocking 2 s flush at 60 Hz.
+///
+/// `AssertUnwindSafe` is load-bearing, and sound for the reason the assertion
+/// demands: `state` may well be half-updated when the unwind arrives, so it is
+/// not carried forward — the whole `EditorState` is replaced.
+///
+/// Returns whether `body` ran to completion.
+pub fn guarded_frame(state: &mut EditorState, body: impl FnOnce(&mut EditorState)) -> bool {
+    if catch_unwind(AssertUnwindSafe(|| body(&mut *state))).is_ok() {
+        return true;
+    }
+    *state = EditorState::after_panic();
+    false
+}
+
+/// What the editor shows once a frame has panicked. Deliberately plain: it is
+/// drawn through [`guarded_frame`] like everything else, so a panic here would
+/// merely re-latch, but there is nothing to gain from risking it.
+///
+/// Public for the same reason as [`consent_modal`]: it takes a crash to reach
+/// it in a DAW, so `examples/gui_preview.rs` is the only way to review its
+/// copy and its fit at the minimum window size (`gui_preview_panic.png`).
+pub fn panic_screen(ctx: &egui::Context, state: &mut EditorState) {
+    // The default central-panel frame plus generous side margins: the second
+    // line is a full sentence, and at the 600 px minimum window it would
+    // otherwise wrap against both window edges.
+    let frame =
+        egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(48, 8));
+    egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(60.0);
+            ui.label(
+                egui::RichText::new("The editor hit an internal error.")
+                    .color(ACCENT_WARN)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            // The reassurance is the point: what the user can see is broken,
+            // and what they cannot see is not.
+            ui.label(
+                egui::RichText::new(
+                    "Audio is unaffected — the alignment already applied keeps \
+                     running, and every control is still available from the \
+                     host's own plugin parameters.",
+                )
+                .small()
+                .color(TEXT_DIM),
+            );
+            ui.add_space(14.0);
+            if ui.button("Reload the editor").clicked() {
+                *state = EditorState::default();
+            }
+        });
+    });
 }
 
 /// The whole editor body, one window margin in. Public so the `gui-preview`
@@ -446,6 +577,9 @@ fn net_shift(params: &ConjureAlignParams, shared: &GuiShared) -> (f32, bool) {
         return (0.0, false);
     }
     let raw = params.detected_offset_ms.load(Ordering::Relaxed) + params.trim.value();
+    // Mirrors the non-finite guard in `current_target()` (a generic-UI text
+    // entry can make `trim` NaN); the two must stay in sync.
+    let raw = if raw.is_finite() { raw } else { 0.0 };
     match active_window_ms(shared) {
         Some(w_ms) => {
             let clamped = raw.clamp(-w_ms, w_ms);
@@ -543,10 +677,10 @@ pub fn consent_modal(ctx: &egui::Context) {
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new(
-                "Sent: plugin version, operating system, sample rate, whether a capture \
-                 succeeded or why it was rejected, and whether a run ended in a crash. \
-                 A crash also sends the error and the ConjureAlign code that led to it \
-                 — labelled with a random ID.",
+                "Sent: plugin version and format (VST3/CLAP), operating system, sample \
+                 rate, whether a capture succeeded or why it was rejected, and whether \
+                 a run ended in a crash. A crash also sends the error and the \
+                 ConjureAlign code that led to it — labelled with a random ID.",
             )
             .small()
             .color(TEXT_DIM),
@@ -627,8 +761,9 @@ fn settings_menu(ui: &mut egui::Ui) {
                 }
                 ui.label(
                     egui::RichText::new(
-                        "Plugin version, OS, sample rate, capture outcomes and crash \
-                         reports, labelled with a random ID. Never your audio.",
+                        "Plugin version and format (VST3/CLAP), OS, sample rate, capture \
+                         outcomes and crash reports, labelled with a random ID. Never \
+                         your audio.",
                     )
                     .small()
                     .color(TEXT_DIM),
@@ -739,6 +874,11 @@ fn status_strip(
             }
             RejectReason::Silence => {
                 "Last capture rejected: input silent — is the sidechain connected and playing?"
+                    .to_string()
+            }
+            RejectReason::NonFinite => {
+                "Last capture rejected: the input contained non-finite samples (NaN/Inf) \
+                 — an upstream plugin may be misbehaving."
                     .to_string()
             }
             RejectReason::LowConfidence => {

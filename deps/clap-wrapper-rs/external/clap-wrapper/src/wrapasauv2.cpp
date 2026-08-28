@@ -3,6 +3,7 @@
 #include <set>
 #include <limits>
 #include <cassert>
+#include <vector>
 
 extern bool fillAudioUnitCocoaView(AudioUnitCocoaViewInfo *viewInfo, std::shared_ptr<Clap::Plugin>);
 
@@ -1377,6 +1378,41 @@ int mainChannelsFor(const clap_audio_ports_config_t &cfg, AudioUnitScope inScope
     return cfg.has_main_output ? (int)cfg.main_output_channel_count : -1;
   return -1;
 }
+
+// The channel count every element of an AU scope currently presents, indexed by element.
+// Taken before and after setupAudioBusses() to detect which formats it rewrote.
+std::vector<UInt32> elementChannelCounts(const ausdk::AUScope &scope)
+{
+  std::vector<UInt32> counts;
+  const auto n = scope.GetNumberOfElements();
+  counts.reserve(n);
+  for (UInt32 i = 0; i < n; ++i)
+  {
+    auto *element = scope.GetElement(i);
+    auto *io = element ? element->AsIOElement() : nullptr;
+    counts.push_back(io ? io->GetStreamFormat().mChannelsPerFrame : 0);
+  }
+  return counts;
+}
+
+// Fires kAudioUnitProperty_StreamFormat for every element whose channel count differs
+// between the two snapshots. setupAudioBusses() writes formats through raw
+// AUIOElement::SetStreamFormat; AUBase's own ChangeStreamFormat dispatch is SetStreamFormat
+// *plus* this PropertyChanged, so this supplies the half the re-setup path skips — without
+// it a host is never told the AU rewrote a format it had negotiated and been told noErr
+// for. Indices covered by only one snapshot notify too: a config switch can change the
+// element count, and for an index that vanished, the old index is the only address the
+// host knows the element by.
+void notifyChangedElementFormats(ausdk::AUBase &au, AudioUnitScope scope,
+                                 const std::vector<UInt32> &before, const std::vector<UInt32> &after)
+{
+  const size_t n = before.size() > after.size() ? before.size() : after.size();
+  for (size_t i = 0; i < n; ++i)
+  {
+    if (i < before.size() && i < after.size() && before[i] == after[i]) continue;
+    au.PropertyChanged(kAudioUnitProperty_StreamFormat, scope, static_cast<AudioUnitElement>(i));
+  }
+}
 }  // namespace
 
 // Switches the CLAP plugin to the audio-ports-config whose main bus on `inScope` has
@@ -1394,11 +1430,11 @@ bool WrapAsAUV2::selectAudioPortsConfigForMain(AudioUnitScope inScope, uint32_t 
   auto guarantee_mainthread = _plugin->AlwaysMainThread();
 
   // Nothing to do when the plugin already presents this width. Re-selecting is NOT a no-op:
-  // it re-runs setupAudioBusses(), which rewrites every AU element's stream format straight
-  // through SetStreamFormat with no PropertyChanged — silently reverting widths the host
-  // negotiated, including a sidechain bus ValidFormat() deliberately accepted at a width the
-  // config does not carry. Initialize() and sample-rate-only sets both land here with the
-  // config already correct.
+  // it re-runs setupAudioBusses(), which would revert widths the host negotiated — including
+  // a sidechain bus ValidFormat() deliberately accepted at a width the config does not
+  // carry. (The snapshot around setupAudioBusses() below would at least announce that
+  // revert now, but not reverting at all is strictly better.) Initialize() and
+  // sample-rate-only sets both land here with the config already correct.
   if (auto ap = _plugin->_ext._audioports)
   {
     const bool isInput = (inScope == kAudioUnitScope_Input);
@@ -1425,8 +1461,26 @@ bool WrapAsAUV2::selectAudioPortsConfigForMain(AudioUnitScope inScope, uint32_t 
   if (!apc->select(_plugin->_plugin, target)) return false;
 
   // The port layout may now differ (channel counts, and for us the sidechain's width), so
-  // re-apply it to the AU elements to keep the two sides consistent.
-  if (_plugin->_ext._audioports) setupAudioBusses(_plugin->_plugin, _plugin->_ext._audioports);
+  // re-apply it to the AU elements to keep the two sides consistent. That re-apply can
+  // rewrite formats the host negotiated and was told noErr for — a genuine mono<->stereo
+  // main switch snaps the sidechain back to the new config's width — so snapshot every
+  // element's width around it and announce each one that changed. A host that never learns
+  // keeps rendering with the stale format, its PullInput fails against the element, and the
+  // wrapper substitutes silence on that bus with nothing anywhere saying why. An element
+  // whose width is unchanged announces nothing, so a re-setup that moves nothing (e.g. a
+  // select reached from Initialize()) stays quiet.
+  if (_plugin->_ext._audioports)
+  {
+    auto inWidths = elementChannelCounts(Inputs());
+    auto outWidths = elementChannelCounts(Outputs());
+
+    setupAudioBusses(_plugin->_plugin, _plugin->_ext._audioports);
+
+    notifyChangedElementFormats(*this, kAudioUnitScope_Input, inWidths,
+                                elementChannelCounts(Inputs()));
+    notifyChangedElementFormats(*this, kAudioUnitScope_Output, outWidths,
+                                elementChannelCounts(Outputs()));
+  }
   return true;
 }
 

@@ -121,8 +121,25 @@ a no-op). Phase machine: Idle → Armed → Capturing → Analyzing → Idle, an
 means nothing recorded yet, and every transition out of Armed/Capturing is a CAS so a GUI
 cancel always wins (`cancel_capture` tries ARMED→IDLE first — the phase only moves forward,
 so that order can't drop a cancel). The buffers live in an `AtomicRefCell`; the audio thread
-borrows in Idle/Armed/Capturing, the background task in Analyzing, never overlapping. On stop
-with data, `context.execute_background(Task::Analyze)` → the `task_executor()` closure (owns
+borrows in Idle/Armed/Capturing, the background task in Analyzing, never overlapping. Two
+hardenings guard that discipline where hosts stress it: `Task::Analyze` carries a capture
+*generation* and runs its whole body under `catch_unwind` (an escaped panic would kill
+nih-plug's process-shared worker — no analysis for ANY instance until the DAW restarts, plus a
+host abort at the next teardown unless the vendored patch is in place — see Known upstream
+issues),
+taking its borrow with `try_borrow` and re-checking the generation inside it; and
+`initialize()` — which hosts re-run on every state load while holding the same lock
+`process()` takes — takes a fast path when (rate, channels) are unchanged (no delay-line
+rebuild, no ~12 MB reallocation, no wait; latency is deliberately not in the key and is
+re-reported either way), and otherwise waits up to 500 ms for an in-flight analysis, then
+either reclaims a queued/lost task (generation bump + `try_borrow_mut` probe, reallocating
+THROUGH the held guard → phase back to Idle; a stale task exits on its pre-borrow and
+in-borrow generation checks) or, if the task actively holds the borrow, keeps the existing
+buffers — clearing the fast-path key so the deferred reallocation really happens next time —
+and the task finishes with valid results. No interleaving reaches the `AtomicRefCell` panic,
+and every phase release on the task side is either value-checked (CAS from Analyzing only)
+or generation-guarded, so a stale task can never demote a successor capture's phase. On stop
+with data, `context.execute_background(Task::Analyze { generation })` → the `task_executor()` closure (owns
 Arc clones) runs `analyze_spliced` (zeroes ±max_shift guard regions around each seam in both
 working copies — exactly the cross-seam products — before the FFT cross-correlation), refines
 the peak to sub-sample precision by maximizing the continuous cross-correlation (DTFT of the
@@ -196,6 +213,13 @@ Anonymous Mixpanel events, OFF until the user consents. Three invariants, all lo
    sets a shutdown flag, drops the sender (which is what wakes a worker parked in `recv()` —
    joining before disconnecting would deadlock), then joins. Sends are `try_send` on a 32-slot
    bounded channel: a wedged network drops events, never blocks a caller or grows a backlog.
+   The drop-side join is bounded because every stage of `post()` is: DNS runs on a throwaway
+   helper thread awaited with a timeout (`resolve_bounded` — the ONE deliberate exception to
+   this rule, mirroring ureq's resolver: on timeout that thread is abandoned inside
+   `getaddrinfo`, accepted because the alternative was a certain DAW-unload hang, and the
+   image outlives it in practice — macOS pins ObjC-bearing images), every resolved address is
+   tried, connect/read/write carry per-op timeouts, and the response read has a wall-clock
+   deadline plus a size cap.
 
 Transport is a hand-written HTTP/1.1 POST over `native-tls` rather than an HTTP client crate:
 the request is one fire-and-forget JSON body to a fixed host, and native-tls binds the OS stack
@@ -264,6 +288,18 @@ session and joins Sentry's transport thread). Three things are specific to panic
    `assert_process_allocs` would otherwise turn the report into a second panic inside the first.
    nih-plug's own hook does the same. The `scope()` guard itself is just a thread-local
    increment, so `process()` still allocates nothing.
+4. **An editor panic is reported AND swallowed.** Both editor closures run their body inside
+   `editor::guarded_frame` (`catch_unwind` + `AssertUnwindSafe`), because they are called from
+   an `extern "C"` frame — a CFRunLoop timer on macOS, a window proc on Windows — and unwinding
+   out of one aborts the host: an arithmetic bug in `view_math` killed Ableton Live instantly
+   (CONJUREALIGN-3). The `crash::scope()` guard stays OUTSIDE the catch, which is what preserves
+   attribution: the hook runs at the panic site, before the unwind. On a catch the whole
+   `EditorState` is replaced by `EditorState::after_panic()` — it may be half-updated, and its
+   snapshot is the likeliest input to the panic — which latches `panic_screen` (a message plus a
+   "Reload the editor" button, previewed as `gui_preview_panic.png`) in place of the panels.
+   The latch is not cosmetic: without it a panic that recurs every frame costs a Sentry report
+   and a blocking 2 s flush at 60 Hz. Nothing here touches the audio thread, so a dead editor
+   still leaves the correction running and every parameter reachable from the host's generic UI.
 
 `before_send` (`crash::scrub`) is the last gate before anything leaves, and each line in it
 backs a promise in the README/consent copy: `server_name` is nulled (`sentry-contexts` fills it
@@ -313,6 +349,15 @@ serialization, anything — becomes an abort of the host at unload, because of t
 `join().unwrap()` upstream. There is no way to catch it from our side, so the only defence is
 that the transport must not panic. Treat changes to `BoundedUreq` or the `ureq` features as
 crash-risk changes and exercise a real TLS connection, not just `cargo tree`.
+
+Nor is the transport thread the only upstream landmine at that seam: sentry-core's session
+flusher spawns its thread with `.unwrap()` (a panic on the consenting editor frame under
+thread exhaustion) and its Drop unwraps its own mutexes after swallowing a worker panic — so
+`sentry::init` is wrapped in `catch_unwind` inside `reporter()` (a failed init degrades to
+no-reporting and retries later), `sync_consent` decides under the per-instance mutex but runs
+init/teardown OUTSIDE it (a decline's client drain would otherwise freeze the editor frame
+while `initialize()` convoys on the lock), and BOTH sentry threads are treated as
+must-not-panic.
 
 **Release builds symbolicate to nothing without a debug-file upload.** `[profile.release]` keeps
 `strip = "symbols"`; `debug = "limited"` + `split-debuginfo = "packed"` leave a `.dSYM`/`.pdb`
@@ -411,24 +456,31 @@ against ANY nih-plug plugin (verified against the wrapper source, commit f36931f
   bytes SIGABRT (state-invalid-random).
 All other validator tests pass; re-run after bumping the nih_plug rev to see if these are fixed.
 
-nih-plug's process-shared background worker (`src/event_loop/background_thread.rs`, the thread
-that runs our per-capture `Task::Analyze`) has two teardown bugs at the pinned rev f36931f —
-PATCHED LOCALLY, so they cannot bite this build, but they come back if a rev bump drops the
-patch: (1) destroying the last instance while its task is executing makes the last
-`Arc<Wrapper>` die on the worker thread (the worker holds the upgraded `Arc` for the duration
-of a task), whose `Drop` then joins its own thread — pthread_join EDEADLK panic on
-macOS/Linux, permanent `WaitForSingleObject(INFINITE)` hang on Windows; (2) a queued task
-whose instance was already destroyed made the worker `return`, killing the thread every OTHER
-instance shares — later schedules fail silently in release, and the last instance's teardown
-panics (`.expect` on the disconnected channel) inside the host's `destroy`, i.e. a host abort
-at project close. The fix lives in the vendored `deps/nih-plug` (wired by the
+nih-plug's process-shared background worker (`event_loop/background_thread.rs`, same rev) has
+two teardown flaws, both triggered by destroying an instance around an in-flight
+`Task::Analyze`: (a) destroying it while the task RUNS can drop the last `Arc<Wrapper>` on
+the worker thread itself (the worker holds the upgraded `Arc` for the task's duration), whose
+`WorkerThread::drop` then joins its own thread — EDEADLK panic-in-Drop on macOS/Linux
+(contained, leaks), permanent `WaitForSingleObject(INFINITE)` hang on Windows; (b) destroying
+it while the task is still QUEUED makes the worker's `executor.upgrade()` fail and the whole
+shared thread exit — later tasks from every instance are silently dropped in release, and the
+last instance's teardown panics in Drop (`send(Shutdown).expect` on the disconnected channel)
+inside the host's `destroy` → host abort at project close.
+
+Two independent mitigations, both needed. The local containment (the `catch_unwind` +
+generation reclaim in the threading section) removes OUR panic route into the worker and
+un-wedges stuck instances. The destroy races themselves are upstream's, and are PATCHED
+LOCALLY in the vendored `deps/nih-plug` (wired by the
 `[patch."https://github.com/robbert-vdh/nih-plug.git"]` in Cargo.toml; hunks marked
-`LOCAL PATCH`), with regression tests:
+`LOCAL PATCH`) — so they cannot bite this build, but they come back if a rev bump drops the
+patch. Regression tests:
 `cargo test --manifest-path deps/nih-plug/Cargo.toml -p nih_plug --lib background_thread` —
-both abort/deadlock against unpatched upstream. deps/PATCHES.md has the invariants and the
-re-vendor procedure; docs/upstream/nih-plug-worker-teardown.md is the issue draft to file
-upstream by hand (not filed as of 2026-08-28). nih-plug itself is in maintenance mode; the
-active community successor, nice-plug (codeberg.org/RustAudio/nice-plug), fixed the
+both abort/deadlock against unpatched upstream. The patch also makes teardown tolerate a
+worker that died for any other reason, which is what keeps a panic that escapes the
+`catch_unwind` from becoming a host abort at the next destroy. deps/PATCHES.md has the
+invariants and the re-vendor procedure; docs/upstream/nih-plug-worker-teardown.md is the issue
+draft to file upstream by hand (not filed as of 2026-08-28). nih-plug itself is in maintenance
+mode; the active community successor, nice-plug (codeberg.org/RustAudio/nice-plug), fixed the
 reference-cycle leak of nih-plug#222 but still carries both of these — so the draft's header
 directs the report there first. Note #222 does NOT shield us: that cycle only closes for
 plugins that retain the `AsyncExecutor` from `Plugin::editor()`, and ours ignores it

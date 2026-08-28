@@ -251,6 +251,23 @@ fn nothing_is_reported_until_consent_is_granted() {
         "a panic raised outside ConjureAlign code was reported as ours"
     );
 
+    // ---- withdrawn: the client is torn down, and reports stop ----
+    analytics::set_consent(false);
+    handle.sync_consent();
+    crash::report_issue("must not be sent after withdrawing");
+    assert!(
+        collect_events(&rx, Duration::from_millis(500)).is_empty(),
+        "a withdrawn plugin sent something"
+    );
+
+    // ---- re-granted: the registry's Weak is dead by now, so this exercises
+    // ---- the bring-it-back-up path, not just the first init ----
+    analytics::set_consent(true);
+    handle.sync_consent();
+    crash::report_issue("conjure-align-regrant-marker");
+    wait_for_event(&rx, "conjure-align-regrant-marker", Duration::from_secs(10))
+        .expect("re-granting consent did not bring reporting back");
+
     // The consent actually landed on disk, at the real config path.
     let stored = analytics::config_path().expect("a config path under the temp HOME");
     assert!(stored.starts_with(&home), "wrote outside the temp HOME");
