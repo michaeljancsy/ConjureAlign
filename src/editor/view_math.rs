@@ -20,12 +20,31 @@ pub fn zoom_about(
     full_hi: f64,
 ) -> (f64, f64) {
     let full = full_hi - full_lo;
-    if !factor.is_finite() || factor <= 0.0 || !span.is_finite() || span <= 0.0 || full <= 0.0 {
+    // Every value reaching a `clamp` below is screened for finiteness first:
+    // `f64::clamp` panics unless `min <= max`, and a NaN bound satisfies no
+    // ordering at all. The `is_finite` checks are what reject NaN here — the
+    // `<= 0.0` tests alone would let it through.
+    if !factor.is_finite()
+        || factor <= 0.0
+        || !span.is_finite()
+        || span <= 0.0
+        || !start.is_finite()
+        || !anchor_frac.is_finite()
+        || !full.is_finite()
+        || full <= 0.0
+    {
         return (start, span);
     }
     let anchor = start + anchor_frac * span;
     let new_span = (span / factor).clamp(min_span.min(full), full);
-    let new_start = (anchor - anchor_frac * new_span).clamp(full_lo, full_hi - new_span);
+    // `full_hi - new_span` is exactly `full_lo` in real arithmetic once
+    // `new_span` saturates at `full`, but the subtraction ROUNDS: on the
+    // spectrum's ln-Hz axis it lands one ULP *below* `full_lo`, and
+    // `clamp(min > max)` panics. That aborted the host on a zoom-out gesture
+    // (min = ln 20, max = ln 24000 - (ln 24000 - ln 20)). `.max(full_lo)` is
+    // the same guard `pan` below already carries.
+    let new_start =
+        (anchor - anchor_frac * new_span).clamp(full_lo, (full_hi - new_span).max(full_lo));
     (new_start, new_span)
 }
 
@@ -99,6 +118,48 @@ mod tests {
         // The anchor frequency sits at the same fraction of the new view.
         let new_frac = (anchor_hz.ln() - s) / sp;
         assert!((new_frac - frac).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zoom_out_to_full_range_on_the_log_axis() {
+        // Regression: zooming out on the spectrum panel aborted the host.
+        // `new_span` saturates at `full`, and `full_hi - full` rounds to one
+        // ULP BELOW `full_lo` on this axis, so the `clamp` in `zoom_about`
+        // got `min > max` and panicked. Exactly the values Sentry reported:
+        // min = 2.995732273553991, max = 2.9957322735539904.
+        let (lo, hi) = (20.0f64.ln(), 24_000.0f64.ln());
+        assert!(
+            hi - (hi - lo) < lo,
+            "this axis no longer round-trips; pick another that does"
+        );
+        // A hard zoom-out from the fitted view, anchored anywhere.
+        for frac in [0.0, 0.25, 0.5, 1.0] {
+            let (s, sp) = zoom_about(lo, hi - lo, frac, 1e-6, std::f64::consts::LN_2 / 2.0, lo, hi);
+            assert!(s >= lo && s + sp <= hi + 1e-12, "escaped range: {s}+{sp}");
+            assert!((sp - (hi - lo)).abs() < 1e-12, "span should be full: {sp}");
+        }
+    }
+
+    #[test]
+    fn non_finite_view_is_a_no_op() {
+        // A NaN reaching a `clamp` bound panics as surely as an unordered
+        // one, and NaN survives `clamp` to poison the next frame's view.
+        // Compared by bits, so a NaN passed through still counts as returned
+        // unchanged (`NaN == NaN` is false).
+        let same = |got: (f64, f64), want: (f64, f64)| {
+            assert!(
+                got.0.to_bits() == want.0.to_bits() && got.1.to_bits() == want.1.to_bits(),
+                "expected the view back unchanged: got {got:?}, want {want:?}"
+            );
+        };
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            same(zoom_about(bad, 2.0, 0.5, 2.0, 0.1, 0.0, 10.0), (bad, 2.0));
+            same(zoom_about(1.0, bad, 0.5, 2.0, 0.1, 0.0, 10.0), (1.0, bad));
+            same(zoom_about(1.0, 2.0, bad, 2.0, 0.1, 0.0, 10.0), (1.0, 2.0));
+            same(zoom_about(1.0, 2.0, 0.5, bad, 0.1, 0.0, 10.0), (1.0, 2.0));
+            same(zoom_about(1.0, 2.0, 0.5, 2.0, 0.1, bad, 10.0), (1.0, 2.0));
+            same(zoom_about(1.0, 2.0, 0.5, 2.0, 0.1, 0.0, bad), (1.0, 2.0));
+        }
     }
 
     #[test]
