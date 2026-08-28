@@ -117,8 +117,20 @@ a no-op). Phase machine: Idle → Armed → Capturing → Analyzing → Idle, an
 means nothing recorded yet, and every transition out of Armed/Capturing is a CAS so a GUI
 cancel always wins (`cancel_capture` tries ARMED→IDLE first — the phase only moves forward,
 so that order can't drop a cancel). The buffers live in an `AtomicRefCell`; the audio thread
-borrows in Idle/Armed/Capturing, the background task in Analyzing, never overlapping. On stop
-with data, `context.execute_background(Task::Analyze)` → the `task_executor()` closure (owns
+borrows in Idle/Armed/Capturing, the background task in Analyzing, never overlapping. Two
+hardenings guard that discipline where hosts stress it: `Task::Analyze` carries a capture
+*generation* and runs its whole body under `catch_unwind` (an escaped panic would kill
+nih-plug's process-shared worker and abort the host at teardown — see Known upstream issues),
+taking its borrow with `try_borrow` and re-checking the generation inside it; and
+`initialize()` — which hosts re-run on every state load while holding the same lock
+`process()` takes — takes a fast path when (rate, channels, latency) are unchanged (no
+delay-line rebuild, no ~12 MB reallocation, no wait), and otherwise waits up to 500 ms for an
+in-flight analysis, then either reclaims a queued/lost task (generation bump +
+`try_borrow_mut` probe → phase back to Idle; the stale task exits on its in-borrow generation
+check) or, if the task actively holds the borrow, keeps the existing buffers and skips the
+reallocation so the task finishes with valid results — no interleaving reaches the
+`AtomicRefCell` panic. On stop
+with data, `context.execute_background(Task::Analyze { generation })` → the `task_executor()` closure (owns
 Arc clones) runs `analyze_spliced` (zeroes ±max_shift guard regions around each seam in both
 working copies — exactly the cross-seam products — before the FFT cross-correlation), refines
 the peak to sub-sample precision by maximizing the continuous cross-correlation (DTFT of the
@@ -192,6 +204,13 @@ Anonymous Mixpanel events, OFF until the user consents. Three invariants, all lo
    sets a shutdown flag, drops the sender (which is what wakes a worker parked in `recv()` —
    joining before disconnecting would deadlock), then joins. Sends are `try_send` on a 32-slot
    bounded channel: a wedged network drops events, never blocks a caller or grows a backlog.
+   The drop-side join is bounded because every stage of `post()` is: DNS runs on a throwaway
+   helper thread awaited with a timeout (`resolve_bounded` — the ONE deliberate exception to
+   this rule, mirroring ureq's resolver: on timeout that thread is abandoned inside
+   `getaddrinfo`, accepted because the alternative was a certain DAW-unload hang, and the
+   image outlives it in practice — macOS pins ObjC-bearing images), every resolved address is
+   tried, connect/read/write carry per-op timeouts, and the response read has a wall-clock
+   deadline plus a size cap.
 
 Transport is a hand-written HTTP/1.1 POST over `native-tls` rather than an HTTP client crate:
 the request is one fire-and-forget JSON body to a fixed host, and native-tls binds the OS stack
@@ -310,6 +329,15 @@ serialization, anything — becomes an abort of the host at unload, because of t
 that the transport must not panic. Treat changes to `BoundedUreq` or the `ureq` features as
 crash-risk changes and exercise a real TLS connection, not just `cargo tree`.
 
+Nor is the transport thread the only upstream landmine at that seam: sentry-core's session
+flusher spawns its thread with `.unwrap()` (a panic on the consenting editor frame under
+thread exhaustion) and its Drop unwraps its own mutexes after swallowing a worker panic — so
+`sentry::init` is wrapped in `catch_unwind` inside `reporter()` (a failed init degrades to
+no-reporting and retries later), `sync_consent` decides under the per-instance mutex but runs
+init/teardown OUTSIDE it (a decline's client drain would otherwise freeze the editor frame
+while `initialize()` convoys on the lock), and BOTH sentry threads are treated as
+must-not-panic.
+
 **Release builds symbolicate to nothing without a debug-file upload.** `[profile.release]` keeps
 `strip = "symbols"`; `debug = "limited"` + `split-debuginfo = "packed"` leave a `.dSYM`/`.pdb`
 beside the binary that the shipped bundle does not contain, and the Mach-O UUID / PE build id is
@@ -406,6 +434,19 @@ against ANY nih-plug plugin (verified against the wrapper source, commit f36931f
 - `ext_state_load` does `Vec::with_capacity` on an unvalidated u64 length prefix, so random
   bytes SIGABRT (state-invalid-random).
 All other validator tests pass; re-run after bumping the nih_plug rev to see if these are fixed.
+
+nih-plug's process-shared background worker (`event_loop/background_thread.rs`, same rev) has
+two teardown flaws, both triggered by destroying an instance around an in-flight
+`Task::Analyze`: (a) destroying it while the task RUNS can drop the last `Arc<Wrapper>` on
+the worker thread itself, whose `WorkerThread::drop` then joins its own thread — EDEADLK
+panic-in-Drop on macOS (contained, leaks), permanent hang on Windows; (b) destroying it while
+the task is still QUEUED makes the worker's `executor.upgrade()` fail and the whole shared
+thread exit — later tasks from every instance are silently dropped, and the last instance's
+teardown panics in Drop (`send(Shutdown).expect` on the disconnected channel) → host abort.
+The local containment (the `catch_unwind` + generation reclaim in the threading section)
+removes our own panic route and un-wedges stuck instances; the destroy races themselves are
+only fixable upstream — a vendored patch / draft upstream report is prepared in a separate
+task.
 
 baseview (both the rev egui-baseview pins, `9a0b42c`, and the older one nih-plug's
 `standalone` feature pins) null-derefs in `becomeFirstResponder` on recent macOS and ABORTS

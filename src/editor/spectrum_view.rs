@@ -97,9 +97,11 @@ pub struct SpectrumArgs<'a> {
 /// fit bound (computed ONCE per snapshot — `prealign_lag` scans the whole
 /// correlation curve for a rejected-with-curve capture, far too much for a
 /// per-frame path) plus the GUI-side Welch re-estimates keyed by nfft
-/// (inner `None` = that size failed, don't retry). Self-invalidating: `snap`
-/// is the snapshot's `Arc` pointer, compared in [`show`] every frame, so
-/// there is no caller-side clearing contract to forget.
+/// (inner `None` = that size failed, don't retry). `snap` is the snapshot's
+/// raw `Arc` pointer and is only a same-snapshot check for the frames while
+/// this tab is visible — it does NOT keep the snapshot alive, so a freed
+/// address can recur on a later snapshot (ABA). The editor's snapshot-changed
+/// block therefore clears this cache like every other one.
 pub struct SpectrumReestimates {
     snap: usize,
     /// Integer pre-alignment lag, identical to what the analysis task used

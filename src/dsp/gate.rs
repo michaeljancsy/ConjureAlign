@@ -67,8 +67,24 @@ impl CaptureGate {
     /// Advances the envelopes by one sample of each mono-summed input and
     /// returns whether this sample should be recorded.
     pub fn step(&mut self, main: f32, reference: f32) -> bool {
-        self.env_main = main.abs().max(self.env_main * self.decay);
-        self.env_ref = reference.abs().max(self.env_ref * self.decay);
+        // A ±Inf sample must not enter an envelope: `Inf * decay` is still
+        // `Inf`, so a single one would pin the envelope (and the gate) open
+        // forever. Treat any non-finite sample as absent and just decay —
+        // which is exactly what `max` already does for NaN (it returns the
+        // other operand) — so the envelopes themselves stay finite for any
+        // input.
+        let main_abs = main.abs();
+        let ref_abs = reference.abs();
+        self.env_main = if main_abs.is_finite() {
+            main_abs.max(self.env_main * self.decay)
+        } else {
+            self.env_main * self.decay
+        };
+        self.env_ref = if ref_abs.is_finite() {
+            ref_abs.max(self.env_ref * self.decay)
+        } else {
+            self.env_ref * self.decay
+        };
         if self.open {
             if self.env_main >= self.close_thresh && self.env_ref >= self.close_thresh {
                 self.hold_left = self.hold_samples;
@@ -204,5 +220,61 @@ mod tests {
         let mut gate = CaptureGate::new(SR, THRESH);
         run(&mut gate, 0.5, 0.5, 1000);
         assert!(run(&mut gate, mid, mid, 100_000).iter().all(|&r| r));
+    }
+
+    #[test]
+    fn inf_sample_does_not_pin_the_gate_open() {
+        let mut gate = CaptureGate::new(SR, THRESH);
+        // Open on real signal, then hit both inputs with one ±Inf sample.
+        run(&mut gate, 0.5, 0.5, 5000);
+        gate.step(f32::INFINITY, f32::NEG_INFINITY);
+        // A pinned envelope would hold the gate open forever; instead the
+        // same release+hold budget as plain silence must close it...
+        let silence = run(&mut gate, 0.0, 0.0, 60_000);
+        assert!(silence[..10_000].iter().all(|&r| r));
+        assert!(!silence[59_999]);
+        // ...and the closed streak keeps growing, so auto-finish stays
+        // viable.
+        let before = gate.closed_streak();
+        assert!(before > 0);
+        run(&mut gate, 0.0, 0.0, 500);
+        assert_eq!(gate.closed_streak(), before + 500);
+
+        // A non-finite sample is treated as absent, so from closed it does
+        // not open the gate either.
+        let mut gate = CaptureGate::new(SR, THRESH);
+        assert!(!gate.step(f32::INFINITY, f32::INFINITY));
+        assert_eq!(gate.closed_streak(), 1);
+    }
+
+    #[test]
+    fn one_sided_inf_status_recovers() {
+        let mut gate = CaptureGate::new(SR, THRESH);
+        // Live on both sides, then a burst of Inf on main only.
+        run(&mut gate, 0.5, 0.5, 1000);
+        run(&mut gate, f32::INFINITY, 0.5, 10);
+        // After sustained real silence main's below-threshold reading must
+        // come back — a pinned envelope would report that input live (and
+        // "waiting for signal" would blame the wrong side) forever.
+        run(&mut gate, 0.0, 0.0, 60_000);
+        let st = gate.status();
+        assert!(!st.open && st.main_below && st.ref_below);
+    }
+
+    #[test]
+    fn nan_input_still_decays_like_silence() {
+        // NaN was already self-healing (`max` drops the NaN operand); the
+        // finiteness guard must keep that: a NaN run behaves exactly like
+        // silence.
+        let mut gate = CaptureGate::new(SR, THRESH);
+        run(&mut gate, 0.5, 0.5, 5000);
+        let nans = run(&mut gate, f32::NAN, f32::NAN, 60_000);
+        // Hold still bridges the start of the run...
+        assert!(nans[..10_000].iter().all(|&r| r));
+        // ...and release+hold still closes the gate on schedule.
+        assert!(!nans[59_999]);
+        // And NaN alone never opens a closed gate.
+        let mut gate = CaptureGate::new(SR, THRESH);
+        assert!(run(&mut gate, f32::NAN, f32::NAN, 48_000).iter().all(|&r| !r));
     }
 }
