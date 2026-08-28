@@ -18,6 +18,10 @@
 //! thread that runs `initialize()` (first init), the test's main thread for
 //! the editor (decline + re-grant), and a long-lived worker for the audio
 //! thread (panics before AND after the re-grant; both must reach the sink).
+//! Release-health sessions have the same per-hub shape (`start_session`
+//! writes the calling thread's hub), so the test also asserts the
+//! post-re-grant crash envelope carries a crashed session update — the
+//! crash-free rate depends on it.
 //!
 //! Runs against a temporary `HOME`/`APPDATA` and a local TCP sink, like
 //! `crash_consent.rs`. Two panics are deliberately raised; their backtraces
@@ -25,36 +29,19 @@
 
 mod sentry_sink;
 
-use std::net::TcpListener;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
 use conjure_align::analytics;
 use conjure_align::crash::{self, CrashHandle};
-use sentry_sink::{spawn_sink, wait_for_event};
+use sentry_sink::{setup, wait_for_body, wait_for_event};
 
 #[test]
 fn a_regrant_from_another_thread_restores_reporting_process_wide() {
-    // Only test in this binary, so nothing races these environment writes.
-    let home = std::env::temp_dir().join("conjure-align-crash-regrant");
-    let _ = std::fs::remove_dir_all(&home);
-    std::fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
-    std::env::set_var("APPDATA", &home);
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::env::set_var(
-        "CONJURE_ALIGN_SENTRY_DSN",
-        format!("http://00000000000000000000000000000000@127.0.0.1:{port}/1"),
-    );
-    std::env::set_var(
-        "CONJURE_ALIGN_ANALYTICS_URL",
-        format!("http://127.0.0.1:{port}/track"),
-    );
-
-    let rx = spawn_sink(listener);
+    // Temp HOME and the local sink, before anything touches the consent
+    // config — see `sentry_sink::setup` for the ordering invariants.
+    let (_home, rx) = setup("conjure-align-crash-regrant");
     // After `rx`, so its drop-time client shutdown finds the sink accepting.
     let handle = CrashHandle::new();
 
@@ -110,7 +97,7 @@ fn a_regrant_from_another_thread_restores_reporting_process_wide() {
     // ---- the audio thread must be reportable again, not just this one ----
     to_audio.send(()).unwrap();
     audio.join().unwrap();
-    wait_for_event(
+    let body = wait_for_body(
         &rx,
         "conjure-align-regrant-after-marker",
         Duration::from_secs(10),
@@ -119,5 +106,15 @@ fn a_regrant_from_another_thread_restores_reporting_process_wide() {
         "a panic on another thread after a consent re-grant was silently \
          dropped — the re-granted client is bound only to the editor thread's \
          hub (Hub::main() re-bind missing?)",
+    );
+    // The crash must also mark the re-granted session: the session update
+    // rides the same envelope as the event that changed it, and a capture
+    // can only flip a session that lives on the capturing hub's scope —
+    // which is why `reporter()` starts sessions on `Hub::main()` instead of
+    // letting `sentry::init` start one on whichever thread re-granted.
+    assert!(
+        body.contains("\"status\":\"crashed\""),
+        "the crash event arrived but its envelope carries no crashed session \
+         update — the re-granted session is not on Hub::main(): {body}"
     );
 }

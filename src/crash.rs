@@ -190,6 +190,18 @@ mod imp {
         _guard: ClientInitGuard,
     }
 
+    impl Drop for Reporter {
+        fn drop(&mut self) {
+            // The session lives on the process hub (see `reporter()`), but
+            // the guard's own drop ends sessions on the *dropping* thread's
+            // hub — for a decline, the editor thread, which does not hold
+            // it. Close it where it actually lives; this runs before the
+            // guard field drops, so the final update still rides the
+            // client's shutdown drain.
+            sentry::Hub::main().end_session();
+        }
+    }
+
     fn options() -> ClientOptions {
         let dsn = std::env::var(DSN_ENV)
             .ok()
@@ -232,11 +244,17 @@ mod imp {
         // source wired up at all. Pinned to zero so that stays true by
         // construction rather than by accident.
         opts.max_breadcrumbs = 0;
-        // One session per process: it opens here (i.e. on consent, so only
-        // opted-in users ever have one) and closes in `Reporter::drop` when the
-        // last instance unloads. That is what makes a crash-free rate
-        // meaningful — see the note in Cargo.toml.
-        opts.auto_session_tracking = true;
+        // One session per process: started explicitly on the process hub in
+        // `reporter()` (i.e. on consent, so only opted-in users ever have
+        // one) and ended in `Reporter::drop` when the last instance unloads.
+        // NOT the automatic variant: `sentry::init` would start the session
+        // on the *init-calling* thread's hub, and after a consent decline →
+        // re-grant that is the editor thread — the `Hub::main()` captures
+        // could then never mark the session crashed. A meaningful crash-free
+        // rate is the point of having sessions at all — see the note in
+        // Cargo.toml. `Application` mode is what attaches the session update
+        // to the same envelope as the event that changed it.
+        opts.auto_session_tracking = false;
         opts.session_mode = sentry::SessionMode::Application;
         opts.shutdown_timeout = SHUTDOWN_TIMEOUT;
         opts.transport = Some(Arc::new(BoundedUreq));
@@ -316,11 +334,33 @@ mod imp {
 
     static HOOK: Once = Once::new();
 
+    /// Whether the calling thread is one of Sentry's own workers
+    /// ("sentry-transport", "sentry-session-flusher"). Those are
+    /// must-not-panic (an escaped panic there is a host abort at unload —
+    /// see `BoundedUreq`), and the hook must not report from them: the
+    /// capture would go into the very machinery that is failing, and `flush`
+    /// on the transport thread queues a barrier behind itself and waits out
+    /// the full timeout. The prefix is the dependency's naming convention,
+    /// not ours — pinned by `sentry_transport_thread_matches_the_hook_skip_prefix`
+    /// below so a sentry upgrade that renames its workers fails a test
+    /// instead of silently re-opening that path.
+    fn is_sentry_internal_thread() -> bool {
+        std::thread::current()
+            .name()
+            .is_some_and(|name| name.starts_with("sentry-"))
+    }
+
     /// Installed once per process, and only after consent — an opted-out user's
     /// host never gets our hook at all.
     fn install_hook() {
         HOOK.call_once(|| {
             let next = std::panic::take_hook();
+            // Constructed once, out here, and never registered: registering
+            // it would run `Integration::setup`, which installs the second
+            // ungated hook the options() comment warns about. All we want is
+            // its panic-info-to-event conversion, which carries the
+            // backtrace and the panic location.
+            let integration = sentry::integrations::panic::PanicIntegration::default();
             std::panic::set_hook(Box::new(move |info| {
                 // A panic can originate on the audio thread: `process()` holds
                 // the `AtomicRefCell` borrows whose collision is the loudest
@@ -328,26 +368,11 @@ mod imp {
                 // would turn our own reporting into a second panic inside the
                 // first. nih-plug's hook wraps itself for the same reason.
                 nih_plug::util::permit_alloc(|| {
-                    // Sentry's own workers are must-not-panic (an escaped
-                    // panic there is a host abort at unload — see
-                    // `BoundedUreq`), and reporting from one would capture
-                    // into the failing machinery itself: `flush` on the
-                    // transport thread queues a barrier behind itself and
-                    // waits out the full timeout.
-                    let reportable = !std::thread::current()
-                        .name()
-                        .is_some_and(|name| name.starts_with("sentry-"));
                     // `enabled_in_hook`, not `enabled`: the panicking frame
                     // may hold the config lock on this thread, and a blocking
                     // or poisoned `lock().unwrap()` here is a deadlock or a
                     // panic-inside-the-hook abort.
-                    if reportable && analytics::enabled_in_hook() {
-                        // Constructed, never registered: registering it would
-                        // run `Integration::setup`, which installs the second
-                        // ungated hook the options() comment warns about. All
-                        // we want is its panic-info-to-event conversion, which
-                        // carries the backtrace and the panic location.
-                        let integration = sentry::integrations::panic::PanicIntegration::default();
+                    if !is_sentry_internal_thread() && analytics::enabled_in_hook() {
                         let mut event = integration.event_from_panic_info(info);
                         // Attribution, not a gate (rule 3): every panic
                         // reaching this hook was raised inside our dylib.
@@ -455,6 +480,13 @@ mod imp {
         // Re-binding the process hub is what keeps `Hub::main()` — where the
         // hook and `report_issue` capture — always fresh.
         sentry::Hub::main().bind_client(sentry::Hub::current().client());
+        // Sessions have the same per-hub shape (`start_session` writes the
+        // *calling* thread's hub scope), so the release-health session is
+        // started on the process hub too: a capture can only mark a session
+        // crashed if the session lives on the capturing hub's scope.
+        // `auto_session_tracking` is off in `options()` for exactly this
+        // reason; the matching `end_session` is in `Reporter::drop`.
+        sentry::Hub::main().start_session();
         let fresh = Arc::new(Reporter { _guard: guard });
         *slot = Arc::downgrade(&fresh);
         Some(fresh)
@@ -615,6 +647,89 @@ mod imp {
             let opts = options();
             let dsn = opts.dsn.expect("options() produced no DSN");
             assert_eq!(dsn.project_id().value(), "4511972827136000");
+        }
+
+        /// The panic hook skips Sentry's own worker threads by name prefix
+        /// (`is_sentry_internal_thread`) — a convention owned by the sentry
+        /// crate, not by us. Pin it the way the test above pins ureq's
+        /// feature wiring: run a real client against a local listener, with a
+        /// middleware on the transport's agent that records — from inside the
+        /// request path, i.e. ON sentry's transport thread — whether the
+        /// hook's predicate would skip that thread. A sentry bump that
+        /// renames its workers fails here instead of silently re-opening the
+        /// capture-into-failing-transport path.
+        #[test]
+        fn sentry_transport_thread_matches_the_hook_skip_prefix() {
+            use std::net::TcpListener;
+
+            struct Probe(Arc<Mutex<Option<(String, bool)>>>);
+            impl ureq::middleware::Middleware for Probe {
+                fn handle(
+                    &self,
+                    request: ureq::http::Request<ureq::SendBody>,
+                    next: ureq::middleware::MiddlewareNext,
+                ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+                    *self.0.lock().unwrap() = Some((
+                        std::thread::current().name().unwrap_or("<unnamed>").to_owned(),
+                        is_sentry_internal_thread(),
+                    ));
+                    next.handle(request)
+                }
+            }
+
+            struct ProbeFactory(Arc<Mutex<Option<(String, bool)>>>);
+            impl TransportFactory for ProbeFactory {
+                fn create_transport_with_options(
+                    &self,
+                    options: TransportOptions,
+                ) -> Arc<dyn Transport> {
+                    let agent = ureq::Agent::config_builder()
+                        .timeout_global(Some(Duration::from_millis(500)))
+                        .middleware(Probe(self.0.clone()))
+                        .build()
+                        .new_agent();
+                    Arc::new(
+                        sentry::transports::UreqHttpTransportOptions::from(options)
+                            .with_agent(agent)
+                            .build(),
+                    )
+                }
+            }
+
+            // Accept-and-hang-up, like the TLS test above: the middleware
+            // records on the way IN, so the request never needs to succeed.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                for stream in listener.incoming().take(1) {
+                    drop(stream);
+                }
+            });
+
+            let seen = Arc::new(Mutex::new(None));
+            let mut opts = ClientOptions::default();
+            opts.dsn = format!("http://00000000000000000000000000000000@127.0.0.1:{port}/1")
+                .parse()
+                .ok();
+            opts.default_integrations = false;
+            opts.transport = Some(Arc::new(ProbeFactory(seen.clone())));
+            let client = sentry::Client::from(opts);
+            client.capture_event(Event::default(), None);
+            assert!(
+                client.flush(Some(Duration::from_secs(5))),
+                "the transport never processed the probe event"
+            );
+            let (name, skipped) = seen
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the transport thread never entered the request path");
+            assert!(
+                skipped,
+                "sentry's transport thread is now named {name:?}, which \
+                 `is_sentry_internal_thread` no longer matches — a panic on it \
+                 would be captured into the failing transport itself"
+            );
         }
     }
 }

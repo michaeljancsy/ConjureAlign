@@ -17,39 +17,18 @@
 
 mod sentry_sink;
 
-use std::net::TcpListener;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Duration;
 
 use conjure_align::analytics;
 use conjure_align::crash::{self, CrashHandle};
-use sentry_sink::{collect_events, spawn_sink, wait_for_event};
+use sentry_sink::{collect_events, exactly_one_event, setup, wait_for_event};
 
 #[test]
 fn nothing_is_reported_until_consent_is_granted() {
-    // Set before anything touches the config: it is cached in a OnceLock on
-    // first read. Safe here because this is the only test in this binary, so
-    // no other thread is reading the environment.
-    let home = std::env::temp_dir().join("conjure-align-crash-e2e");
-    let _ = std::fs::remove_dir_all(&home);
-    std::fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
-    std::env::set_var("APPDATA", &home);
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::env::set_var(
-        "CONJURE_ALIGN_SENTRY_DSN",
-        format!("http://00000000000000000000000000000000@127.0.0.1:{port}/1"),
-    );
-    // Belt and braces: the analytics sender is not exercised here, but if it
-    // ever were, it must not reach the real Mixpanel either.
-    std::env::set_var(
-        "CONJURE_ALIGN_ANALYTICS_URL",
-        format!("http://127.0.0.1:{port}/track"),
-    );
-
-    let rx = spawn_sink(listener);
+    // Temp HOME and the local sink, before anything touches the consent
+    // config — see `sentry_sink::setup` for the ordering invariants.
+    let (home, rx) = setup("conjure-align-crash-e2e");
     // Declared after `rx` so it drops first: the client shutdown it triggers
     // needs the sink still accepting.
     let handle = CrashHandle::new();
@@ -134,17 +113,16 @@ fn nothing_is_reported_until_consent_is_granted() {
     assert!(!frames.is_empty(), "a reported issue had an empty stacktrace");
 
     // ---- a panic inside a scope is reported and tagged as a known callback ----
+    //
+    // `exactly_one_event`, not `wait_for_event`: exactly one report per panic
+    // is what pins "Rule 3" — a second event for the same marker means a
+    // blanket hook (a registered PanicIntegration) is reporting next to ours.
     let panicked = catch_unwind(AssertUnwindSafe(|| {
         let _scope = crash::scope();
         panic!("conjure-align-in-scope-marker");
     }));
     assert!(panicked.is_err());
-    let reported = wait_for_event(
-        &rx,
-        "conjure-align-in-scope-marker",
-        Duration::from_secs(10),
-    )
-    .expect("a panic inside a scope was not reported");
+    let reported = exactly_one_event(&rx, "conjure-align-in-scope-marker", Duration::from_secs(10));
     assert_eq!(reported["level"], "fatal");
     assert_eq!(reported["tags"]["in_scope"], "true");
 
@@ -155,12 +133,11 @@ fn nothing_is_reported_until_consent_is_granted() {
         panic!("conjure-align-out-of-scope-marker");
     }));
     assert!(panicked.is_err());
-    let stray = wait_for_event(
+    let stray = exactly_one_event(
         &rx,
         "conjure-align-out-of-scope-marker",
         Duration::from_secs(10),
-    )
-    .expect("a panic outside a scope went unreported — the GUI event loop and helper threads panic there");
+    );
     assert_eq!(stray["level"], "fatal");
     assert_eq!(stray["tags"]["in_scope"], "false");
 

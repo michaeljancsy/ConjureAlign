@@ -8,8 +8,43 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
+
+/// Everything a crash test binary needs before it touches any plugin code: a
+/// temporary `HOME`/`APPDATA` (the consent config is cached in a `OnceLock`
+/// on first read, so this must run first — safe because each caller is the
+/// only test in its binary, so nothing races the environment writes), and
+/// both endpoint overrides pointed at one local sink. The DSN override is
+/// the load-bearing line: without it `options()` falls back to the real
+/// production DSN, and a test would pass while shipping its deliberately
+/// raised panics to Sentry. The analytics override is belt and braces — the
+/// sender isn't exercised by these tests, but if it ever were, it must not
+/// reach the real Mixpanel either.
+///
+/// Returns the temp home and the sink's receiver. Create the `CrashHandle`
+/// AFTER binding the receiver, so the handle drops first and the client
+/// shutdown it triggers still finds the sink accepting.
+pub fn setup(dir_name: &str) -> (PathBuf, Receiver<String>) {
+    let home = std::env::temp_dir().join(dir_name);
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::env::set_var("HOME", &home);
+    std::env::set_var("APPDATA", &home);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::env::set_var(
+        "CONJURE_ALIGN_SENTRY_DSN",
+        format!("http://00000000000000000000000000000000@127.0.0.1:{port}/1"),
+    );
+    std::env::set_var(
+        "CONJURE_ALIGN_ANALYTICS_URL",
+        format!("http://127.0.0.1:{port}/track"),
+    );
+    (home, spawn_sink(listener))
+}
 
 /// Reads one HTTP request off the socket, answers it, and returns the body.
 fn read_request(stream: TcpStream) -> Option<String> {
@@ -111,4 +146,48 @@ pub fn wait_for_event(
         }
     }
     None
+}
+
+/// Like `wait_for_event`, but returns the whole raw envelope body containing
+/// `marker` — for asserting on non-event items, e.g. the release-health
+/// session update that rides the same envelope as the crash event that
+/// changed it.
+pub fn wait_for_body(rx: &Receiver<String>, marker: &str, budget: Duration) -> Option<String> {
+    let deadline = Instant::now() + budget;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let Ok(body) = rx.recv_timeout(remaining) else {
+            break;
+        };
+        if body.contains(marker) {
+            return Some(body);
+        }
+    }
+    None
+}
+
+/// The single event containing `marker`, asserting no duplicate follows. The
+/// duplicate check is load-bearing, not pedantry: a second report for the
+/// same panic is the signature of a blanket hook reporting next to the crash
+/// module's own — e.g. sentry's `PanicIntegration` accidentally *registered*
+/// instead of merely constructed ("Rule 3" in `src/crash.rs`'s `options()`).
+/// Both hooks run before the panic's unwind continues, so a duplicate is
+/// already in flight when the first event is read back; a short drain window
+/// is enough to catch it deterministically.
+pub fn exactly_one_event(
+    rx: &Receiver<String>,
+    marker: &str,
+    budget: Duration,
+) -> serde_json::Value {
+    let first = wait_for_event(rx, marker, budget)
+        .unwrap_or_else(|| panic!("no event containing {marker:?} reached the sink"));
+    let duplicates = collect_events(rx, Duration::from_secs(2))
+        .into_iter()
+        .filter(|e| e.to_string().contains(marker))
+        .count();
+    assert_eq!(
+        duplicates, 0,
+        "a second event for {marker:?} arrived — a blanket panic hook \
+         (a registered PanicIntegration?) is double-reporting"
+    );
+    first
 }
