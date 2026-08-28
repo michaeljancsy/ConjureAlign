@@ -13,10 +13,11 @@
 //! 1. The panic is *contained* — the frame is abandoned, the process lives on,
 //!    and the editor latches into a state that draws a message instead of
 //!    re-entering the drawing code at frame rate.
-//! 2. It is still *attributed to us* — `crash`'s hook runs at the panic site,
-//!    before the unwind that `guarded_frame` catches, so it still sees the
-//!    `crash::scope()` guard the draw closure takes. Catching a panic must not
-//!    quietly turn our crashes into ones we never hear about.
+//! 2. It is still *attributed correctly* — `crash`'s hook runs at the panic
+//!    site, before the unwind that `guarded_frame` catches, so it still sees
+//!    the `crash::scope()` guard the draw closure takes and tags the report
+//!    `in_scope`. Catching a panic must not quietly demote a known callback's
+//!    crash to a stray.
 //!
 //! The panics raised below are deliberate. The hook installed here chains to
 //! the harness's, so their messages and backtraces print even when this test
@@ -28,7 +29,7 @@ use conjure_align::crash;
 use conjure_align::editor::{guarded_frame, EditorState};
 
 /// What `crash::in_plugin_code()` said at the moment the last panic was
-/// raised — i.e. what the real hook would have decided.
+/// raised — i.e. what the real hook would have stamped as the `in_scope` tag.
 static LOOKED_LIKE_OURS: AtomicBool = AtomicBool::new(false);
 static PANICS_SEEN: AtomicU32 = AtomicU32::new(0);
 
@@ -38,7 +39,7 @@ static PANICS_SEEN: AtomicU32 = AtomicU32::new(0);
 fn an_editor_panic_is_contained_reported_and_latched() {
     let next = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Exactly the question `crash`'s own hook asks before reporting.
+        // Exactly what `crash`'s own hook reads for the `in_scope` tag.
         LOOKED_LIKE_OURS.store(crash::in_plugin_code(), Ordering::SeqCst);
         PANICS_SEEN.fetch_add(1, Ordering::SeqCst);
         next(info);
@@ -73,7 +74,7 @@ fn an_editor_panic_is_contained_reported_and_latched() {
          plus a blocking flush per frame"
     );
 
-    // ---- the hook still sees it as ours ----
+    // ---- the hook still sees it as in-scope ----
     //
     // The guard belongs OUTSIDE the containment (that is how the draw closure
     // takes it): the hook runs at the panic site, before the unwind starts.
@@ -89,11 +90,11 @@ fn an_editor_panic_is_contained_reported_and_latched() {
     }
     assert!(
         LOOKED_LIKE_OURS.load(Ordering::SeqCst),
-        "an editor panic no longer looks like ours to the crash hook, so it \
-         would go unreported"
+        "an editor panic no longer looks in-scope to the crash hook, so its \
+         report would be mislabelled a stray"
     );
 
-    // ---- while a panic outside our code still belongs to whoever raised it ----
+    // ---- while a panic outside any scope is tagged as the stray it is ----
     assert!(!crash::in_plugin_code());
     let mut unscoped = EditorState::default();
     assert!(!guarded_frame(&mut unscoped, |_state| panic!(
@@ -101,7 +102,7 @@ fn an_editor_panic_is_contained_reported_and_latched() {
     )));
     assert!(
         !LOOKED_LIKE_OURS.load(Ordering::SeqCst),
-        "containment made a panic outside our scope look like ours"
+        "containment leaked a scope into an unscoped panic's tag"
     );
 
     // ---- a latched editor recovers on request ----

@@ -16,12 +16,18 @@
 //!    thread tied to the client, so the client is owned by [`CrashHandle`]s
 //!    through a `Weak` registry, exactly like `analytics::Worker`. The last
 //!    plugin instance to drop closes the client and joins the thread.
-//! 3. **We report our own panics, not the host's.** A plugin shares its
-//!    process with the DAW and every other plugin in the session. Sentry's
-//!    stock `PanicIntegration` installs a hook that captures *any* panic
-//!    anywhere in that process, which would file the host's bugs — and every
-//!    other Rust plugin's — as ours. Instead the hook here reports only when a
-//!    [`Scope`] guard says the panicking thread is currently inside our code.
+//! 3. **Every panic the hook can see is ours, and every one is reported.** A
+//!    panic hook lives in the panicking image's own statically-linked std, so
+//!    the host's panics and other plugins' can never reach this one — there is
+//!    no cross-image blanket to guard against, and a panic in the GUI event
+//!    loop, a helper thread, or a dependency compiled into this dylib is
+//!    still a ConjureAlign crash the user hit. The hook therefore gates on
+//!    consent alone and stamps each report with an `in_scope` tag saying
+//!    whether a [`Scope`] guard was held — attribution (a known callback vs
+//!    shipped-but-unscoped code), not a filter. The one exception is Sentry's
+//!    own `sentry-*` worker threads: those are must-not-panic (see
+//!    `BoundedUreq` below), and reporting from one would capture into the
+//!    very machinery that is failing.
 //!
 //! ## Ordering against nih-plug's own panic hook
 //!
@@ -80,8 +86,10 @@ impl Drop for Scope {
     }
 }
 
-/// Whether the calling thread is inside a [`scope`]. This is the whole
-/// difference between reporting our own crashes and reporting the host's.
+/// Whether the calling thread is inside a [`scope`]. The panic hook stamps
+/// this on every report as the `in_scope` tag: `true` means a known plugin
+/// callback, `false` means somewhere else in this dylib — the GUI event loop,
+/// a helper thread, a dependency's internals.
 pub fn in_plugin_code() -> bool {
     DEPTH.with(|d| d.get()) > 0
 }
@@ -195,8 +203,9 @@ mod imp {
         // Must match what `sentry-cli debug-files upload` associates the
         // dSYM/PDB with, or release builds symbolicate to nothing.
         opts.release = Some(concat!("conjure_align@", env!("CARGO_PKG_VERSION")).into());
-        // Rule 3: no `PanicIntegration`. The default set would install the
-        // process-wide hook that captures the host's panics as ours; the other
+        // Rule 3: no `PanicIntegration`. Registering it would install a
+        // second, ungated hook next to ours — no consent check, no `in_scope`
+        // tag, no bounded flush, and a double report per panic. The other
         // four are exactly the defaults, listed explicitly so that adding one
         // is a deliberate act.
         opts.default_integrations = false;
@@ -206,6 +215,12 @@ mod imp {
             Arc::new(sentry::integrations::contexts::ContextIntegration::default()),
             Arc::new(sentry::integrations::backtrace::ProcessStacktraceIntegration),
         ];
+        // What arms `AttachStacktraceIntegration` above: a `report_issue`
+        // message is just a string, and without this it ships with no stack at
+        // all — the integration is gated on the option. Panic events are
+        // unaffected either way; theirs comes from `event_from_panic_info`,
+        // and the integration skips any event that already has one.
+        opts.attach_stacktrace = true;
         // The README promises no machine name and no identity beyond the random
         // install id. `send_default_pii` off is what stops Sentry backfilling
         // the client IP; `server_name` is nulled here and again in
@@ -313,19 +328,42 @@ mod imp {
                 // would turn our own reporting into a second panic inside the
                 // first. nih-plug's hook wraps itself for the same reason.
                 nih_plug::util::permit_alloc(|| {
+                    // Sentry's own workers are must-not-panic (an escaped
+                    // panic there is a host abort at unload — see
+                    // `BoundedUreq`), and reporting from one would capture
+                    // into the failing machinery itself: `flush` on the
+                    // transport thread queues a barrier behind itself and
+                    // waits out the full timeout.
+                    let reportable = !std::thread::current()
+                        .name()
+                        .is_some_and(|name| name.starts_with("sentry-"));
                     // `enabled_in_hook`, not `enabled`: the panicking frame
                     // may hold the config lock on this thread, and a blocking
                     // or poisoned `lock().unwrap()` here is a deadlock or a
                     // panic-inside-the-hook abort.
-                    if in_plugin_code() && analytics::enabled_in_hook() {
+                    if reportable && analytics::enabled_in_hook() {
                         // Constructed, never registered: registering it would
-                        // run `Integration::setup`, which installs the blanket
-                        // hook this whole module exists to avoid. All we want
-                        // is its panic-info-to-event conversion, which carries
-                        // the backtrace and the panic location.
+                        // run `Integration::setup`, which installs the second
+                        // ungated hook the options() comment warns about. All
+                        // we want is its panic-info-to-event conversion, which
+                        // carries the backtrace and the panic location.
                         let integration = sentry::integrations::panic::PanicIntegration::default();
-                        sentry::capture_event(integration.event_from_panic_info(info));
-                        if let Some(client) = sentry::Hub::current().client() {
+                        let mut event = integration.event_from_panic_info(info);
+                        // Attribution, not a gate (rule 3): every panic
+                        // reaching this hook was raised inside our dylib.
+                        event
+                            .tags
+                            .insert("in_scope".into(), in_plugin_code().to_string());
+                        // `Hub::main()`, not `Hub::current()`: a thread's own
+                        // hub is a snapshot taken the first time that thread
+                        // touched Sentry, and after a consent decline →
+                        // re-grant it can still point at the closed client.
+                        // The process hub is re-bound on every init (see
+                        // `reporter()`), so it is the one place a capture is
+                        // never stale.
+                        let hub = sentry::Hub::main();
+                        hub.capture_event(event);
+                        if let Some(client) = hub.client() {
                             client.flush(Some(FLUSH_TIMEOUT));
                         }
                     }
@@ -406,6 +444,17 @@ mod imp {
         // Only after a successful init — a failed attempt must leave the
         // process exactly as it found it, panic hook included.
         install_hook();
+        // `sentry::init` binds the client to the *calling* thread's hub only,
+        // and every other thread's hub snapshots the process hub the first
+        // time that thread touches Sentry — and never re-syncs. On the first
+        // grant those are the same hub (this thread is the first Sentry
+        // toucher in the process), but a decline → re-grant re-inits from the
+        // editor thread while the process hub still holds the closed client,
+        // which would silently drop every capture from the audio thread, the
+        // host's main thread, and the bg-worker for the rest of the process.
+        // Re-binding the process hub is what keeps `Hub::main()` — where the
+        // hook and `report_issue` capture — always fresh.
+        sentry::Hub::main().bind_client(sentry::Hub::current().client());
         let fresh = Arc::new(Reporter { _guard: guard });
         *slot = Arc::downgrade(&fresh);
         Some(fresh)
@@ -510,7 +559,10 @@ mod imp {
         if !analytics::enabled() {
             return;
         }
-        sentry::capture_message(message, Level::Error);
+        // Through `Hub::main()` for the same reason as the panic hook: the
+        // free function captures on the calling thread's hub, whose client
+        // snapshot can be stale after a consent decline → re-grant.
+        sentry::Hub::main().capture_message(message, Level::Error);
     }
 
     #[cfg(test)]
@@ -596,9 +648,10 @@ mod tests {
 
     #[test]
     fn scope_is_off_by_default_and_nests() {
-        // The panic hook reads this to decide whether a panic is ours. Getting
-        // it wrong in the "off" direction loses our own crashes; in the "on"
-        // direction it files the host's crashes as ours.
+        // The panic hook stamps this on every report as the `in_scope` tag.
+        // Getting it wrong in the "off" direction mislabels a known callback's
+        // crash as stray; in the "on" direction it dresses a GUI-event-loop or
+        // helper-thread panic up as one of the audited code paths.
         assert!(!in_plugin_code());
         {
             let _outer = scope();
@@ -619,8 +672,8 @@ mod tests {
     fn scope_is_per_thread() {
         let _guard = scope();
         assert!(in_plugin_code());
-        // A scope on the audio thread must not make the analysis thread's
-        // panics look like ours, and vice versa.
+        // A scope on the audio thread must not tag the analysis thread's
+        // panics as in-scope, and vice versa.
         assert!(!std::thread::spawn(in_plugin_code).join().unwrap());
     }
 }
