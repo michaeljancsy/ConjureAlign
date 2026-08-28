@@ -282,6 +282,18 @@ session and joins Sentry's transport thread). Three things are specific to panic
    `assert_process_allocs` would otherwise turn the report into a second panic inside the first.
    nih-plug's own hook does the same. The `scope()` guard itself is just a thread-local
    increment, so `process()` still allocates nothing.
+4. **An editor panic is reported AND swallowed.** Both editor closures run their body inside
+   `editor::guarded_frame` (`catch_unwind` + `AssertUnwindSafe`), because they are called from
+   an `extern "C"` frame — a CFRunLoop timer on macOS, a window proc on Windows — and unwinding
+   out of one aborts the host: an arithmetic bug in `view_math` killed Ableton Live instantly
+   (CONJUREALIGN-3). The `crash::scope()` guard stays OUTSIDE the catch, which is what preserves
+   attribution: the hook runs at the panic site, before the unwind. On a catch the whole
+   `EditorState` is replaced by `EditorState::after_panic()` — it may be half-updated, and its
+   snapshot is the likeliest input to the panic — which latches `panic_screen` (a message plus a
+   "Reload the editor" button, previewed as `gui_preview_panic.png`) in place of the panels.
+   The latch is not cosmetic: without it a panic that recurs every frame costs a Sentry report
+   and a blocking 2 s flush at 60 Hz. Nothing here touches the audio thread, so a dead editor
+   still leaves the correction running and every parameter reachable from the host's generic UI.
 
 `before_send` (`crash::scrub`) is the last gate before anything leaves, and each line in it
 backs a promise in the README/consent copy: `server_name` is nulled (`sentry-contexts` fills it
