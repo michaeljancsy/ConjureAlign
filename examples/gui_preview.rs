@@ -137,6 +137,29 @@ fn main() {
         detected_ms,
         Overlay::Settings,
     );
+    // Scene 8: what an editor that has panicked shows instead of the panels
+    // (see `editor::guarded_frame`). It replaces the body rather than floating
+    // over it, and reaching it in a DAW takes an actual crash, so this is the
+    // only review of its copy and of how it wraps at the minimum width.
+    render_panic_screen(&out.replace(".png", "_panic.png"));
+}
+
+/// Renders the post-panic message at the real minimum window size. It draws
+/// straight onto the context, like the editor's own closure does once the
+/// latch is set — no `draw_ui`, which is the point of the scene.
+fn render_panic_screen(out: &str) {
+    let mut state = conjure_align::editor::EditorState::after_panic();
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::Vec2::new(600.0, 460.0))
+        .build(move |ctx| {
+            ctx.set_visuals(egui::Visuals::dark());
+            conjure_align::editor::panic_screen(ctx, &mut state);
+        });
+
+    harness.run();
+    let image = harness.render().expect("wgpu offscreen render");
+    image.save(out).expect("write png");
+    println!("wrote {out}");
 }
 
 /// Which of the editor's two floating surfaces a full-editor scene draws on
