@@ -98,7 +98,10 @@ else
     else
         echo "  WARNING: symbol upload failed; continuing with the release."
         echo "  Check SENTRY_ORG / SENTRY_PROJECT, or the [defaults] in ~/.sentryclirc"
-        echo "  (\`sentry-cli info\` prints what it resolved them to)."
+        echo "  (\`sentry-cli info\` prints what it resolved them to) — and the token's"
+        echo "  scopes: uploads need project:releases, which a read-only token lacks"
+        echo "  (\`sentry-cli info\` lists scopes; an org auth token from sentry.io →"
+        echo "  Settings → Auth Tokens carries it)."
     fi
 fi
 
