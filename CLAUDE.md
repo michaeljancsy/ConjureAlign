@@ -74,8 +74,12 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   AudioComponentRegistrar cache). Signing the pkg needs the "Developer ID **Installer**"
   cert — a different cert from the "Developer ID Application" one that signs the bundles.
 - Toolchain: stable Rust. nih_plug is a git dependency (not on crates.io); Cargo.lock pins the
-  rev. `atomic_float` in Cargo.toml must stay on the same version nih_plug uses, because its
-  `AtomicF32` implements nih_plug's `PersistentField`.
+  rev — but the `nih_plug` crate itself is `[patch]`ed onto the vendored copy at
+  `deps/nih-plug` (teardown fixes for the shared background worker; see Known upstream issues
+  and deps/PATCHES.md). `nih_plug_egui`/`nih_plug_xtask` still resolve from the git source, so
+  the vendored tree must move in lockstep with the pinned rev. `atomic_float` in Cargo.toml
+  must stay on the same version nih_plug uses, because its `AtomicF32` implements nih_plug's
+  `PersistentField`.
 - Debug builds enable nih_plug's `assert_process_allocs`: any allocation on the audio thread
   panics. Keep it that way; fix the code, not the feature flag.
 
@@ -406,6 +410,31 @@ against ANY nih-plug plugin (verified against the wrapper source, commit f36931f
 - `ext_state_load` does `Vec::with_capacity` on an unvalidated u64 length prefix, so random
   bytes SIGABRT (state-invalid-random).
 All other validator tests pass; re-run after bumping the nih_plug rev to see if these are fixed.
+
+nih-plug's process-shared background worker (`src/event_loop/background_thread.rs`, the thread
+that runs our per-capture `Task::Analyze`) has two teardown bugs at the pinned rev f36931f —
+PATCHED LOCALLY, so they cannot bite this build, but they come back if a rev bump drops the
+patch: (1) destroying the last instance while its task is executing makes the last
+`Arc<Wrapper>` die on the worker thread (the worker holds the upgraded `Arc` for the duration
+of a task), whose `Drop` then joins its own thread — pthread_join EDEADLK panic on
+macOS/Linux, permanent `WaitForSingleObject(INFINITE)` hang on Windows; (2) a queued task
+whose instance was already destroyed made the worker `return`, killing the thread every OTHER
+instance shares — later schedules fail silently in release, and the last instance's teardown
+panics (`.expect` on the disconnected channel) inside the host's `destroy`, i.e. a host abort
+at project close. The fix lives in the vendored `deps/nih-plug` (wired by the
+`[patch."https://github.com/robbert-vdh/nih-plug.git"]` in Cargo.toml; hunks marked
+`LOCAL PATCH`), with regression tests:
+`cargo test --manifest-path deps/nih-plug/Cargo.toml -p nih_plug --lib background_thread` —
+both abort/deadlock against unpatched upstream. deps/PATCHES.md has the invariants and the
+re-vendor procedure; docs/upstream/nih-plug-worker-teardown.md is the issue draft to file
+upstream by hand (not filed as of 2026-08-28). nih-plug itself is in maintenance mode; the
+active community successor, nice-plug (codeberg.org/RustAudio/nice-plug), fixed the
+reference-cycle leak of nih-plug#222 but still carries both of these — so the draft's header
+directs the report there first. Note #222 does NOT shield us: that cycle only closes for
+plugins that retain the `AsyncExecutor` from `Plugin::editor()`, and ours ignores it
+(`_async_executor`), so our instances genuinely tear down — which is what makes both bugs
+reachable here, and equally what keeps our own Drop-chain invariants (joined analytics/Sentry
+threads) working.
 
 baseview (both the rev egui-baseview pins, `9a0b42c`, and the older one nih-plug's
 `standalone` feature pins) null-derefs in `becomeFirstResponder` on recent macOS and ABORTS

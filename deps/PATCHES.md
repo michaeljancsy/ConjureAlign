@@ -179,3 +179,144 @@ fork's GitHub refs are years older than the pinned revs (the objects resolve via
 fork network), so pushing any branch based on modern upstream uploads history touching
 `.github/workflows/` and requires a gh token with the `workflow` scope
 (`gh auth refresh -h github.com -s workflow`).
+
+---
+
+# Vendored `nih_plug` (shared-background-worker teardown patch)
+
+`deps/nih-plug` is [robbert-vdh/nih-plug](https://github.com/robbert-vdh/nih-plug) at
+`f36931f7af4646065488a9845d8f8c2f95252c23` — the exact rev Cargo.lock pins — applied through
+`[patch."https://github.com/robbert-vdh/nih-plug.git"]` in the root Cargo.toml. Same mechanism
+as the baseview patch above, but pointing at a local path instead of a fork: nothing here needs
+to be public, and a path under `deps/` follows the clap-wrapper-rs precedent. The `[patch]`
+replaces `nih_plug` for the whole graph — `nih_plug_egui` and `nih_plug_xtask` still resolve
+from the git source at the locked rev, and their internal `nih_plug` path dependency lands on
+the vendored copy, so exactly one `nih_plug` exists in the build (verify with
+`cargo tree -i nih_plug`: one node, two dependents).
+
+Deliberate differences from upstream, in full:
+
+1. **A subset, not the repo.** Only the root `nih_plug` crate plus `nih_plug_derive` (its one
+   path dependency) are vendored; the sibling GUI/tooling crates, the bundled plugins,
+   `.github` and `bundler.toml` are deleted, and the `[workspace]` member list in `Cargo.toml`
+   is trimmed to match — the only manifest edit, marked `LOCAL PATCH`. The vendored
+   `Cargo.lock` is upstream's, pruned by cargo to the trimmed workspace on the first
+   vendored-test run (the surviving entries keep upstream's versions); it governs only the
+   vendored test runs below — the plugin itself builds against the root workspace's lock.
+2. **The teardown patch and its regression tests** in `src/event_loop/background_thread.rs` —
+   the only Rust change. Every hunk is marked `LOCAL PATCH (ConjureAlign)`, so
+   `grep -rn "LOCAL PATCH" deps/nih-plug` is the complete diff map.
+
+## The patch: teardown of the process-shared worker must not take the host down
+
+`BackgroundThread` runs every instance's background tasks — our per-capture `Task::Analyze`,
+and on Linux even GUI tasks (`LinuxEventLoop` delegates both queues to it) — on ONE
+`bg-worker` thread shared by all instances of the plugin in the process. Tasks travel as
+`(task, Weak<Wrapper>)`; the worker upgrades the `Weak` per task and holds the `Arc` while the
+task runs. Teardown is reference-counted: the last instance to drop its handle sends
+`Shutdown` and joins the thread. Two bugs at the pinned rev, both reachable from ordinary
+host behavior whenever a task is in flight around instance destruction:
+
+1. **Destroy-during-task makes the worker join itself.** The host's `destroy` drops the
+   wrapper `Arc` while the worker holds the upgraded one, so when `execute()` returns, the
+   *last* strong reference — owning the `BackgroundThread`, and through it the last
+   `WorkerThread` handle — dies **on the worker thread**. `Drop` then joined its own thread:
+   `pthread_join` returns EDEADLK and std panics (macOS/Linux, verified against std 1.93.1),
+   `WaitForSingleObject(INFINITE)` hangs forever (Windows), with a latent access violation if
+   the host unloads the DLL afterwards.
+2. **One dead executor killed the worker for everyone.** A queued task whose instance was
+   already destroyed fails `executor.upgrade()`, and the worker `return`ed — ending the
+   thread every *other* instance shares. From then on `schedule()` fails silently in release
+   builds (the only report is a `nih_debug_assert!` at the call sites), and the last
+   instance's teardown ran `send(Shutdown).expect(…)` on the disconnected channel — a panic
+   that unwinds out of the host's `extern "C"` destroy call: a host abort at project close.
+
+The fix keeps behavior identical outside the failure paths: `Drop` no longer `.expect`s on
+send or join, detaches instead of joining when it finds itself running on the worker thread
+(the `try_send(Shutdown)` — or, if the queue is full, the channel disconnecting when this
+struct's only `Sender` drops — ends the loop right after the current task), and the worker
+loop drops a task whose executor is gone and keeps serving the rest.
+
+What detaching does NOT fix: in the destroy-during-task scenario the worker still executes a
+few final instructions of plugin code after `destroy()` has returned, so a host that unloads
+the dylib immediately could still fault. That window exists upstream too — the worker is
+inside plugin code when `destroy` returns, by definition of the scenario — and closing it
+needs an upstream design change (destroy synchronizing with in-flight tasks); the issue draft
+says so. The patch makes teardown non-fatal and keeps surviving instances working.
+
+## Verifying the patch after a change
+
+```bash
+cargo test --manifest-path deps/nih-plug/Cargo.toml -p nih_plug --lib background_thread
+```
+
+Both tests pass against the patched file, and they are load-bearing: reverting the two fix
+hunks (keeping the tests) makes `destroying_the_last_instance_mid_task_does_not_self_join`
+fail via its panic-hook counter — it counts panics on the `bg-worker` thread, which is where
+the EDEADLK join panic lands, invisible to the harness otherwise — and makes
+`dead_executor_does_not_kill_the_shared_worker` **abort the entire test process**: the
+`.expect` in `Drop` fires while the failed assertion is already unwinding, "thread caused
+non-unwinding panic. aborting." — the host-abort mechanism reproduced in miniature. The usual
+gates (`cargo test --release`, `cargo clippy --all-targets`, a bundle build) cover
+integration.
+
+Cargo does not `--cap-lints allow` path dependencies the way it does git dependencies, so the
+vendored crate surfaces three of upstream's own warnings in our builds (an unused import in
+`src/wrapper/clap/util.rs`, and `unexpected cfg` noise from the objc `class!` macro). Left in
+place deliberately: fixing upstream cosmetics here would widen the diff the `LOCAL PATCH`
+markers are supposed to bound.
+
+## Maintenance
+
+The vendored tree and the git rev that `nih_plug_egui`/`nih_plug_xtask` pin MUST advance
+together — `nih_plug_egui` (git) compiles against the vendored `nih_plug`, so drift between
+the two revs means API mismatches at best and silent behavior skew at worst. To bump nih-plug:
+
+1. Update the rev for the git dependencies as usual and let Cargo.lock re-pin.
+2. Re-vendor: copy the new checkout (`~/.cargo/git/checkouts/nih-plug-*/<rev>/`) over
+   `deps/nih-plug` with the same trim — keep the root files, `src/` and `nih_plug_derive/`,
+   delete the rest — and re-trim the `[workspace]` members list.
+3. Check whether upstream fixed the bugs: they are present while `WorkerThread::drop` still
+   `.expect`s on send/join and the worker loop's upgrade-failure arm still `return`s. If both
+   are fixed, drop the vendor and the `[patch]` entry instead of steps 4–5.
+4. Re-apply the patch: every hunk is marked `LOCAL PATCH (ConjureAlign)` in
+   `src/event_loop/background_thread.rs` (three hunks: the `Drop` impl, the worker loop's
+   `None` arm, the `tests` module).
+5. Re-run the verify commands above.
+
+## Upstream
+
+Not reported as of 2026-08-28. The complete issue draft — mechanism, permalinks,
+reproduction tests, suggested diff — is
+[`docs/upstream/nih-plug-worker-teardown.md`](../docs/upstream/nih-plug-worker-teardown.md),
+written to be pasted into a robbert-vdh/nih-plug issue after review. File it manually;
+nothing in this repo posts it anywhere.
+
+The nearest existing upstream report is
+[nih-plug#222](https://github.com/robbert-vdh/nih-plug/issues/222) with open PR
+[#225](https://github.com/robbert-vdh/nih-plug/pull/225): the wrappers'
+`execute_background`/`execute_gui` closures hold strong `Arc`s to their own wrapper, a
+reference cycle that stops the drop glue from running on destroy at all. A different defect,
+and — this matters — **one that does not shield us**: the cycle only closes for plugins that
+*retain* the `AsyncExecutor` handed to `Plugin::editor()`. Ours ignores it (`_async_executor`,
+[src/lib.rs:185](../src/lib.rs)) and `nih_plug_egui`'s editor never stores one, so those
+strong clones die when `editor()` returns, our instances really do tear down, and the two bugs
+above are **live in the shipped build**, not latent. (Flip side, and the reason the shipped
+build is otherwise sound: we do not suffer #222's leak either — our `Drop` chain runs, so the
+analytics worker and Sentry reporter are still joined, as the "no thread outlives the dylib"
+invariant requires.) #225 does not touch `background_thread.rs`, so it neither fixes nor
+conflicts with this patch. `background_thread.rs` is unchanged on master since the pinned rev
+(checked 2026-08-28), so the draft applies to master as-is.
+
+Know also that robbert-vdh/nih-plug is officially **in maintenance mode** (its README
+redirects framework users to the community successor,
+[nice-plug](https://codeberg.org/RustAudio/nice-plug)), so #225 — and any issue we file
+there — may never be acted on: this vendored patch is the durable state for as long as the
+plugin stays on nih-plug, and the #222 leak likewise will not be fixed for us by upstream.
+nice-plug has already fixed the leak (its closed issues #3/#4) but as of 2026-08-28 still
+carries both teardown bugs verbatim in
+`crates/nice-plug/src/event_loop/background_thread.rs` — armed there, since teardown really
+runs. The draft's header says how to adapt the report for nice-plug's tracker, where it is
+most useful. A future migration to nice-plug is a separate project (crate renames, egui
+0.36, an overhauled editor API, crates.io baseview 0.3.1 — the pinch patch above needs
+re-porting) and this patch must be ported or upstreamed to nice-plug as part of it.

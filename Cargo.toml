@@ -137,6 +137,22 @@ required-features = ["gui-preview"]
 [patch."https://github.com/RustAudio/baseview.git"]
 baseview = { git = "https://github.com/michaeljancsy/baseview.git", rev = "c1ff57cad3a32d62273ffabf7ee946e3ff651c5f" }
 
+# nih-plug's process-shared background worker thread (the one that runs our per-capture
+# Task::Analyze) has two teardown bugs in src/event_loop/background_thread.rs, still
+# present at the locked rev f36931f: destroying the last instance while its task is
+# running makes the worker thread join *itself* (a panic on macOS, a permanent hang on
+# Windows), and a task whose instance was already destroyed shuts the worker down for
+# every other instance in the process — after which the last instance's teardown panics
+# inside the host. deps/nih-plug is that exact rev with only background_thread.rs
+# patched (plus regression tests) and the workspace trimmed to the crates we build —
+# see deps/PATCHES.md, and docs/upstream/nih-plug-worker-teardown.md for the issue
+# draft to file upstream. `nih_plug_egui` above still resolves from the git source;
+# this entry rewires its internal `nih_plug` dependency onto the vendored copy too, so
+# exactly one nih_plug exists in the graph. When bumping the nih-plug rev, re-vendor
+# and re-apply rather than dropping this — PATCHES.md has the procedure.
+[patch."https://github.com/robbert-vdh/nih-plug.git"]
+nih_plug = { path = "deps/nih-plug" }
+
 [profile.release]
 lto = "thin"
 # The shipped binary carries no symbols, but the Mach-O UUID / PE build id survives
