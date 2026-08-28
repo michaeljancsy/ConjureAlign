@@ -127,15 +127,19 @@ required-features = ["gui-preview"]
 # (RustAudio/baseview#204, rev 3e12973). Cargo forbids patching a git source
 # with its own URL, hence the fork. The fork's `magnify-as-ctrl-scroll`
 # branch is NO LONGER an unmodified mirror: on top of the #204 fix it carries
-# one commit that delivers macOS `magnifyWithEvent:` (trackpad pinch, which
+# two commits. One delivers macOS `magnifyWithEvent:` (trackpad pinch, which
 # stock baseview drops entirely) as a synthetic ctrl-scroll WheelScrolled
-# event, calibrated so egui's zoom pipeline applies exp(magnification) — see
+# event, calibrated so egui's zoom pipeline applies exp(magnification). The
+# other claims keyboard focus on mouseDown (Logic never volunteers it, so the
+# ←/→ Trim nudge was dead there), forwards every key but ←/→ back to the host
+# so its own commands survive, and stops delivering Cmd — which is what pins
+# zoom to Ctrl/pinch, the one modifier that needs no focus. See
 # deps/PATCHES.md. When nih-plug / egui-baseview advance past the #204 fix,
-# REBASE the magnify commit onto the new rev instead of dropping the patch.
+# REBASE both commits onto the new rev instead of dropping the patch.
 # (Also overrides the `standalone` feature's much older baseview pin — see
 # src/bin/standalone.rs.)
 [patch."https://github.com/RustAudio/baseview.git"]
-baseview = { git = "https://github.com/michaeljancsy/baseview.git", rev = "c1ff57cad3a32d62273ffabf7ee946e3ff651c5f" }
+baseview = { git = "https://github.com/michaeljancsy/baseview.git", rev = "a8d4bba89f3fa593163bdc027c7f53801d403ade" }
 
 # nih-plug's process-shared background worker thread (the one that runs our per-capture
 # Task::Analyze) has two teardown bugs in src/event_loop/background_thread.rs, still

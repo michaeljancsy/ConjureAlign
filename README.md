@@ -9,8 +9,10 @@ Sub-sample precision, automatic polarity detection, and support for *negative* s
 The plugin window shows both captured waveforms overlaid (the main signal slides as the
 alignment changes) and the cross-correlation curve with a marker at the detected peak plus a
 live marker that tracks the applied shift. All graphs share one gesture set: drag or scroll
-to pan, pinch or ⌘-scroll (Ctrl-scroll on Windows) to zoom, double-click to fit. Manual Trim is adjusted with its
-slider, or with ←/→ while hovering a graph (0.01 ms per tap; hold Shift for 0.1 ms).
+to pan, pinch or Ctrl-scroll to zoom, double-click to fit. Manual Trim is adjusted with its
+slider, or with ←/→ while hovering a graph (0.01 ms per tap; hold Shift for 0.1 ms) — the arrow
+keys need the plugin window to have keyboard focus, which in Logic means clicking the editor
+once first.
 
 ![The ConjureAlign editor: overlaid captured waveforms above the cross-correlation curve with the detected peak marked](docs/screenshot.png)
 

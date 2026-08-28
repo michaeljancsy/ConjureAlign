@@ -162,9 +162,9 @@ element format is stereo and matches our layout-0 ports).
 # Patched `baseview` fork (not vendored — a `[patch]` in the root Cargo.toml)
 
 `[patch."https://github.com/RustAudio/baseview.git"]` points at
-`michaeljancsy/baseview`, branch `magnify-as-ctrl-scroll` (rev `c1ff57c`). That branch is
+`michaeljancsy/baseview`, branch `magnify-as-ctrl-scroll`. That branch is
 upstream's RustAudio/baseview#204 null-deref fix (`3e12973`, the rev the fork originally
-pinned unmodified) **plus one commit**:
+pinned unmodified) **plus two commits**:
 
 ## The patch: deliver macOS trackpad pinches at all
 
@@ -187,7 +187,37 @@ No new event variants, no egui-baseview changes: egui's `is_zoom` convention
 the gesture. The event's real modifiers ride along. Magnify gestures have no momentum phase;
 the began/ended phases carry `magnification == 0` and synthesize harmless zero deltas.
 
-**Maintenance.** When nih-plug/egui-baseview move past `3e12973`, rebase this one commit
+## The second patch: keyboard focus for an embedded editor
+
+**Problem.** An embedded plugin view asks to become first responder exactly once, from
+`viewWillMoveToWindow:`. Hosts that keep first responder on their own views for key commands
+take it straight back — Logic Pro does — and the editor then never receives a keystroke.
+That kills the ←/→ Trim nudge, and it also kills ⌘-scroll zoom, because egui-baseview only
+learns Cmd from a key event: its `update_modifiers` reads Shift/Option/Control off each
+mouse event and drops the Command bit that macOS stamps there (window.rs:279). Ctrl-scroll
+and pinch are unaffected — they ride that same stamp, or force it (see above) — which is why
+the symptom is host-dependent and modifier-dependent at once.
+
+**Fix.** Three parts, one commit, all in `src/macos/view.rs`:
+
+1. `mouseDown:` claims first responder (skipping the call when the view already holds it —
+   `makeFirstResponder:` otherwise cycles resign/become, which surfaces as focus flapping).
+2. Every key event is still delivered, but everything EXCEPT ←/→ is *also* passed up the
+   responder chain, so the host keeps transport, save and menu shortcuts while the editor is
+   focused. The view has to name those keys itself: egui-baseview answers every event with
+   `EventStatus::Captured` (window.rs:605), so baseview's stock "forward only when the
+   handler ignored it" rule would forward nothing.
+3. Cmd (`MetaLeft`/`MetaRight`) is never delivered to the handler. A latched Cmd is a
+   scroll-to-zoom modifier that desyncs from focus in both directions — unreachable when the
+   host withholds keys, and never cleared when focus leaves mid-gesture, which turns the next
+   ordinary scroll into a zoom. Zoom is pinned to Ctrl/pinch instead. **Cost:** ⌘-shortcuts,
+   including egui's clipboard ones, no longer reach the GUI. Harmless here — the editor has
+   no text entry — but a view that gains a text field wants this behind a flag.
+
+Both 2 and 3 are policy this plugin gets to set because it owns the fork; neither belongs
+upstream as an unconditional default.
+
+**Maintenance.** When nih-plug/egui-baseview move past `3e12973`, rebase both commits
 onto the new upstream rev and update the `[patch]` rev — do not drop the fork. Note the
 fork's GitHub refs are years older than the pinned revs (the objects resolve via GitHub's
 fork network), so pushing any branch based on modern upstream uploads history touching

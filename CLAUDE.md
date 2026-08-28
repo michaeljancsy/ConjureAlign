@@ -10,9 +10,12 @@ cross-correlation, with sub-sample precision and automatic polarity detection. T
 two microphones on one guitar amp, one plugin instance on the track to be shifted, the other
 track routed into the sidechain. Has a custom egui editor (overlaid capture waveforms, a
 cross-correlation graph with live markers, a comb-filter spectrum panel; all graphs share one
-gesture set — drag/scroll pans, pinch or ⌘-scroll (ctrl-scroll off macOS) zooms the x-axis, the y-axis is always
+gesture set — drag/scroll pans, pinch or ctrl-scroll zooms the x-axis on every platform (Ctrl
+is stamped on the scroll event itself, so it needs no keyboard focus; ⌘ would, and Logic
+never grants it — see the baseview patch), the y-axis is always
 plugin-scaled, double-click fits; Trim is adjusted via its slider or ←/→ while hovering a
-graph, there is no drag-to-trim; the lower panel's header row carries a legend spelling
+graph — those DO need keyboard focus, so in Logic the editor must be clicked once first —
+there is no drag-to-trim; the lower panel's header row carries a legend spelling
 the gesture set out — it rides in that already-budgeted row rather than a line of its own,
 and words the modifiers because egui's default font renders ⌘ but not ⌥/⇧/←/→) but
 remains fully operable headless from the host's generic parameter UI. Capture/Stop/Cancel
@@ -494,15 +497,20 @@ THE HOST when the editor window opens: AppKit now attaches the view before it ha
 and `msg_send![nil, isKeyWindow]` trips rustc's inserted null check. Fixed upstream one
 commit after `9a0b42c` (RustAudio/baseview#204, rev `3e12973`); Cargo.toml carries a
 `[patch."https://github.com/RustAudio/baseview.git"]` pointing at the
-`michaeljancsy/baseview` fork's `magnify-as-ctrl-scroll` branch (rev `c1ff57c`), which is
-that fix PLUS ONE LOCAL COMMIT: stock baseview registers no `magnifyWithEvent:` handler, so
-macOS trackpad pinches produce no events at all in the editor — the commit re-encodes them
+`michaeljancsy/baseview` fork's `magnify-as-ctrl-scroll` branch, which is that fix PLUS TWO
+LOCAL COMMITS. (1) Stock baseview registers no `magnifyWithEvent:` handler, so macOS
+trackpad pinches produce no events at all in the editor — the commit re-encodes them
 as ctrl-scroll `WheelScrolled` events (K = 200 calibrates to egui's default scroll-zoom
 speed of 1/200, giving exp(magnification) — the native AppKit convention). That is what
-makes pinch-zoom work in every host; see deps/PATCHES.md. Do NOT remove the patch when
-nih-plug/egui-baseview advance past the #204 fix — REBASE the magnify commit onto the new
+makes pinch-zoom work in every host. (2) The view claims first responder on `mouseDown:`
+(stock baseview asks once, from `viewWillMoveToWindow:`, and Logic takes it straight back),
+delivers every key but hands all of them EXCEPT ←/→ up the responder chain as well —
+egui-baseview answers every event `Captured`, so without that the host would lose its own
+key commands — and never delivers Cmd at all, which is what pins zoom to Ctrl/pinch.
+See deps/PATCHES.md. Do NOT remove the patch when
+nih-plug/egui-baseview advance past the #204 fix — REBASE both commits onto the new
 rev instead (without #204 the editor crashes every host on current macOS; without the
-magnify commit pinch silently dies). Beware when pushing to the fork: its GitHub refs
+magnify commit pinch silently dies; without the focus commit ←/→ are dead in Logic). Beware when pushing to the fork: its GitHub refs
 predate the pinned revs (objects resolve via the fork network), so pushing a branch uploads
 upstream history that touches `.github/workflows/` and needs a gh token with the `workflow`
 scope. The AU path is the likeliest of the three to trip the null-deref: clap-wrapper's

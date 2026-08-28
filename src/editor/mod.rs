@@ -107,15 +107,13 @@ pub(crate) fn gesture_legend(ui: &mut egui::Ui) {
         size,
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            // egui maps its zoom modifier to cmd on macOS and ctrl everywhere
-            // else, so the legend names whichever applies.
-            const LEGEND: &str = if cfg!(target_os = "macos") {
-                "drag / scroll: pan  ·  pinch or cmd-scroll: zoom  ·  \
-                 arrow keys: nudge trim  ·  double-click: fit"
-            } else {
-                "drag / scroll: pan  ·  pinch or ctrl-scroll: zoom  ·  \
-                 arrow keys: nudge trim  ·  double-click: fit"
-            };
+            // Ctrl on every platform, macOS included: that flag is stamped
+            // on the scroll event itself, so the gesture works whether or not
+            // the host has given the editor keyboard focus. Cmd would have to
+            // be latched from a key event, which Logic never delivers, so the
+            // baseview patch drops it rather than leave zoom host-dependent.
+            const LEGEND: &str = "drag / scroll: pan  ·  pinch or ctrl-scroll: zoom  ·  \
+                                  arrow keys: nudge trim  ·  double-click: fit";
             ui.add(
                 egui::Label::new(egui::RichText::new(LEGEND).small().color(TEXT_DIM))
                     .truncate(),
