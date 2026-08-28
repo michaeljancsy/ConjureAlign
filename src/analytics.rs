@@ -12,20 +12,22 @@
 //!    fields are per-DAW-session and consent is per-install.
 //! 3. **No thread outlives the dylib.** Hosts unload plugin bundles in-process.
 //!    One worker thread is shared by every instance in the process via a
-//!    `Weak` registry, and the last instance to drop joins it.
+//!    `Weak` registry, and the last instance to drop joins it. (One narrow
+//!    exception: a timed-out DNS lookup abandons its helper thread — see
+//!    `resolve_bounded`.)
 //!
 //! The payload is deliberately thin: a random device id, the plugin version,
 //! the OS, the sample rate, and *bucketed* capture outcomes. No audio, no file
 //! names, no host name, no raw measurements.
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atomic_float::AtomicF32;
 
@@ -42,6 +44,14 @@ const ENDPOINT_ENV: &str = "CONJURE_ALIGN_ANALYTICS_URL";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
+/// Wall-clock ceiling on one whole `post`, enforced by the response-read loop
+/// in `exchange`: the socket's per-op read timeout cannot stop a server that
+/// keeps trickling bytes, and an unbounded post rides through the worker loop
+/// straight into `Worker::drop`'s join at plugin unload.
+const POST_DEADLINE: Duration = Duration::from_secs(10);
+/// The worker discards responses and the smoke test reads a few hundred bytes
+/// of JSON; buffering more than this only serves a misbehaving server.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// Small on purpose: if the network is wedged, events are dropped rather than
 /// queued. An analytics backlog must never grow without bound in a DAW.
 const QUEUE_CAPACITY: usize = 32;
@@ -287,6 +297,7 @@ pub fn reason_str(reason: RejectReason) -> &'static str {
     match reason {
         RejectReason::TooShort => "too_short",
         RejectReason::Silence => "silence",
+        RejectReason::NonFinite => "non_finite",
         RejectReason::LowConfidence => "low_confidence",
     }
 }
@@ -370,10 +381,57 @@ pub fn parse_endpoint(url: &str) -> Option<Endpoint> {
     })
 }
 
+/// `getaddrinfo` with a deadline. `ToSocketAddrs` exposes no timeout, and a
+/// blackholed resolver (captive portal, dead VPN DNS) blocks it for the OS
+/// resolver's own timeout — tens of seconds — which would ride through the
+/// worker loop into `Worker::drop`'s join and stall plugin unload. So the
+/// blocking call runs on a throwaway thread and we wait a bounded time for
+/// its answer.
+///
+/// On timeout the helper is abandoned mid-`getaddrinfo` — a deliberate,
+/// narrow exception to rule 3 ("no thread outlives the dylib"), the same
+/// trade ureq's resolver makes. The lingering thread holds no plugin state
+/// and ends with one channel send nobody hears; the theoretical hazard is
+/// the dylib unmapping underneath it, but this cdylib cannot unload on
+/// macOS — clap-wrapper's ObjC class registration marks the image
+/// never-unload (verified in the built bundle), with the cdylib's
+/// thread-locals as a second pin. The alternative — joining it — is the
+/// certain unload hang this exists to remove.
+fn resolve_bounded(host: &str, port: u16, timeout: Duration) -> std::io::Result<Vec<SocketAddr>> {
+    // An IP literal never touches the resolver (tests, local sinks): no
+    // thread needed.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let (tx, rx) = channel();
+    let host = host.to_owned();
+    std::thread::Builder::new()
+        .name("conjure-align-dns".into())
+        .spawn(move || {
+            // Fails harmlessly when the waiter has already given up.
+            let _ = tx.send(
+                (host.as_str(), port)
+                    .to_socket_addrs()
+                    .map(|i| i.collect::<Vec<_>>()),
+            );
+        })?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        // Timed out, or the helper died without sending; either way this post
+        // fails and the event is dropped, like any other analytics failure.
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out resolving analytics host",
+        )),
+    }
+}
+
 /// Returns the raw HTTP response. The worker discards it — a dropped event is
 /// not worth reacting to — but returning it is what lets the smoke test below
 /// tell "bytes moved" apart from "Mixpanel accepted the event".
 fn post(endpoint: &Endpoint, body: &str) -> std::io::Result<String> {
+    let deadline = Instant::now() + POST_DEADLINE;
     let request = format!(
         "POST {} HTTP/1.1\r\n\
          Host: {}\r\n\
@@ -392,48 +450,87 @@ fn post(endpoint: &Endpoint, body: &str) -> std::io::Result<String> {
 
     // One connection, opened here and handed to whichever writer applies —
     // connecting inside the TLS branch instead would leave this one dangling.
-    let addr = (endpoint.host.as_str(), endpoint.port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| std::io::Error::other("no address for analytics host"))?;
-    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    // Every resolved address gets a try, not just the first: dual-stack hosts
+    // routinely resolve IPv6-first, and a machine whose IPv6 route is broken
+    // would otherwise never deliver a single event.
+    let mut stream = Err(std::io::Error::other("no address for analytics host"));
+    for addr in resolve_bounded(&endpoint.host, endpoint.port, CONNECT_TIMEOUT)? {
+        // The 10 s deadline must bound this loop too: dual-stack hosts
+        // resolve to several addresses, and a firewall that blackholes SYNs
+        // would otherwise stack a full CONNECT_TIMEOUT per address on top of
+        // the budget the caller was promised.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            stream = Err(std::io::Error::other("analytics post deadline exhausted"));
+            break;
+        }
+        stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT.min(remaining));
+        if stream.is_ok() {
+            break;
+        }
+    }
+    let stream = stream?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
     if endpoint.tls {
-        write_tls(&endpoint.host, stream, request.as_bytes())
+        write_tls(&endpoint.host, stream, request.as_bytes(), deadline)
     } else {
-        write_plain(stream, request.as_bytes())
+        write_plain(stream, request.as_bytes(), deadline)
     }
 }
 
-fn exchange<S: Read + Write>(mut stream: S, request: &[u8]) -> std::io::Result<String> {
+fn exchange<S: Read + Write>(
+    mut stream: S,
+    request: &[u8],
+    deadline: Instant,
+) -> std::io::Result<String> {
     stream.write_all(request)?;
     stream.flush()?;
     // `Connection: close` means the far end hangs up once it has replied, so
-    // this returns promptly; the socket's read timeout bounds it either way.
-    // A truncated read still yields whatever arrived, which is all the caller
-    // wants.
+    // this normally returns promptly — but the socket's read timeout only
+    // bounds each *individual* read, so a peer trickling a byte per timeout
+    // could pin the worker (and grow the buffer) forever. The deadline and
+    // the size cap bound the whole read; the worst case is one blocked read
+    // past the deadline. A truncated response still yields whatever arrived,
+    // read errors included — which is all the caller wants, and matches the
+    // `read_to_end` this replaced, whose result was ignored too.
     let mut response = Vec::new();
-    let _ = stream.read_to_end(&mut response);
+    let mut chunk = [0u8; 4096];
+    while response.len() < MAX_RESPONSE_BYTES && Instant::now() < deadline {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => response.extend_from_slice(&chunk[..n]),
+        }
+    }
     Ok(String::from_utf8_lossy(&response).into_owned())
 }
 
-fn write_plain(stream: TcpStream, request: &[u8]) -> std::io::Result<String> {
-    exchange(stream, request)
+fn write_plain(stream: TcpStream, request: &[u8], deadline: Instant) -> std::io::Result<String> {
+    exchange(stream, request, deadline)
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn write_tls(host: &str, stream: TcpStream, request: &[u8]) -> std::io::Result<String> {
+fn write_tls(
+    host: &str,
+    stream: TcpStream,
+    request: &[u8],
+    deadline: Instant,
+) -> std::io::Result<String> {
     let connector = native_tls::TlsConnector::new().map_err(std::io::Error::other)?;
     let tls = connector
         .connect(host, stream)
         .map_err(std::io::Error::other)?;
-    exchange(tls, request)
+    exchange(tls, request, deadline)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn write_tls(_host: &str, _stream: TcpStream, _request: &[u8]) -> std::io::Result<String> {
+fn write_tls(
+    _host: &str,
+    _stream: TcpStream,
+    _request: &[u8],
+    _deadline: Instant,
+) -> std::io::Result<String> {
     Err(std::io::Error::other("TLS unavailable on this platform"))
 }
 
@@ -802,6 +899,134 @@ mod tests {
 
         // Dropping the last reference must disconnect and join the thread.
         drop(worker);
+    }
+
+    /// A peer that talks forever: every read yields more bytes, after an
+    /// optional pause — the shape of a server trickling a response that never
+    /// ends. `exchange` being generic is what lets this run without a socket.
+    struct EndlessPeer {
+        pause: Duration,
+    }
+
+    impl Read for EndlessPeer {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.pause);
+            let n = buf.len().min(1024);
+            buf[..n].fill(b'x');
+            Ok(n)
+        }
+    }
+
+    impl Write for EndlessPeer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn exchange_caps_how_much_response_it_buffers() {
+        let peer = EndlessPeer {
+            pause: Duration::ZERO,
+        };
+        let far_off = Instant::now() + Duration::from_secs(30);
+        let response = exchange(peer, b"x", far_off).unwrap();
+        assert!(response.len() >= MAX_RESPONSE_BYTES);
+        // The cap is checked between reads, so one chunk of overshoot at most.
+        assert!(
+            response.len() < MAX_RESPONSE_BYTES + 4096,
+            "{}",
+            response.len()
+        );
+    }
+
+    #[test]
+    fn exchange_deadline_beats_a_trickling_peer() {
+        let peer = EndlessPeer {
+            pause: Duration::from_millis(5),
+        };
+        let start = Instant::now();
+        let response = exchange(peer, b"x", start + Duration::from_millis(100)).unwrap();
+        let elapsed = start.elapsed();
+        assert!(!response.is_empty());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "trickle held exchange for {elapsed:?}"
+        );
+    }
+
+    /// The transport half of the unload-hang fix: a server that accepts and
+    /// then goes silent must not pin the worker — and, transitively,
+    /// `Worker::drop`'s join — beyond the post deadline. (Takes ~`IO_TIMEOUT`
+    /// to run: the client has to actually give up on the read.)
+    #[test]
+    fn post_survives_a_server_that_never_responds() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = channel::<()>();
+        let sink = std::thread::spawn(move || {
+            // Hold the accepted connection open without writing a byte until
+            // the client has given up — dropping it early would read as a
+            // clean EOF rather than a hung server.
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(30));
+        });
+
+        let endpoint = parse_endpoint(&format!("http://127.0.0.1:{port}/track")).unwrap();
+        let start = Instant::now();
+        let response = post(&endpoint, "[]").unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(response, "");
+        assert!(
+            elapsed < POST_DEADLINE,
+            "silent server held post for {elapsed:?}"
+        );
+
+        let _ = done_tx.send(());
+        sink.join().unwrap();
+    }
+
+    /// `localhost` resolves to `::1` before `127.0.0.1` on plenty of systems
+    /// (Windows notably), and only `127.0.0.1` has a listener here — so this
+    /// passes only because `post` walks the whole address list instead of
+    /// trusting the first entry. Also the one test that exercises
+    /// `resolve_bounded`'s helper thread, since every other sink is an IP
+    /// literal.
+    #[test]
+    fn post_tries_every_resolved_address() {
+        use std::io::BufRead;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sink = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(v) = line.strip_prefix("Content-Length: ") {
+                    content_length = v.trim().parse().unwrap();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n1")
+                .unwrap();
+        });
+
+        let endpoint = parse_endpoint(&format!("http://localhost:{port}/track")).unwrap();
+        let response = post(&endpoint, "[]").unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.ends_with('1'), "{response}");
+        sink.join().unwrap();
     }
 
     /// The only test that leaves the machine, so it is opt-in:

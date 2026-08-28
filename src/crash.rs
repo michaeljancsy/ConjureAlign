@@ -88,6 +88,7 @@ pub fn in_plugin_code() -> bool {
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod imp {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::{Arc, Mutex, Once, OnceLock, Weak};
     use std::time::Duration;
 
@@ -346,18 +347,68 @@ mod imp {
         REGISTRY.get_or_init(|| Mutex::new(Weak::new()))
     }
 
-    fn reporter() -> Arc<Reporter> {
+    /// The process-wide client, shared through the registry. The registry
+    /// mutex is held across `sentry::init` on purpose: it is what serializes
+    /// concurrent grants, so the second caller upgrades the `Weak` instead of
+    /// initializing a second client.
+    ///
+    /// `None` when the client could not be brought up. The slot is left empty
+    /// so the next `sync_consent` retries, rather than pinning reporting off
+    /// for the rest of the process.
+    fn reporter() -> Option<Arc<Reporter>> {
         let registry = registry();
         let mut slot = registry.lock().unwrap();
         if let Some(existing) = slot.upgrade() {
-            return existing;
+            return Some(existing);
         }
+        // A failed init retries, but not at the editor's frame rate: every
+        // attempt builds the TLS agent, spawns and joins a transport thread,
+        // and panics through nih-plug's logging hook (a backtrace per try) —
+        // a 60 Hz churn loop on exactly the thread-starved machine that made
+        // init fail. One attempt per backoff interval keeps the eventual
+        // recovery that not latching failures off for the process buys.
+        const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+        static LAST_FAILURE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        {
+            let last = LAST_FAILURE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if last.is_some_and(|t| t.elapsed() < RETRY_BACKOFF) {
+                return None;
+            }
+        }
+        // `sentry::init` spawns two threads — the transport worker and the
+        // session flusher — and both spawns `.unwrap()`, so on a machine out
+        // of threads this is a *panic*, raised on whichever host thread is
+        // syncing consent, unwinding out through the FFI boundary. Contain
+        // it: a starved host gets no crash reporting, not an abort. Sound to
+        // catch, because both spawns run inside `Client::from(opts)`, before
+        // anything is bound to the global hub.
+        let guard = match catch_unwind(AssertUnwindSafe(|| sentry::init(options()))) {
+            Ok(guard) => guard,
+            Err(_) => {
+                *LAST_FAILURE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(std::time::Instant::now());
+                // Once per process: the editor re-syncs every frame, and a
+                // persistent failure must not flood the log at frame rate.
+                static WARNED: Once = Once::new();
+                WARNED.call_once(|| {
+                    nih_plug::nih_log!(
+                        "ConjureAlign: starting the crash reporter panicked \
+                         (could not spawn its threads?); crash reporting stays off"
+                    );
+                });
+                return None;
+            }
+        };
+        // Only after a successful init — a failed attempt must leave the
+        // process exactly as it found it, panic hook included.
         install_hook();
-        let fresh = Arc::new(Reporter {
-            _guard: sentry::init(options()),
-        });
+        let fresh = Arc::new(Reporter { _guard: guard });
         *slot = Arc::downgrade(&fresh);
-        fresh
+        Some(fresh)
     }
 
     /// One per plugin instance. Constructing it does no I/O, starts no thread
@@ -384,20 +435,63 @@ mod imp {
         /// session — and it cannot be forgotten the way a call bolted onto
         /// each button would be.
         pub fn sync_consent(&self) {
-            let mut slot = self.reporter.lock().unwrap();
-            match (analytics::enabled(), slot.is_some()) {
-                (true, false) => *slot = Some(reporter()),
+            // Decide under the instance lock, act outside it: `initialize()`
+            // (a host thread) and the editor's draw closure both funnel
+            // through this mutex, and both arms below are heavyweight —
+            // arming spawns Sentry's threads, disarming can run the full
+            // client teardown. Neither belongs under a lock another host
+            // thread convoys on. A stale decision costs one extra frame: the
+            // editor re-syncs every frame, and consent only changes through
+            // the editor, so the next sync converges.
+            let armed = self.reporter.lock().unwrap().is_some();
+            match (analytics::enabled(), armed) {
+                // Built outside the instance lock, stored under a brief
+                // re-lock. Racing grants (this instance's `initialize()`
+                // against its editor, or another instance's) are fine: the
+                // registry inside `reporter()` hands every concurrent caller
+                // the same client, so the loser overwrites the slot with the
+                // Arc it already holds.
+                (true, false) => {
+                    if let Some(fresh) = reporter() {
+                        // Re-checked under the re-lock: a decline can land
+                        // while `reporter()` was building (two thread spawns
+                        // plus TLS agent construction), and an editor-less
+                        // instance would otherwise stay armed — client,
+                        // session and all — with consent declined on disk.
+                        // The discarded `fresh` drops after the guard, so any
+                        // teardown it triggers runs outside the lock.
+                        let mut slot = self.reporter.lock().unwrap();
+                        if analytics::enabled() {
+                            *slot = Some(fresh);
+                        } else {
+                            drop(slot);
+                            drop(fresh);
+                        }
+                    }
+                }
                 // Dropping the last strong reference is what closes the client,
-                // ending the session and joining the transport thread.
-                (false, true) => *slot = None,
+                // ending the session and joining the transport thread. The
+                // guard is a temporary that dies at the end of the `let`, so
+                // that teardown runs *after* the lock is released — but it
+                // still blocks this thread, bounded at SHUTDOWN_TIMEOUT plus
+                // one in-flight request (~7–10 s against a blackholed
+                // network). Accepted: no thread may outlive the dylib (rule 2
+                // in the module docs), so handing the drop to a detached
+                // thread is not an option.
+                (false, true) => {
+                    let stale = self.reporter.lock().unwrap().take();
+                    drop(stale);
+                }
                 _ => {}
             }
         }
 
         /// Records what the report should say about *where* it happened. Both
-        /// values are already inside the analytics disclosure, so this adds no
-        /// new surface. Stored unconditionally — consent may arrive later, and
-        /// a report raised then should still say where it came from.
+        /// values are disclosed: sample rate already rides the analytics
+        /// payload, and the plugin format (VST3/CLAP) is named in the README
+        /// privacy table and the consent/settings copy. Stored
+        /// unconditionally — consent may arrive later, and a report raised
+        /// then should still say where it came from.
         pub fn set_host_context(&self, plugin_api: &str, sample_rate: f32) {
             // Poison-tolerant: the value is plain data, and one earlier
             // panic must not disable host tagging for the process's lifetime.

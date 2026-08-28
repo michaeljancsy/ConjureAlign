@@ -138,9 +138,11 @@ pub struct EditorState {
     spectrum_log: bool,
     spectrum_cache: Option<SpectrumCache>,
     /// Per-snapshot FFT-selector state (fit bound + GUI-side Welch
-    /// re-estimates). Self-invalidating on the snapshot pointer inside
-    /// `spectrum_view::show`, so it needs no entry in the snapshot-changed
-    /// block below.
+    /// re-estimates). Cleared in the snapshot-changed block like every other
+    /// cache: its own pointer check runs only while the Spectrum tab is
+    /// drawn, so it cannot be trusted to self-invalidate — a freed
+    /// snapshot's address can be reused by a later one (ABA) and would serve
+    /// stale spectra.
     spectrum_reestimates: Option<spectrum_view::SpectrumReestimates>,
     /// Last trim value this editor sent. `set_parameter` only queues the
     /// change until the audio thread drains the event queue, so the nudge
@@ -232,8 +234,11 @@ pub fn create(
                 state.corr_cache = None;
                 state.spec_view = SpecViewState::default();
                 state.spectrum_cache = None;
-                // (spectrum_reestimates self-invalidates on the snapshot
-                // pointer inside spectrum_view::show.)
+                // Explicitly, NOT left to spectrum_view's own pointer check:
+                // that check runs only while the Spectrum tab is drawn, and a
+                // freed snapshot's address can be reused by a later one (ABA)
+                // — which rendered an old capture's spectra as the new one's.
+                state.spectrum_reestimates = None;
             }
 
             ResizableWindow::new("conjure-align-resize")
@@ -446,6 +451,9 @@ fn net_shift(params: &ConjureAlignParams, shared: &GuiShared) -> (f32, bool) {
         return (0.0, false);
     }
     let raw = params.detected_offset_ms.load(Ordering::Relaxed) + params.trim.value();
+    // Mirrors the non-finite guard in `current_target()` (a generic-UI text
+    // entry can make `trim` NaN); the two must stay in sync.
+    let raw = if raw.is_finite() { raw } else { 0.0 };
     match active_window_ms(shared) {
         Some(w_ms) => {
             let clamped = raw.clamp(-w_ms, w_ms);
@@ -543,10 +551,10 @@ pub fn consent_modal(ctx: &egui::Context) {
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new(
-                "Sent: plugin version, operating system, sample rate, whether a capture \
-                 succeeded or why it was rejected, and whether a run ended in a crash. \
-                 A crash also sends the error and the ConjureAlign code that led to it \
-                 — labelled with a random ID.",
+                "Sent: plugin version and format (VST3/CLAP), operating system, sample \
+                 rate, whether a capture succeeded or why it was rejected, and whether \
+                 a run ended in a crash. A crash also sends the error and the \
+                 ConjureAlign code that led to it — labelled with a random ID.",
             )
             .small()
             .color(TEXT_DIM),
@@ -627,8 +635,9 @@ fn settings_menu(ui: &mut egui::Ui) {
                 }
                 ui.label(
                     egui::RichText::new(
-                        "Plugin version, OS, sample rate, capture outcomes and crash \
-                         reports, labelled with a random ID. Never your audio.",
+                        "Plugin version and format (VST3/CLAP), OS, sample rate, capture \
+                         outcomes and crash reports, labelled with a random ID. Never \
+                         your audio.",
                     )
                     .small()
                     .color(TEXT_DIM),
@@ -739,6 +748,11 @@ fn status_strip(
             }
             RejectReason::Silence => {
                 "Last capture rejected: input silent — is the sidechain connected and playing?"
+                    .to_string()
+            }
+            RejectReason::NonFinite => {
+                "Last capture rejected: the input contained non-finite samples (NaN/Inf) \
+                 — an upstream plugin may be misbehaving."
                     .to_string()
             }
             RejectReason::LowConfidence => {

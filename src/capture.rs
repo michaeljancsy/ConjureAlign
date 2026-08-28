@@ -12,9 +12,13 @@
 //! exactly while Armed); once Capturing, momentary gate closes pause writing
 //! but do NOT return to Armed — the gate state is separate display info. The
 //! audio thread only borrows `data` in Idle/Armed/Capturing; the background
-//! task only borrows it in Analyzing. The phases never overlap, so the
-//! `AtomicRefCell` borrows can never contend — a failed borrow would be a bug
-//! in the state machine, and `AtomicRefCell` panics loudly in that case.
+//! task only borrows it in Analyzing, so in steady state the `AtomicRefCell`
+//! borrows never contend. The one deliberate exception is `initialize()`
+//! reclaiming a wedged Analyzing phase (a lost or slow task): it bumps
+//! [`CaptureState::generation`] and probes with `try_borrow_mut`, and the
+//! task side takes its borrow with `try_borrow` and re-checks the generation
+//! inside it — so a collision resolves as "stale task exits" instead of the
+//! `AtomicRefCell` panic a plain borrow would raise across the FFI boundary.
 //!
 //! The GUI thread is deliberately NOT part of this scheme: the editor only
 //! ever holds a [`CaptureHandle`], which exposes the atomics but cannot reach
@@ -22,7 +26,7 @@
 //! publishes (see `shared.rs`), never by borrowing these buffers.
 
 use atomic_refcell::AtomicRefCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 pub const PHASE_IDLE: u8 = 0;
@@ -44,6 +48,11 @@ pub const MAX_SPLICES: usize = 64;
 
 pub struct CaptureState {
     pub phase: AtomicU8,
+    /// Bumped by `initialize()` when it reclaims a wedged Analyzing phase
+    /// before reallocating the buffers. Every queued analysis task carries
+    /// the value current at dispatch and exits without touching `data` when
+    /// it no longer matches — see the module docs.
+    pub generation: AtomicU64,
     /// GUI capture request. `process()` consumes (swaps to false) this every
     /// block and treats a `true` like a rising edge on the `capture` param;
     /// a request that races a non-idle phase is simply dropped. `reset()`
@@ -148,6 +157,7 @@ impl CaptureState {
     pub fn new() -> Self {
         Self {
             phase: AtomicU8::new(PHASE_IDLE),
+            generation: AtomicU64::new(0),
             request: AtomicBool::new(false),
             stop_request: AtomicBool::new(false),
             gate_state: AtomicU8::new(0),
@@ -168,7 +178,14 @@ impl CaptureState {
     /// Sizes the buffers for the longest possible capture. Called from
     /// `initialize()` (allocation is allowed there), never from `process()`.
     pub fn allocate(&self, max_len: usize, sample_rate: f32) {
-        let mut data = self.data.borrow_mut();
+        Self::allocate_locked(&mut self.data.borrow_mut(), max_len, sample_rate);
+    }
+
+    /// [`Self::allocate`] through a borrow the caller already holds — the
+    /// reclaim path in `initialize()` must not release its probe borrow
+    /// before resizing (a raced stale task's `try_borrow` could land in the
+    /// gap and collide with a fresh `borrow_mut`).
+    pub fn allocate_locked(data: &mut CaptureData, max_len: usize, sample_rate: f32) {
         data.main.clear();
         data.main.resize(max_len, 0.0);
         data.reference.clear();

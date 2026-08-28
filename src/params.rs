@@ -29,6 +29,24 @@ pub const GATE_THRESHOLD_MAX_DB: f32 = -30.0;
 /// sample rates and the 4 s capture cap).
 pub const SPECTRUM_NFFT_OPTIONS: [u32; 6] = [1024, 2048, 4096, 8192, 16384, 32768];
 
+/// The callback type `FloatParam::with_string_to_value` takes.
+type StringToValue = Arc<dyn Fn(&str) -> Option<f32> + Send + Sync>;
+
+/// The default text parser plus a finiteness gate. Hosts' generic UIs feed
+/// typed text straight through, the stock parser accepts a literal "NaN", and
+/// the range clamps propagate non-finite values instead of rescuing them —
+/// `current_target()` guards the DSP side; this closes the door at entry.
+fn finite_parser(unit: &'static str) -> StringToValue {
+    Arc::new(move |s| {
+        s.trim()
+            .trim_end_matches(unit)
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+    })
+}
+
 #[derive(Enum, Debug, PartialEq, Clone, Copy)]
 pub enum PolarityMode {
     /// Follow the polarity found by analysis.
@@ -119,7 +137,8 @@ impl Default for ConjureAlignParams {
                 },
             )
             .with_unit(" ms")
-            .with_step_size(0.01),
+            .with_step_size(0.01)
+            .with_string_to_value(finite_parser(" ms")),
             max_shift: FloatParam::new(
                 "Max Shift",
                 50.0,
@@ -130,6 +149,7 @@ impl Default for ConjureAlignParams {
             )
             .with_unit(" ms")
             .with_step_size(1.0)
+            .with_string_to_value(finite_parser(" ms"))
             .non_automatable(),
             gate_threshold: FloatParam::new(
                 "Gate",
@@ -141,6 +161,7 @@ impl Default for ConjureAlignParams {
             )
             .with_unit(" dB")
             .with_step_size(1.0)
+            .with_string_to_value(finite_parser(" dB"))
             .non_automatable(),
             detected_offset_ms: Arc::new(AtomicF32::new(0.0)),
             detected_polarity: Arc::new(AtomicBool::new(false)),

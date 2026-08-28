@@ -52,6 +52,17 @@ pub struct ConjureAlign {
     /// transition with samples already written marks a splice seam.
     prev_record: bool,
     last_latency: u32,
+    /// `(sample_rate, channels)` of the last full `initialize()` whose
+    /// buffers actually match it (the keep-buffers arm clears this so the
+    /// deferred reallocation really happens next time). Hosts re-run
+    /// `initialize()` on every state load while holding the lock `process()`
+    /// takes each block; when neither value changed, the delay-line rebuild
+    /// and the ~12 MB buffer reallocation are skipped so that path cannot
+    /// cause an audible dropout. Latency is deliberately NOT part of the
+    /// key: nothing in the skipped block depends on it (the delay line is
+    /// sized for the parameter maxima) and it is re-reported unconditionally
+    /// below, so a Max Shift edit must not force a pointless reallocation.
+    active_config: Option<(f32, usize)>,
     /// Opt-in usage analytics. Inert until the user consents; never touched
     /// from `process()`.
     analytics: Arc<analytics::AnalyticsHandle>,
@@ -62,7 +73,11 @@ pub struct ConjureAlign {
 }
 
 pub enum Task {
-    Analyze,
+    /// Analyze the just-finished capture. Carries the capture generation
+    /// current at dispatch: a task that runs after `initialize()` has
+    /// reclaimed the phase and replaced the buffers is stale and must not
+    /// touch them (see `capture.rs`).
+    Analyze { generation: u64 },
 }
 
 /// Packs the gate status into the display bitfield the editor reads
@@ -87,6 +102,7 @@ impl Default for ConjureAlign {
             prev_capture: false,
             prev_record: false,
             last_latency: 0,
+            active_config: None,
             analytics: Arc::new(analytics::AnalyticsHandle::new()),
             crash: Arc::new(crash::CrashHandle::new()),
         }
@@ -124,6 +140,12 @@ impl ConjureAlign {
         }
         let offset_ms = self.params.detected_offset_ms.load(Ordering::Relaxed)
             + self.params.trim.value();
+        // A host's generic UI can feed a literal NaN into `trim` (the default
+        // text parser accepts it and the range clamps propagate rather than
+        // rescue it), and `clamp()` below passes NaN straight through into
+        // the tap — which would pin the shift to −window and restart the
+        // crossfade every block. Mirrored in `editor::net_shift`.
+        let offset_ms = if offset_ms.is_finite() { offset_ms } else { 0.0 };
         let max_shift = self.reported_window_samples() as f64;
         let offset = (offset_ms as f64 / 1000.0 * self.sample_rate as f64)
             .clamp(-max_shift, max_shift);
@@ -137,6 +159,154 @@ impl ConjureAlign {
             inverted,
         }
     }
+}
+
+/// The body of [`Task::Analyze`]: analyzes the finished capture and publishes
+/// the results. Background thread only (see `task_executor` for the unwind
+/// containment around it).
+///
+/// Returns the analytics event for the CALLER to send after the
+/// `catch_unwind`: nothing in here may run after the phase release — a panic
+/// past it would reach the repair arm while a same-generation successor
+/// could already own ANALYZING. `None` means a stale/blocked early exit with
+/// nothing to report.
+fn analyze_and_publish(
+    generation: u64,
+    capture: &CaptureState,
+    params: &ConjureAlignParams,
+    shared: &GuiShared,
+) -> Option<analytics::AnalyticsEvent> {
+    // Long-stale tasks — their capture was reclaimed by a later
+    // `initialize()` — must exit BEFORE borrowing anything: after a reclaim
+    // the audio thread may already be recording a new capture, and even this
+    // task's transient read borrow could collide with its `borrow_mut`. No
+    // phase repair either: any ANALYZING visible now belongs to a successor.
+    if capture.generation.load(Ordering::Acquire) != generation {
+        return None;
+    }
+    // Built inside the borrow below, sent by the caller after it drops:
+    // serializing and queueing an event is cheap, but it has no business
+    // happening while the capture buffers are borrowed.
+    let event;
+    // Everything that reads `data` stays inside this scope; the snapshot
+    // mutex is deliberately touched only AFTER the borrow drops. The GUI
+    // locks that mutex every frame, and blocking here while holding the
+    // borrow would extend the window in which `initialize()`'s reallocation
+    // could contend with it.
+    let snapshot = {
+        // `try_borrow`, not `borrow`: a failure means `initialize()` holds
+        // the buffers (its probe, or the reallocation through the held
+        // probe guard) — it bumped the generation before taking them and
+        // reclaims the phase itself. Exit without touching either.
+        let Ok(data) = capture.data.try_borrow() else {
+            return None;
+        };
+        // Re-checked INSIDE the borrow: the bump can land between the
+        // pre-borrow check and this borrow. In that instruction-scale window
+        // no successor capture can exist yet (arming one needs at least the
+        // gate's 250 ms hold), so the ANALYZING this CAS releases is provably
+        // this task's own — and when `initialize()`'s probe found us holding
+        // the borrow (its keep-buffers arm), this CAS is the only thing that
+        // un-wedges the phase.
+        if capture.generation.load(Ordering::Acquire) != generation {
+            drop(data);
+            let _ = capture.phase.compare_exchange(
+                PHASE_ANALYZING,
+                PHASE_IDLE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return None;
+        }
+        let report = analysis::analyze_spliced(
+            &data.main[..data.filled],
+            &data.reference[..data.filled],
+            data.max_shift_samples,
+            &data.splices,
+        );
+        match report.outcome {
+            Ok(result) => {
+                let offset_ms =
+                    (result.offset_samples / data.sample_rate as f64 * 1000.0) as f32;
+                params
+                    .detected_offset_ms
+                    .store(offset_ms, Ordering::Relaxed);
+                params
+                    .detected_polarity
+                    .store(result.inverted, Ordering::Relaxed);
+                params
+                    .detected_confidence
+                    .store(result.confidence, Ordering::Relaxed);
+                nih_log!(
+                    "ConjureAlign: detected offset {:.3} ms ({:.2} samples), \
+                     polarity {}, confidence {:.2}",
+                    offset_ms,
+                    result.offset_samples,
+                    if result.inverted { "inverted" } else { "normal" },
+                    result.confidence
+                );
+                event = analytics::AnalyticsEvent::CaptureCompleted {
+                    confidence: result.confidence,
+                    offset_ms,
+                };
+            }
+            Err(reason) => {
+                nih_log!(
+                    "ConjureAlign: analysis rejected ({:?}); keeping previous offset",
+                    reason
+                );
+                event = analytics::AnalyticsEvent::CaptureRejected { reason };
+            }
+        }
+        // Freeze everything the GUI needs. Copying here — on the
+        // background thread, inside the Analyzing phase where this
+        // task owns the borrow — is the only path waveform data
+        // ever takes to the editor.
+        // Honor the panel's persisted FFT-size selection so a
+        // fresh snapshot already matches it; the GUI only
+        // re-estimates when the selector changes afterwards.
+        let nfft_override = match params.spectrum_nfft.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n as usize),
+        };
+        let spectrum = spectrum::welch_for_capture(
+            &data.main[..data.filled],
+            &data.reference[..data.filled],
+            data.sample_rate,
+            &report,
+            &data.splices,
+            nfft_override,
+        );
+        Arc::new(AnalysisSnapshot {
+            main: data.main[..data.filled].to_vec(),
+            reference: data.reference[..data.filled].to_vec(),
+            sample_rate: data.sample_rate,
+            max_shift_samples: report.max_shift_samples,
+            corr: report.corr_curve,
+            splices: data.splices.clone(),
+            spectrum,
+            outcome: report.outcome,
+        })
+    };
+    *shared
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+    // A CAS, not a blind store — and deliberately NOT generation-guarded.
+    // The publish above can block briefly on the GUI-contended mutex, and a
+    // slow-path `initialize()` landing in that gap may have reclaimed the
+    // phase and let a new capture start: a blind IDLE store would stomp its
+    // ARMED/CAPTURING. The phase VALUE is the discriminator (a successor
+    // cannot reach ANALYZING inside a microseconds-wide gap), while a
+    // generation guard would wrongly refuse to release our own phase after
+    // a keep-buffers `initialize()` bumped mid-analysis.
+    let _ = capture.phase.compare_exchange(
+        PHASE_ANALYZING,
+        PHASE_IDLE,
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+    );
+    Some(event)
 }
 
 impl Plugin for ConjureAlign {
@@ -197,100 +367,48 @@ impl Plugin for ConjureAlign {
         let shared = self.shared.clone();
         let analytics = self.analytics.clone();
         Box::new(move |task| match task {
-            Task::Analyze => {
+            Task::Analyze { generation } => {
                 // Everything below runs on nih-plug's shared `bg-worker`
                 // thread, which serves every plugin instance in the process.
                 // The guard is what tells the panic hook that a panic on this
                 // thread right now is ours and not another plugin's.
                 let _scope = crash::scope();
-                // Built inside the borrow below, sent after it drops:
-                // serializing and queueing an event is cheap, but it has no
-                // business happening while the capture buffers are borrowed.
-                let event;
-                // Everything that reads `data` stays inside this scope; the
-                // snapshot mutex is deliberately touched only AFTER the
-                // borrow drops. The GUI locks that mutex every frame, and
-                // blocking here while holding the borrow would extend the
-                // window in which `initialize()`'s `allocate()` could
-                // collide with it.
-                let snapshot = {
-                    let data = capture.data.borrow();
-                    let report = analysis::analyze_spliced(
-                        &data.main[..data.filled],
-                        &data.reference[..data.filled],
-                        data.max_shift_samples,
-                        &data.splices,
-                    );
-                    match report.outcome {
-                        Ok(result) => {
-                            let offset_ms =
-                                (result.offset_samples / data.sample_rate as f64 * 1000.0) as f32;
-                            params
-                                .detected_offset_ms
-                                .store(offset_ms, Ordering::Relaxed);
-                            params
-                                .detected_polarity
-                                .store(result.inverted, Ordering::Relaxed);
-                            params
-                                .detected_confidence
-                                .store(result.confidence, Ordering::Relaxed);
-                            nih_log!(
-                                "ConjureAlign: detected offset {:.3} ms ({:.2} samples), \
-                                 polarity {}, confidence {:.2}",
-                                offset_ms,
-                                result.offset_samples,
-                                if result.inverted { "inverted" } else { "normal" },
-                                result.confidence
+                // The worker loop upstream has no unwind containment: a panic
+                // escaping here kills the one thread every instance in the
+                // process shares (all later captures would be dropped
+                // silently), and the host then aborts at teardown when the
+                // worker's Drop send/join hits the dead thread. The panic
+                // hook has already reported by the time the unwind lands
+                // here; swallow it and repair the phase machine.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    analyze_and_publish(generation, &capture, &params, &shared)
+                })) {
+                    // Tracked out here so nothing inside the caught closure
+                    // runs after the phase release — the repair arm's
+                    // generation guard below depends on that ordering.
+                    Ok(Some(event)) => analytics.track(event),
+                    Ok(None) => {}
+                    Err(_) => {
+                        // The borrow guard was released during the unwind.
+                        // Generation-guarded: the panic hook can flush for up
+                        // to 2 s before the unwind lands here — time enough
+                        // for a reclaim plus a whole successor capture — and
+                        // an unchanged generation is what proves no reclaim
+                        // happened, i.e. any ANALYZING is still ours. If the
+                        // guard refuses, the next slow-path initialize()
+                        // reclaims instead (the keep-buffers arm that bumped
+                        // it also cleared active_config, so one is coming).
+                        if capture.generation.load(Ordering::Acquire) == generation {
+                            let _ = capture.phase.compare_exchange(
+                                PHASE_ANALYZING,
+                                PHASE_IDLE,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
                             );
-                            event = analytics::AnalyticsEvent::CaptureCompleted {
-                                confidence: result.confidence,
-                                offset_ms,
-                            };
                         }
-                        Err(reason) => {
-                            nih_log!(
-                                "ConjureAlign: analysis rejected ({:?}); keeping previous offset",
-                                reason
-                            );
-                            event = analytics::AnalyticsEvent::CaptureRejected { reason };
-                        }
+                        crash::report_issue("analysis task panicked; capture state repaired");
                     }
-                    // Freeze everything the GUI needs. Copying here — on the
-                    // background thread, inside the Analyzing phase where this
-                    // task owns the borrow — is the only path waveform data
-                    // ever takes to the editor.
-                    // Honor the panel's persisted FFT-size selection so a
-                    // fresh snapshot already matches it; the GUI only
-                    // re-estimates when the selector changes afterwards.
-                    let nfft_override = match params.spectrum_nfft.load(Ordering::Relaxed) {
-                        0 => None,
-                        n => Some(n as usize),
-                    };
-                    let spectrum = spectrum::welch_for_capture(
-                        &data.main[..data.filled],
-                        &data.reference[..data.filled],
-                        data.sample_rate,
-                        &report,
-                        &data.splices,
-                        nfft_override,
-                    );
-                    Arc::new(AnalysisSnapshot {
-                        main: data.main[..data.filled].to_vec(),
-                        reference: data.reference[..data.filled].to_vec(),
-                        sample_rate: data.sample_rate,
-                        max_shift_samples: report.max_shift_samples,
-                        corr: report.corr_curve,
-                        splices: data.splices.clone(),
-                        spectrum,
-                        outcome: report.outcome,
-                    })
-                };
-                *shared
-                    .snapshot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
-                capture.phase.store(PHASE_IDLE, Ordering::Release);
-                analytics.track(event);
+                }
             }
         })
     }
@@ -308,38 +426,114 @@ impl Plugin for ConjureAlign {
             .main_input_channels
             .map(|c| c.get())
             .unwrap_or(2) as usize;
+        let latency = self.latency_samples();
 
-        // Size everything for the parameter maxima so no later change ever
-        // allocates on the audio thread.
-        let max_shift_max =
-            (MAX_SHIFT_MAX_MS / 1000.0 * self.sample_rate).ceil() as usize;
-        let trim_max = (TRIM_RANGE_MS / 1000.0 * self.sample_rate).ceil() as usize;
-        let max_delay = 2 * max_shift_max + trim_max + FIR_CENTER + 1;
-        let fade_len = (CROSSFADE_SECONDS * self.sample_rate) as usize;
-        self.delay = AlignDelay::new(channels, max_delay, fade_len);
+        // Hosts re-run initialize() on every state load (preset browsing,
+        // undo), holding the same lock process() takes each block — so an
+        // unchanged configuration must not rebuild the delay line or
+        // reallocate ~12 MB of capture buffers on that path (an audible
+        // dropout during playback; upstream's own FIXME makes re-init
+        // lightness the plugin's responsibility). Everything skipped below
+        // depends only on this triple.
+        let fast = self.active_config == Some((self.sample_rate, channels));
 
-        // An in-flight analysis holds a borrow of the capture buffers on the
-        // background thread, and `allocate()`'s `borrow_mut()` would panic
-        // across the FFI boundary if it collided (hosts re-run initialize()
-        // after state loads with no task drain). Analysis takes tens of
-        // milliseconds — wait it out, bounded in case something is wedged.
-        let mut wedged = true;
-        for _ in 0..500 {
-            if self.capture.phase.load(Ordering::Acquire) != PHASE_ANALYZING {
-                wedged = false;
-                break;
+        if !fast {
+            // Size everything for the parameter maxima so no later change ever
+            // allocates on the audio thread.
+            let max_shift_max =
+                (MAX_SHIFT_MAX_MS / 1000.0 * self.sample_rate).ceil() as usize;
+            let trim_max = (TRIM_RANGE_MS / 1000.0 * self.sample_rate).ceil() as usize;
+            let max_delay = 2 * max_shift_max + trim_max + FIR_CENTER + 1;
+            let fade_len = (CROSSFADE_SECONDS * self.sample_rate) as usize;
+            self.delay = AlignDelay::new(channels, max_delay, fade_len);
+
+            // An in-flight analysis holds a borrow of the capture buffers on
+            // the background thread, and `allocate()`'s `borrow_mut()` would
+            // panic across the FFI boundary if it collided (hosts re-run
+            // initialize() after state loads with no task drain). Give it a
+            // bounded head start — analysis usually finishes in well under
+            // this at common rates, though a 192 kHz capture (or a queue of
+            // other instances' analyses on the shared worker) can outlast it.
+            let mut analyzing = true;
+            for _ in 0..500 {
+                if self.capture.phase.load(Ordering::Acquire) != PHASE_ANALYZING {
+                    analyzing = false;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            let mut keep_buffers = false;
+            let mut reallocated = false;
+            if analyzing {
+                // Invalidate any not-yet-started task BEFORE probing the
+                // borrow: a task re-checks the generation before AND inside
+                // its borrow, so after this bump it can no longer touch
+                // buffers we are about to replace (see capture.rs).
+                self.capture.generation.fetch_add(1, Ordering::AcqRel);
+                match self.capture.data.try_borrow_mut() {
+                    Ok(mut guard) => {
+                        // No task holds the borrow: it is queued behind other
+                        // instances' work on the shared worker, or lost (a
+                        // dropped dispatch). Reallocate THROUGH the held
+                        // guard — dropping it and re-borrowing inside
+                        // `allocate()` would leave a gap for a raced stale
+                        // task's `try_borrow` to land in — then reclaim the
+                        // phase so Capture doesn't stay disabled forever;
+                        // the stale task exits on its generation checks.
+                        CaptureState::allocate_locked(
+                            &mut guard,
+                            CAPTURE_MAX_SECS * self.sample_rate as usize,
+                            self.sample_rate,
+                        );
+                        drop(guard);
+                        reallocated = true;
+                        let _ = self.capture.phase.compare_exchange(
+                            PHASE_ANALYZING,
+                            PHASE_IDLE,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        );
+                        nih_log!(
+                            "ConjureAlign: reclaimed a queued/lost analysis task after 500 ms"
+                        );
+                        crash::report_issue(
+                            "initialize(): reclaimed a queued/lost analysis task",
+                        );
+                    }
+                    Err(_) => {
+                        // The task is actively mid-analysis. Leave the buffers
+                        // to it: its results were computed against them and
+                        // stay valid, and skipping the reallocation is what
+                        // keeps its borrow uncontended (the pre-fix behavior
+                        // here was to proceed into a guaranteed AtomicRefCell
+                        // panic). The next capture arm rewrites
+                        // `data.sample_rate`; the only residue is a buffer
+                        // still sized for the previous rate — a shorter next
+                        // capture, corrected by the next quiet initialize().
+                        keep_buffers = true;
+                        nih_log!(
+                            "ConjureAlign: analysis still running after 500 ms; \
+                             keeping its buffers and skipping reallocation"
+                        );
+                    }
+                }
+            }
+            if !keep_buffers && !reallocated {
+                self.capture
+                    .allocate(CAPTURE_MAX_SECS * self.sample_rate as usize, self.sample_rate);
+            }
+            // Recorded only when the buffers really match this config: the
+            // keep-buffers arm leaves them sized for the previous rate, and
+            // recording it would let the fast path skip the reallocation
+            // that is supposed to correct them (a 192→44.1 kHz session
+            // would capture ~17 s instead of 4 forever after).
+            self.active_config = if keep_buffers {
+                None
+            } else {
+                Some((self.sample_rate, channels))
+            };
         }
-        if wedged {
-            // The spin above is the guard against `allocate()`'s `borrow_mut()`
-            // colliding with the background task's borrow. Reaching the end of
-            // it still holding PHASE_ANALYZING means the guard has failed and
-            // the `AtomicRefCell` panic — across the FFI boundary — is the next
-            // thing that happens. It is invisible in the field otherwise.
-            nih_log!("ConjureAlign: analysis still running after 500 ms; proceeding anyway");
-            crash::report_issue("initialize(): capture buffers still borrowed after 500 ms");
-        }
+
         // Drop any stale GUI capture/stop request and progress so a click
         // made while the host wasn't processing can't fire a surprise
         // capture on the first block, and the editor can't show a stale
@@ -349,10 +543,7 @@ impl Plugin for ConjureAlign {
         self.capture.gate_state.store(0, Ordering::Relaxed);
         self.capture.progress.store(0, Ordering::Relaxed);
         self.capture.target.store(0, Ordering::Relaxed);
-        self.capture
-            .allocate(CAPTURE_MAX_SECS * self.sample_rate as usize, self.sample_rate);
 
-        let latency = self.latency_samples();
         context.set_latency_samples(latency);
         self.last_latency = latency;
 
@@ -468,7 +659,9 @@ impl Plugin for ConjureAlign {
                 )
                 .is_ok()
             {
-                context.execute_background(Task::Analyze);
+                context.execute_background(Task::Analyze {
+                    generation: self.capture.generation.load(Ordering::Relaxed),
+                });
             }
         }
 
@@ -587,7 +780,9 @@ impl Plugin for ConjureAlign {
                     )
                     .is_ok()
             {
-                context.execute_background(Task::Analyze);
+                context.execute_background(Task::Analyze {
+                    generation: self.capture.generation.load(Ordering::Relaxed),
+                });
             }
         }
 

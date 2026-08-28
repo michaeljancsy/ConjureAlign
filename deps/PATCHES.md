@@ -47,7 +47,7 @@ track.** That was the reported symptom.
 | `src/clap_proxy.h` | Hold `_audioports_config` in `ClapPluginExtensions`. |
 | `src/clap_proxy.cpp` | Fetch it with `getExtension(..., CLAP_EXT_AUDIO_PORTS_CONFIG)`. |
 | `src/detail/auv2/auv2_base_classes.h` | Declare `WrapAsAUV2::selectAudioPortsConfigForMain`. |
-| `src/wrapasauv2.cpp` | `SupportedNumChannels` builds `AUChannelInfo` from *every* config; `ValidFormat` also accepts a main-bus width belonging to any config, and accepts any width on a sidechain bus; `ChangeStreamFormat` and `Initialize` select the matching config, and selection is skipped when the plugin already presents that width. |
+| `src/wrapasauv2.cpp` | `SupportedNumChannels` builds `AUChannelInfo` from *every* config; `ValidFormat` also accepts a main-bus width belonging to any config, and accepts any width on a sidechain bus; `ChangeStreamFormat` and `Initialize` select the matching config, selection is skipped when the plugin already presents that width, and a select that goes through snapshots every element's width around `setupAudioBusses()` and fires the `PropertyChanged(kAudioUnitProperty_StreamFormat, …)` that raw re-setup never emits. |
 | `src/detail/auv2/auv2_base_classes.h` | `StreamFormatWritable` returns `!IsInitialized()` (was unconditional `true`), so formats cannot change on a running unit. |
 | `src/detail/auv2/process.cpp` | Value-initialize the substitute silent buffers, so an unconnected bus really does read as silence. |
 | `build.rs` | Add `rerun-if-changed` for the vendored C++ (see below). |
@@ -73,9 +73,23 @@ freeing element buffers under a live render thread.
 
 `selectAudioPortsConfigForMain` returns early when the plugin already presents the requested
 main width. Re-selecting the current config is not a no-op: it re-runs `setupAudioBusses()`,
-which rewrites every element's stream format through `SetStreamFormat` without a
-`PropertyChanged`, so it would silently revert a sidechain width the host set and was told was
-accepted. `Initialize()` and sample-rate-only sets both arrive with the config already correct.
+which would revert a sidechain width the host set and was told was accepted. `Initialize()`
+and sample-rate-only sets both arrive with the config already correct.
+
+A select that *does* go through re-runs `setupAudioBusses()` too, and there the rewrite is the
+point — a genuine mono↔stereo main switch snaps the sidechain to the new config's width. But
+`addInputBus`/`addOutputBus` write those formats through raw `AUIOElement::SetStreamFormat`,
+which is only half of AUSDK's own dispatch: `AUBase::ChangeStreamFormat` is `SetStreamFormat`
+*plus* `PropertyChanged(kAudioUnitProperty_StreamFormat, scope, element)`. A host that
+negotiated a width (and heard noErr for it) must learn when the AU rewrites it — otherwise it
+keeps rendering with the stale format, `PullInput` fails against the changed element, and the
+wrapper substitutes silence on that bus with nothing anywhere saying why (for ConjureAlign:
+the capture is forever rejected as "ref quiet"). So the select path snapshots every input and
+output element's channel count before `setupAudioBusses()` and fires the missing
+`PropertyChanged` for each element whose count changed afterwards — including indices present
+in only one snapshot, since a config switch can change the element count (for a vanished
+index, the old index is the only address the host knows the element by). Unchanged elements
+announce nothing, so a re-setup that moves nothing stays quiet.
 
 **`build.rs` only declared `rerun-if-changed=build.rs`.** Editing the vendored C++ therefore
 did not rebuild anything: cargo reported `Finished` in 0.1s and you kept testing the previous
