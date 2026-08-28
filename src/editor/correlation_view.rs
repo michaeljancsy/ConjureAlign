@@ -141,11 +141,13 @@ pub fn show(
 
     // Resolve the view, then apply this frame's gestures to it.
     let (mut x0, mut span_ms) = match vs.view {
-        Some((s, sp)) => {
-            let sp = sp.clamp(min_span_ms, 2.0 * full_ms);
-            (s.clamp(-full_ms, full_ms - sp), sp)
+        // Ordered bounds only, and non-finite dropped rather than clamped —
+        // see the matching note in `spectrum_view`.
+        Some((s, sp)) if s.is_finite() && sp.is_finite() => {
+            let sp = sp.clamp(min_span_ms.min(2.0 * full_ms), 2.0 * full_ms);
+            (s.clamp(-full_ms, (full_ms - sp).max(-full_ms)), sp)
         }
-        None => (-full_ms, 2.0 * full_ms),
+        _ => (-full_ms, 2.0 * full_ms),
     };
     if response.hovered() {
         let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));

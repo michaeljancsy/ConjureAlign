@@ -267,11 +267,16 @@ pub fn show(
     // pan/zoom operates in ln-f space on the log axis so gestures feel
     // uniform across the decades.
     let (mut v_lo, mut v_hi) = match vs.view {
-        Some((lo, hi)) => {
-            let lo = lo.clamp(base_lo, base_hi);
-            (lo, hi.clamp(lo + 1e-6, base_hi))
+        // Ordered bounds only: `lo + 1e-6` exceeds `base_hi` for a stored view
+        // sitting at the top of the range (or one stored before the sample
+        // rate dropped), and `clamp` panics on `min > max`. Non-finite is
+        // dropped rather than clamped — NaN survives `clamp` and would reach
+        // the next frame's bounds.
+        Some((lo, hi)) if lo.is_finite() && hi.is_finite() => {
+            let lo = lo.clamp(base_lo, (base_hi - 1e-6).max(base_lo));
+            (lo, hi.clamp((lo + 1e-6).min(base_hi), base_hi))
         }
-        None => (base_lo, base_hi),
+        _ => (base_lo, base_hi),
     };
     if response.hovered() {
         let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));
