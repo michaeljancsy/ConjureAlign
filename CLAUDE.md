@@ -123,13 +123,16 @@ hardenings guard that discipline where hosts stress it: `Task::Analyze` carries 
 nih-plug's process-shared worker and abort the host at teardown — see Known upstream issues),
 taking its borrow with `try_borrow` and re-checking the generation inside it; and
 `initialize()` — which hosts re-run on every state load while holding the same lock
-`process()` takes — takes a fast path when (rate, channels, latency) are unchanged (no
-delay-line rebuild, no ~12 MB reallocation, no wait), and otherwise waits up to 500 ms for an
-in-flight analysis, then either reclaims a queued/lost task (generation bump +
-`try_borrow_mut` probe → phase back to Idle; the stale task exits on its in-borrow generation
-check) or, if the task actively holds the borrow, keeps the existing buffers and skips the
-reallocation so the task finishes with valid results — no interleaving reaches the
-`AtomicRefCell` panic. On stop
+`process()` takes — takes a fast path when (rate, channels) are unchanged (no delay-line
+rebuild, no ~12 MB reallocation, no wait; latency is deliberately not in the key and is
+re-reported either way), and otherwise waits up to 500 ms for an in-flight analysis, then
+either reclaims a queued/lost task (generation bump + `try_borrow_mut` probe, reallocating
+THROUGH the held guard → phase back to Idle; a stale task exits on its pre-borrow and
+in-borrow generation checks) or, if the task actively holds the borrow, keeps the existing
+buffers — clearing the fast-path key so the deferred reallocation really happens next time —
+and the task finishes with valid results. No interleaving reaches the `AtomicRefCell` panic,
+and every phase release on the task side is either value-checked (CAS from Analyzing only)
+or generation-guarded, so a stale task can never demote a successor capture's phase. On stop
 with data, `context.execute_background(Task::Analyze { generation })` → the `task_executor()` closure (owns
 Arc clones) runs `analyze_spliced` (zeroes ±max_shift guard regions around each seam in both
 working copies — exactly the cross-seam products — before the FFT cross-correlation), refines

@@ -361,6 +361,22 @@ mod imp {
         if let Some(existing) = slot.upgrade() {
             return Some(existing);
         }
+        // A failed init retries, but not at the editor's frame rate: every
+        // attempt builds the TLS agent, spawns and joins a transport thread,
+        // and panics through nih-plug's logging hook (a backtrace per try) —
+        // a 60 Hz churn loop on exactly the thread-starved machine that made
+        // init fail. One attempt per backoff interval keeps the eventual
+        // recovery that not latching failures off for the process buys.
+        const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+        static LAST_FAILURE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        {
+            let last = LAST_FAILURE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if last.is_some_and(|t| t.elapsed() < RETRY_BACKOFF) {
+                return None;
+            }
+        }
         // `sentry::init` spawns two threads — the transport worker and the
         // session flusher — and both spawns `.unwrap()`, so on a machine out
         // of threads this is a *panic*, raised on whichever host thread is
@@ -371,6 +387,10 @@ mod imp {
         let guard = match catch_unwind(AssertUnwindSafe(|| sentry::init(options()))) {
             Ok(guard) => guard,
             Err(_) => {
+                *LAST_FAILURE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(std::time::Instant::now());
                 // Once per process: the editor re-syncs every frame, and a
                 // persistent failure must not flood the log at frame rate.
                 static WARNED: Once = Once::new();
@@ -433,7 +453,20 @@ mod imp {
                 // Arc it already holds.
                 (true, false) => {
                     if let Some(fresh) = reporter() {
-                        *self.reporter.lock().unwrap() = Some(fresh);
+                        // Re-checked under the re-lock: a decline can land
+                        // while `reporter()` was building (two thread spawns
+                        // plus TLS agent construction), and an editor-less
+                        // instance would otherwise stay armed — client,
+                        // session and all — with consent declined on disk.
+                        // The discarded `fresh` drops after the guard, so any
+                        // teardown it triggers runs outside the lock.
+                        let mut slot = self.reporter.lock().unwrap();
+                        if analytics::enabled() {
+                            *slot = Some(fresh);
+                        } else {
+                            drop(slot);
+                            drop(fresh);
+                        }
                     }
                 }
                 // Dropping the last strong reference is what closes the client,

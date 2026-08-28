@@ -635,8 +635,9 @@ fn settings_menu(ui: &mut egui::Ui) {
                 }
                 ui.label(
                     egui::RichText::new(
-                        "Plugin version and format, OS, sample rate, capture outcomes \
-                         and crash reports, labelled with a random ID. Never your audio.",
+                        "Plugin version and format (VST3/CLAP), OS, sample rate, capture \
+                         outcomes and crash reports, labelled with a random ID. Never \
+                         your audio.",
                     )
                     .small()
                     .color(TEXT_DIM),

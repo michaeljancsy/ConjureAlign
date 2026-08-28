@@ -178,7 +178,14 @@ impl CaptureState {
     /// Sizes the buffers for the longest possible capture. Called from
     /// `initialize()` (allocation is allowed there), never from `process()`.
     pub fn allocate(&self, max_len: usize, sample_rate: f32) {
-        let mut data = self.data.borrow_mut();
+        Self::allocate_locked(&mut self.data.borrow_mut(), max_len, sample_rate);
+    }
+
+    /// [`Self::allocate`] through a borrow the caller already holds — the
+    /// reclaim path in `initialize()` must not release its probe borrow
+    /// before resizing (a raced stale task's `try_borrow` could land in the
+    /// gap and collide with a fresh `borrow_mut`).
+    pub fn allocate_locked(data: &mut CaptureData, max_len: usize, sample_rate: f32) {
         data.main.clear();
         data.main.resize(max_len, 0.0);
         data.reference.clear();

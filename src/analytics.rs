@@ -392,9 +392,11 @@ pub fn parse_endpoint(url: &str) -> Option<Endpoint> {
 /// narrow exception to rule 3 ("no thread outlives the dylib"), the same
 /// trade ureq's resolver makes. The lingering thread holds no plugin state
 /// and ends with one channel send nobody hears; the theoretical hazard is
-/// the dylib unmapping underneath it, but Rust cdylibs carry thread-locals,
-/// which dyld pins for the life of the process on macOS. The alternative —
-/// joining it — is the certain unload hang this exists to remove.
+/// the dylib unmapping underneath it, but this cdylib cannot unload on
+/// macOS — clap-wrapper's ObjC class registration marks the image
+/// never-unload (verified in the built bundle), with the cdylib's
+/// thread-locals as a second pin. The alternative — joining it — is the
+/// certain unload hang this exists to remove.
 fn resolve_bounded(host: &str, port: u16, timeout: Duration) -> std::io::Result<Vec<SocketAddr>> {
     // An IP literal never touches the resolver (tests, local sinks): no
     // thread needed.
@@ -453,7 +455,16 @@ fn post(endpoint: &Endpoint, body: &str) -> std::io::Result<String> {
     // would otherwise never deliver a single event.
     let mut stream = Err(std::io::Error::other("no address for analytics host"));
     for addr in resolve_bounded(&endpoint.host, endpoint.port, CONNECT_TIMEOUT)? {
-        stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT);
+        // The 10 s deadline must bound this loop too: dual-stack hosts
+        // resolve to several addresses, and a firewall that blackholes SYNs
+        // would otherwise stack a full CONNECT_TIMEOUT per address on top of
+        // the budget the caller was promised.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            stream = Err(std::io::Error::other("analytics post deadline exhausted"));
+            break;
+        }
+        stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT.min(remaining));
         if stream.is_ok() {
             break;
         }

@@ -52,12 +52,17 @@ pub struct ConjureAlign {
     /// transition with samples already written marks a splice seam.
     prev_record: bool,
     last_latency: u32,
-    /// `(sample_rate, channels, reported latency)` of the last full
-    /// `initialize()`. Hosts re-run `initialize()` on every state load while
-    /// holding the lock `process()` takes each block; when nothing relevant
-    /// changed, the delay-line rebuild and the ~12 MB buffer reallocation are
-    /// skipped so that path cannot cause an audible dropout.
-    active_config: Option<(f32, usize, u32)>,
+    /// `(sample_rate, channels)` of the last full `initialize()` whose
+    /// buffers actually match it (the keep-buffers arm clears this so the
+    /// deferred reallocation really happens next time). Hosts re-run
+    /// `initialize()` on every state load while holding the lock `process()`
+    /// takes each block; when neither value changed, the delay-line rebuild
+    /// and the ~12 MB buffer reallocation are skipped so that path cannot
+    /// cause an audible dropout. Latency is deliberately NOT part of the
+    /// key: nothing in the skipped block depends on it (the delay line is
+    /// sized for the parameter maxima) and it is re-reported unconditionally
+    /// below, so a Max Shift edit must not force a pointless reallocation.
+    active_config: Option<(f32, usize)>,
     /// Opt-in usage analytics. Inert until the user consents; never touched
     /// from `process()`.
     analytics: Arc<analytics::AnalyticsHandle>,
@@ -159,16 +164,29 @@ impl ConjureAlign {
 /// The body of [`Task::Analyze`]: analyzes the finished capture and publishes
 /// the results. Background thread only (see `task_executor` for the unwind
 /// containment around it).
+///
+/// Returns the analytics event for the CALLER to send after the
+/// `catch_unwind`: nothing in here may run after the phase release — a panic
+/// past it would reach the repair arm while a same-generation successor
+/// could already own ANALYZING. `None` means a stale/blocked early exit with
+/// nothing to report.
 fn analyze_and_publish(
     generation: u64,
     capture: &CaptureState,
     params: &ConjureAlignParams,
     shared: &GuiShared,
-    analytics: &analytics::AnalyticsHandle,
-) {
-    // Built inside the borrow below, sent after it drops: serializing and
-    // queueing an event is cheap, but it has no business happening while the
-    // capture buffers are borrowed.
+) -> Option<analytics::AnalyticsEvent> {
+    // Long-stale tasks — their capture was reclaimed by a later
+    // `initialize()` — must exit BEFORE borrowing anything: after a reclaim
+    // the audio thread may already be recording a new capture, and even this
+    // task's transient read borrow could collide with its `borrow_mut`. No
+    // phase repair either: any ANALYZING visible now belongs to a successor.
+    if capture.generation.load(Ordering::Acquire) != generation {
+        return None;
+    }
+    // Built inside the borrow below, sent by the caller after it drops:
+    // serializing and queueing an event is cheap, but it has no business
+    // happening while the capture buffers are borrowed.
     let event;
     // Everything that reads `data` stays inside this scope; the snapshot
     // mutex is deliberately touched only AFTER the borrow drops. The GUI
@@ -176,25 +194,20 @@ fn analyze_and_publish(
     // borrow would extend the window in which `initialize()`'s reallocation
     // could contend with it.
     let snapshot = {
-        // `try_borrow`, not `borrow`: if `initialize()` currently owns the
-        // buffers (reclaiming a wedged phase before reallocating), this task
-        // is stale, and a plain borrow would be exactly the AtomicRefCell
-        // panic this protocol exists to prevent. The CAS keeps the phase
-        // machine consistent whichever side noticed first.
+        // `try_borrow`, not `borrow`: a failure means `initialize()` holds
+        // the buffers (its probe, or the reallocation through the held
+        // probe guard) — it bumped the generation before taking them and
+        // reclaims the phase itself. Exit without touching either.
         let Ok(data) = capture.data.try_borrow() else {
-            let _ = capture.phase.compare_exchange(
-                PHASE_ANALYZING,
-                PHASE_IDLE,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
-            return;
+            return None;
         };
-        // Re-checked INSIDE the borrow — `initialize()` bumps the generation
-        // before probing the borrow, so a stale task can never slip between
-        // the check and the data access. Stale means the buffers were (or
-        // are about to be) replaced under this task; exit without reading
-        // or publishing anything.
+        // Re-checked INSIDE the borrow: the bump can land between the
+        // pre-borrow check and this borrow. In that instruction-scale window
+        // no successor capture can exist yet (arming one needs at least the
+        // gate's 250 ms hold), so the ANALYZING this CAS releases is provably
+        // this task's own — and when `initialize()`'s probe found us holding
+        // the borrow (its keep-buffers arm), this CAS is the only thing that
+        // un-wedges the phase.
         if capture.generation.load(Ordering::Acquire) != generation {
             drop(data);
             let _ = capture.phase.compare_exchange(
@@ -203,7 +216,7 @@ fn analyze_and_publish(
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             );
-            return;
+            return None;
         }
         let report = analysis::analyze_spliced(
             &data.main[..data.filled],
@@ -279,8 +292,21 @@ fn analyze_and_publish(
         .snapshot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
-    capture.phase.store(PHASE_IDLE, Ordering::Release);
-    analytics.track(event);
+    // A CAS, not a blind store — and deliberately NOT generation-guarded.
+    // The publish above can block briefly on the GUI-contended mutex, and a
+    // slow-path `initialize()` landing in that gap may have reclaimed the
+    // phase and let a new capture start: a blind IDLE store would stomp its
+    // ARMED/CAPTURING. The phase VALUE is the discriminator (a successor
+    // cannot reach ANALYZING inside a microseconds-wide gap), while a
+    // generation guard would wrongly refuse to release our own phase after
+    // a keep-buffers `initialize()` bumped mid-analysis.
+    let _ = capture.phase.compare_exchange(
+        PHASE_ANALYZING,
+        PHASE_IDLE,
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+    );
+    Some(event)
 }
 
 impl Plugin for ConjureAlign {
@@ -354,21 +380,34 @@ impl Plugin for ConjureAlign {
                 // worker's Drop send/join hits the dead thread. The panic
                 // hook has already reported by the time the unwind lands
                 // here; swallow it and repair the phase machine.
-                let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    analyze_and_publish(generation, &capture, &params, &shared, &analytics)
-                }))
-                .is_err();
-                if panicked {
-                    // The borrow guard was released during the unwind. A CAS,
-                    // not a store: initialize() may have reclaimed the phase
-                    // meanwhile, and a new capture may already be running.
-                    let _ = capture.phase.compare_exchange(
-                        PHASE_ANALYZING,
-                        PHASE_IDLE,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    );
-                    crash::report_issue("analysis task panicked; capture state repaired");
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    analyze_and_publish(generation, &capture, &params, &shared)
+                })) {
+                    // Tracked out here so nothing inside the caught closure
+                    // runs after the phase release — the repair arm's
+                    // generation guard below depends on that ordering.
+                    Ok(Some(event)) => analytics.track(event),
+                    Ok(None) => {}
+                    Err(_) => {
+                        // The borrow guard was released during the unwind.
+                        // Generation-guarded: the panic hook can flush for up
+                        // to 2 s before the unwind lands here — time enough
+                        // for a reclaim plus a whole successor capture — and
+                        // an unchanged generation is what proves no reclaim
+                        // happened, i.e. any ANALYZING is still ours. If the
+                        // guard refuses, the next slow-path initialize()
+                        // reclaims instead (the keep-buffers arm that bumped
+                        // it also cleared active_config, so one is coming).
+                        if capture.generation.load(Ordering::Acquire) == generation {
+                            let _ = capture.phase.compare_exchange(
+                                PHASE_ANALYZING,
+                                PHASE_IDLE,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            );
+                        }
+                        crash::report_issue("analysis task panicked; capture state repaired");
+                    }
                 }
             }
         })
@@ -396,7 +435,7 @@ impl Plugin for ConjureAlign {
         // dropout during playback; upstream's own FIXME makes re-init
         // lightness the plugin's responsibility). Everything skipped below
         // depends only on this triple.
-        let fast = self.active_config == Some((self.sample_rate, channels, latency));
+        let fast = self.active_config == Some((self.sample_rate, channels));
 
         if !fast {
             // Size everything for the parameter maxima so no later change ever
@@ -424,20 +463,30 @@ impl Plugin for ConjureAlign {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             let mut keep_buffers = false;
+            let mut reallocated = false;
             if analyzing {
                 // Invalidate any not-yet-started task BEFORE probing the
-                // borrow: a task checks the generation inside its borrow, so
-                // after this bump it can no longer touch buffers we are about
-                // to replace (see capture.rs).
+                // borrow: a task re-checks the generation before AND inside
+                // its borrow, so after this bump it can no longer touch
+                // buffers we are about to replace (see capture.rs).
                 self.capture.generation.fetch_add(1, Ordering::AcqRel);
                 match self.capture.data.try_borrow_mut() {
-                    Ok(guard) => {
-                        drop(guard);
+                    Ok(mut guard) => {
                         // No task holds the borrow: it is queued behind other
                         // instances' work on the shared worker, or lost (a
-                        // dropped dispatch). Reclaim the phase so Capture
-                        // doesn't stay disabled forever; the stale task exits
-                        // on the generation check.
+                        // dropped dispatch). Reallocate THROUGH the held
+                        // guard — dropping it and re-borrowing inside
+                        // `allocate()` would leave a gap for a raced stale
+                        // task's `try_borrow` to land in — then reclaim the
+                        // phase so Capture doesn't stay disabled forever;
+                        // the stale task exits on its generation checks.
+                        CaptureState::allocate_locked(
+                            &mut guard,
+                            CAPTURE_MAX_SECS * self.sample_rate as usize,
+                            self.sample_rate,
+                        );
+                        drop(guard);
+                        reallocated = true;
                         let _ = self.capture.phase.compare_exchange(
                             PHASE_ANALYZING,
                             PHASE_IDLE,
@@ -469,10 +518,20 @@ impl Plugin for ConjureAlign {
                     }
                 }
             }
-            if !keep_buffers {
+            if !keep_buffers && !reallocated {
                 self.capture
                     .allocate(CAPTURE_MAX_SECS * self.sample_rate as usize, self.sample_rate);
             }
+            // Recorded only when the buffers really match this config: the
+            // keep-buffers arm leaves them sized for the previous rate, and
+            // recording it would let the fast path skip the reallocation
+            // that is supposed to correct them (a 192→44.1 kHz session
+            // would capture ~17 s instead of 4 forever after).
+            self.active_config = if keep_buffers {
+                None
+            } else {
+                Some((self.sample_rate, channels))
+            };
         }
 
         // Drop any stale GUI capture/stop request and progress so a click
