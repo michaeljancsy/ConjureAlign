@@ -727,11 +727,13 @@ pub fn consent_modal(ctx: &egui::Context) {
 
 /// Question one. Deliberately just the question and the two answers: the
 /// enumeration of what is collected was removed by product decision on
-/// 2026-08-28, so nothing in the UI describes the payload. `CLAUDE.md` and the
+/// 2026-08-28, so nothing in the UI describes the payload — not here, and not
+/// on the [`privacy_section`] checkbox either. `CLAUDE.md` and the
 /// `analytics`/`host` module docs are the only remaining record of it.
 ///
-/// Question two below still carries its copy — it was added separately, covers
-/// a feature that sends nothing, and was not part of that decision.
+/// Question two below is also bare, but for an unrelated reason — prompt
+/// length, not disclosure — and its copy still exists in [`privacy_section`]
+/// and the README.
 fn analytics_question(ui: &mut egui::Ui) {
     ui.heading("Share anonymous usage and crash data?");
     ui.add_space(12.0);
@@ -756,22 +758,11 @@ fn analytics_question(ui: &mut egui::Ui) {
 /// into it: this one shares no data and mints no identifier, and rolling the
 /// two together would mean a user who declines analytics also loses update
 /// notices for a reason that has nothing to do with why they declined.
+///
+/// Heading and buttons only, for the same reason as [`analytics_question`];
+/// what the check does is described in [`privacy_section`] and the README.
 fn updates_question(ui: &mut egui::Ui) {
     ui.heading("Check for new versions?");
-    ui.add_space(8.0);
-    ui.label(
-        "Once a day, ConjureAlign can ask GitHub whether a newer release exists \
-         and show a link if there is one. It never downloads or installs anything.",
-    );
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new(
-            "Nothing about you is sent — no ID, no usage, no audio. GitHub sees the \
-             request the way it would see your browser opening the releases page.",
-        )
-        .small()
-        .color(TEXT_DIM),
-    );
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         if ui.button("No thanks").clicked() {

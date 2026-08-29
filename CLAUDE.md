@@ -332,8 +332,11 @@ UI: the first-run prompt (`editor::consent_modal`) and the ⚙ popover (`setting
 drawn OUTSIDE `draw_ui` / from the control bar respectively, and both are `pub` so
 `examples/gui_preview.rs` can render them headless (`_consent.png`, `_settings.png`,
 `_settings_update.png`) — a consent dialog has no business in the panel screenshots. The prompt
-renders only its unanswered questions, so the preview points `HOME` at a scratch directory to
-get a virgin install; without that it would render whatever this machine has already answered. Two layout constraints learned the
+is each question's heading plus its two buttons and nothing else, with one closing line saying
+the answers are changeable under ⚙; what detail survives is in the README, plus the popover for
+the update check. It renders only its unanswered questions, so the preview points `HOME` at a
+scratch directory to get a virgin install; without that it would render whatever this machine
+has already answered. Two layout constraints learned the
 hard way: the status strip has **zero slack at the 600×460 minimum** (its labels already reach
 the Capture button and *overflow* rather than truncate, so anything parked there gets drawn
 through), which is why the gear rides the centered control-bar row's spare width instead; and
@@ -423,10 +426,11 @@ user-facing text, which is exactly why it is worth noticing: this file and the
 Re-check the disclosure question before shipping a property more revealing than the bucketed
 outcomes already sent.
 
-That decision covers question ONE only. `updates_question` and its half of `privacy_section`
-still carry their copy, and it is still a promise: "sends nothing about you, never installs
+That decision covers question ONE only, and it is about *disclosure*. `updates_question` is
+bare in the first-run prompt as well, but for an unrelated reason — the prompt was cut to
+headings and buttons on length grounds — and its half of `privacy_section` and the README
+still carry its copy. That copy is still a promise: "sends nothing about you, never installs
 anything" has to stay true of `update.rs`.
-
 
 `RejectReason` is NOT an error: it is an expected user outcome, already logged and already a
 Mixpanel event. Routing it here would bury real crashes. Only panics and genuine
