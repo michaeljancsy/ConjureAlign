@@ -11,7 +11,7 @@ use conjure_align::editor::correlation_view::{self, CorrArgs, CorrViewState};
 use conjure_align::editor::spectrum_view::{self, SpecViewState, SpectrumArgs};
 use conjure_align::editor::waveform_view::{self, CaptureOverlay, WaveArgs, WaveViewState};
 use conjure_align::editor::LowerPanelTab;
-use conjure_align::capture::CaptureState;
+use conjure_align::capture::{CaptureState, GATE_OPEN, GATE_REF_QUIET, PHASE_CAPTURING};
 use conjure_align::params::ConjureAlignParams;
 use conjure_align::shared::{AnalysisSnapshot, GuiShared};
 use conjure_align::spectrum;
@@ -138,6 +138,26 @@ fn main() {
         &snapshot,
         detected_ms,
         Overlay::None,
+        CaptureScene::Idle,
+    );
+    // Scenes 5b/5c: the strip mid-capture, at the width where it is tightest —
+    // the Stop/Cancel pair is wider than the idle Capture button, the phase
+    // message is at its longest (the paused variant especially), and every
+    // trailing label must elide at the button boundary instead of painting
+    // through it.
+    render_full(
+        &out.replace(".png", "_capturing.png"),
+        &snapshot,
+        detected_ms,
+        Overlay::None,
+        CaptureScene::Capturing,
+    );
+    render_full(
+        &out.replace(".png", "_capturing_paused.png"),
+        &snapshot,
+        detected_ms,
+        Overlay::None,
+        CaptureScene::CapturingPaused,
     );
     // Scene 6: the first-run analytics prompt over that same editor. It is
     // drawn outside `draw_ui` so it can never appear in the scenes above,
@@ -147,6 +167,7 @@ fn main() {
         &snapshot,
         detected_ms,
         Overlay::Consent,
+        CaptureScene::Idle,
     );
     // Scene 7: the ⚙ popover, the standing way to change that answer. It
     // needs a click, so nothing else would ever render it — and it opens
@@ -157,6 +178,7 @@ fn main() {
         &snapshot,
         detected_ms,
         Overlay::Settings,
+        CaptureScene::Idle,
     );
     // Scene 8: the same popover with an update waiting, which is also the only
     // way to see the "\u{2699} Update" label in the control bar behind it. The
@@ -167,6 +189,7 @@ fn main() {
         &snapshot,
         detected_ms,
         Overlay::SettingsUpdate,
+        CaptureScene::Idle,
     );
     // Scene 9: what an editor that has panicked shows instead of the panels
     // (see `editor::guarded_frame`). It replaces the body rather than floating
@@ -219,6 +242,18 @@ impl Overlay {
     }
 }
 
+/// The capture phase a full-editor scene renders in. Mid-capture the strip is
+/// at its tightest — two buttons instead of one, and the longest status
+/// messages — which no idle scene can show.
+#[derive(Clone, Copy)]
+enum CaptureScene {
+    Idle,
+    /// Gate open, 2.3 s of 4 s recorded.
+    Capturing,
+    /// Gate closed on the reference: the longest message the strip ever shows.
+    CapturingPaused,
+}
+
 /// A `GuiContext` that goes nowhere: `ParamSetter` needs one, and the editor
 /// only ever writes parameters through it, which a preview must not do.
 struct StubGuiContext;
@@ -243,7 +278,13 @@ impl GuiContext for StubGuiContext {
 
 /// Renders `editor::draw_ui` at the real minimum window size, one window
 /// margin in — the same wrapping the editor's own `create()` uses.
-fn render_full(out: &str, snapshot: &Arc<AnalysisSnapshot>, detected_ms: f32, overlay: Overlay) {
+fn render_full(
+    out: &str,
+    snapshot: &Arc<AnalysisSnapshot>,
+    detected_ms: f32,
+    overlay: Overlay,
+    scene: CaptureScene,
+) {
     let params = ConjureAlignParams::default();
     params
         .detected_offset_ms
@@ -254,7 +295,22 @@ fn render_full(out: &str, snapshot: &Arc<AnalysisSnapshot>, detected_ms: f32, ov
     let shared = GuiShared::default();
     shared.set_window(960, snapshot.sample_rate);
     shared.snapshot.store(Some(snapshot.clone()));
-    let capture = Arc::new(CaptureState::new()).handle();
+    let capture_state = Arc::new(CaptureState::new());
+    if !matches!(scene, CaptureScene::Idle) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let sr = snapshot.sample_rate;
+        capture_state.phase.store(PHASE_CAPTURING, Relaxed);
+        capture_state.progress.store((2.3 * sr) as u32, Relaxed);
+        capture_state.target.store((4.0 * sr) as u32, Relaxed);
+        capture_state.gate_state.store(
+            match scene {
+                CaptureScene::CapturingPaused => GATE_REF_QUIET,
+                _ => GATE_OPEN,
+            },
+            Relaxed,
+        );
+    }
+    let capture = capture_state.handle();
     let updates = Arc::new(conjure_align::update::UpdateHandle::new());
     // Scenes render in one process and the status is process-wide, so each one
     // states what it wants rather than inheriting the last scene's.
