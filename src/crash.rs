@@ -14,7 +14,7 @@
 //!    the main thread, the editor thread, or the background analysis task.
 //! 2. **No thread outlives the dylib.** Sentry's transport owns a background
 //!    thread tied to the client, so the client is owned by [`CrashHandle`]s
-//!    through a `Weak` registry, exactly like `analytics::Worker`. The last
+//!    through a `Weak` registry, exactly like `net::Worker`. The last
 //!    plugin instance to drop closes the client and joins the thread.
 //! 3. **Every panic the hook can see is ours, and every one is reported.** A
 //!    panic hook lives in the panicking image's own statically-linked std, so
@@ -48,8 +48,8 @@ use std::marker::PhantomData;
 pub const SENTRY_DSN: &str =
     "https://d5c574afb565fb671e6ec70e673eedf0@o4511091371081728.ingest.us.sentry.io/4511972827136000";
 
-/// Points the reporter at a local sink for tests and manual QA, mirroring
-/// `analytics::ENDPOINT_ENV`.
+/// Points the reporter at a local sink for tests and manual QA, mirroring the
+/// endpoint overrides in `analytics` and `update`.
 const DSN_ENV: &str = "CONJURE_ALIGN_SENTRY_DSN";
 
 // ---------------------------------------------------------------------------
