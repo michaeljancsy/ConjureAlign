@@ -23,6 +23,19 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "gui_preview.png".into());
 
+    // Render against a scratch preferences directory rather than the
+    // developer's own. Two reasons, both load-bearing for the consent scene:
+    // it must show a *virgin* install (every question unanswered — on this
+    // machine the analytics one is long since answered, so the real file would
+    // render half the dialog), and a preview must never write to the file that
+    // holds a real consent decision. Set before anything reads it: the config
+    // is cached in a `OnceLock` on first access.
+    let scratch = std::env::temp_dir().join("conjure-align-gui-preview-home");
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("scratch preferences dir");
+    std::env::set_var("HOME", &scratch);
+    std::env::set_var("APPDATA", &scratch);
+
     // Synthetic capture: bursty band-limited noise; reference = main delayed
     // by 240 samples (5 ms at 48 kHz), i.e. main LEADS and the detected
     // offset must come out at +5 ms.
@@ -137,7 +150,17 @@ fn main() {
         detected_ms,
         Overlay::Settings,
     );
-    // Scene 8: what an editor that has panicked shows instead of the panels
+    // Scene 8: the same popover with an update waiting, which is also the only
+    // way to see the "\u{2699} Update" label in the control bar behind it. The
+    // fit worth checking is that label against the centred row's spare width at
+    // the 600 px minimum.
+    render_full(
+        &out.replace(".png", "_settings_update.png"),
+        &snapshot,
+        detected_ms,
+        Overlay::SettingsUpdate,
+    );
+    // Scene 9: what an editor that has panicked shows instead of the panels
     // (see `editor::guarded_frame`). It replaces the body rather than floating
     // over it, and reaching it in a DAW takes an actual crash, so this is the
     // only review of its copy and of how it wraps at the minimum width.
@@ -169,6 +192,23 @@ enum Overlay {
     None,
     Consent,
     Settings,
+    /// The popover with an update on offer — which also puts the "\u{2699} Update"
+    /// label on the control bar behind it, the only notification the plugin
+    /// ever shows.
+    SettingsUpdate,
+}
+
+impl Overlay {
+    /// The update status this scene wants. Forced per scene because the status
+    /// is process-wide and every scene renders in the same process.
+    fn update_status(self) -> conjure_align::update::Status {
+        match self {
+            Overlay::SettingsUpdate => conjure_align::update::Status::Available {
+                version: "9.9.9".into(),
+            },
+            _ => conjure_align::update::Status::Unknown,
+        }
+    }
 }
 
 /// A `GuiContext` that goes nowhere: `ParamSetter` needs one, and the editor
@@ -207,6 +247,10 @@ fn render_full(out: &str, snapshot: &Arc<AnalysisSnapshot>, detected_ms: f32, ov
     shared.set_window(960, snapshot.sample_rate);
     *shared.snapshot.lock().unwrap() = Some(snapshot.clone());
     let capture = Arc::new(CaptureState::new()).handle();
+    let updates = Arc::new(conjure_align::update::UpdateHandle::new());
+    // Scenes render in one process and the status is process-wide, so each one
+    // states what it wants rather than inheriting the last scene's.
+    conjure_align::update::set_status_for_preview(overlay.update_status());
     let mut state = conjure_align::editor::EditorState::with_snapshot(snapshot.clone());
 
     let mut harness = egui_kittest::Harness::builder()
@@ -219,7 +263,7 @@ fn render_full(out: &str, snapshot: &Arc<AnalysisSnapshot>, detected_ms: f32, ov
                 .inner_margin(egui::Margin::symmetric(10, 8))
                 .show(ui, |ui| {
                     conjure_align::editor::draw_ui(
-                        ui, &setter, &mut state, &params, &shared, &capture,
+                        ui, &setter, &mut state, &params, &shared, &capture, &updates,
                     );
                 });
             match overlay {
@@ -227,7 +271,9 @@ fn render_full(out: &str, snapshot: &Arc<AnalysisSnapshot>, detected_ms: f32, ov
                 Overlay::Consent => conjure_align::editor::consent_modal(ui.ctx()),
                 // Opened before the bar is drawn on the next pass, so the
                 // popover is already up when the harness renders.
-                Overlay::Settings => conjure_align::editor::open_settings_popup(ui.ctx()),
+                Overlay::Settings | Overlay::SettingsUpdate => {
+                    conjure_align::editor::open_settings_popup(ui.ctx())
+                }
             }
         });
 

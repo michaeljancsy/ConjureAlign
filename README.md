@@ -42,6 +42,21 @@ validation automatically on every release, but it has had far less real-DAW test
 the macOS build — [reports of anything odd](https://github.com/michaeljancsy/ConjureAlign/issues)
 are genuinely useful, especially about the plugin window.
 
+## Updates
+
+ConjureAlign can tell you when a newer version is out. It asks once — in the same first-run
+prompt as the privacy question, and as a separate question — and if you say yes it checks
+[the releases page](https://github.com/michaeljancsy/ConjureAlign/releases/latest) about
+once a day. When there is something new, the **⚙** button in the plugin's control bar reads
+**⚙ Update**; click it for the version and a link to the release notes. "Skip this version"
+silences one release without silencing the next.
+
+It never downloads or installs anything — updating means downloading the new installer and
+running it, exactly like the first time. You can check by hand at any time under **⚙ → Check
+now**, whatever you answered, and you can change the answer there too.
+
+If you say no, or never open the plugin window, no check ever happens.
+
 ## How to use it
 
 1. Put **ConjureAlign on the track you want to shift** (usually the more distant mic).
@@ -82,11 +97,13 @@ any plugin. In the audible band the null is −70 dB or deeper (measured in
 
 ## Privacy
 
-ConjureAlign can report anonymous usage data and crash reports, and asks once — the first
-time you open its window — whether you want it to. **It is off unless you say yes**, and it
-never sends anything before you answer. One answer covers both. There is no account, no login,
-and no identifier tied to you: everything carries a random ID generated on the machine when you
-opt in.
+The first time you open its window, ConjureAlign asks you two questions, and does nothing
+until you answer either one. **Both are off unless you say yes.** There is no account, no
+login, and nothing tied to you.
+
+**1. Share anonymous usage and crash data?** Covers both usage analytics and crash reports —
+one question, one answer. Everything sent carries a random ID generated on the machine when
+you opt in.
 
 | | |
 |---|---|
@@ -97,18 +114,26 @@ A crash report names ConjureAlign's *own* code — its functions, and paths insi
 tree as it was built. It carries nothing from your machine: the list of other plugins loaded
 alongside it is stripped before sending, and so is your computer's name.
 
-Change your mind at any time with the **⚙** button in the plugin's control bar. Your answer is
+**2. Check for new versions?** A separate question, because it shares no data and creates no
+identifier. Once a day the plugin asks GitHub for the number of the latest release — nothing
+more. There is no ID, no usage information and no payload; GitHub sees the request the way it
+would see your browser opening the releases page. The reply is read for a version number and
+nothing else, and the link the plugin offers is a fixed address compiled into it, never one
+that arrived over the network.
+
+Change either answer at any time with the **⚙** button in the plugin's control bar. Both are
 stored in `~/Library/Application Support/ConjureDSP/ConjureAlign/analytics.json` on macOS and
 `%APPDATA%\ConjureDSP\ConjureAlign\analytics.json` on Windows; deleting that file makes the
-plugin ask again. Declining stores the "no" and nothing else — no ID is generated. If you never
-open the editor (running headless from the host's generic parameter UI), you are never asked
-and nothing is ever sent. Both are compiled out entirely on platforms other than macOS and
-Windows.
+plugin ask again. Declining stores the "no" and nothing else — no ID is generated. If you
+never open the editor (running headless from the host's generic parameter UI), you are never
+asked, and nothing is sent or fetched. All three features are compiled out entirely on
+platforms other than macOS and Windows.
 
-The code is all in [`src/analytics.rs`](src/analytics.rs) and [`src/crash.rs`](src/crash.rs).
-The usage payload is built in one function (`build_payload`), and every crash report passes
-through one more (`scrub`) on its way out, if you want to read exactly what leaves the
-machine.
+The code is all in [`src/analytics.rs`](src/analytics.rs), [`src/crash.rs`](src/crash.rs) and
+[`src/update.rs`](src/update.rs). The usage payload is built in one function
+(`build_payload`), every crash report passes through one more (`scrub`) on its way out, and
+the update check reads exactly one field of one document (`parse_release`) — if you want to
+read precisely what leaves the machine.
 
 The Audio Unit build is produced by [clap-wrapper](https://github.com/free-audio/clap-wrapper),
 which re-exports the CLAP plugin behind an AU entry point. It carries a local patch so that
@@ -135,7 +160,8 @@ that layer is macOS-only).
 Run the DSP test suite with `cargo test --release`. To eyeball the GUI panels without a DAW,
 `cargo run --example gui_preview --features gui-preview` renders them with synthetic data to
 `gui_preview.png` / `gui_preview_zoom.png`, plus the whole editor (`_full`), the first-run
-privacy prompt (`_consent`) and the ⚙ popover (`_settings`).
+prompt (`_consent`) and the ⚙ popover with and without an update waiting
+(`_settings_update`, `_settings`).
 
 ## License
 

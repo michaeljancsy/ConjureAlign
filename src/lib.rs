@@ -8,12 +8,15 @@
 pub mod analysis;
 pub mod analytics;
 pub mod capture;
+pub mod config;
 pub mod crash;
 pub mod dsp;
 pub mod editor;
+pub mod net;
 pub mod params;
 pub mod shared;
 pub mod spectrum;
+pub mod update;
 
 use nih_plug::prelude::*;
 use std::sync::atomic::Ordering;
@@ -70,6 +73,10 @@ pub struct ConjureAlign {
     /// `process()` takes one of its scope guards, which is a thread-local
     /// counter and nothing else — see the rules in `crash.rs`.
     crash: Arc<crash::CrashHandle>,
+    /// Opt-in update checking, on its own consent answer. Only the editor ever
+    /// asks it to do anything — a plugin scan must not make network requests
+    /// (see `update.rs`).
+    updates: Arc<update::UpdateHandle>,
 }
 
 pub enum Task {
@@ -105,6 +112,7 @@ impl Default for ConjureAlign {
             active_config: None,
             analytics: Arc::new(analytics::AnalyticsHandle::new()),
             crash: Arc::new(crash::CrashHandle::new()),
+            updates: Arc::new(update::UpdateHandle::new()),
         }
     }
 }
@@ -358,6 +366,7 @@ impl Plugin for ConjureAlign {
             self.shared.clone(),
             self.capture.handle(),
             self.crash.clone(),
+            self.updates.clone(),
         )
     }
 
