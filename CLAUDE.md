@@ -46,9 +46,11 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   renderer: the panels alone (`gui_preview.png`, `_zoom`, `_spectrum`, `_spectrum_trim`)
   and — via a stub `GuiContext` behind a `ParamSetter` — the WHOLE editor at its 600×460
   minimum window (`_full.png`), which is the only scene that shows the vertical budget
-  (dead space under the control bar, a clipped bar), plus the two floating surfaces that
+  (dead space under the control bar, a clipped bar), plus the floating surfaces that
   live outside `draw_ui` and would otherwise need a DAW and a click to see: the first-run
-  privacy prompt (`_consent.png`) and the ⚙ popover (`_settings.png`). Or run the plugin
+  prompt (`_consent.png`, both questions — the example points HOME at a scratch dir so it
+  renders a virgin install rather than this machine's answers) and the ⚙ popover, with an
+  update waiting and without (`_settings_update.png`, `_settings.png`). Or run the plugin
   interactively with `cargo run --bin standalone --features standalone -- --backend dummy`
   (works thanks to the baseview `[patch]` — see Known upstream issues).
 - CLAP validation: `clap-validator validate target/bundled/ConjureAlign.clap`
@@ -89,6 +91,9 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
 ## Architecture
 
 - `src/analytics.rs` — opt-in Mixpanel telemetry (see its own section below);
+  `src/update.rs` — the opt-in update check; `src/net.rs` — the one HTTP client and the one
+  background network thread both of them (and nothing else) go through; `src/config.rs` —
+  the install-wide preferences file holding both consent answers;
 - `src/lib.rs` — Plugin impl and orchestration; `src/params.rs` — the whole state model;
   `src/capture.rs` — capture buffers + phase machine + the GUI-safe `CaptureHandle`;
   `src/analysis.rs` — offset estimation (background thread only); `src/shared.rs` — the
@@ -211,26 +216,47 @@ Anonymous Mixpanel events, OFF until the user consents. Three invariants, all lo
    unparseable one) is what shows the first-run prompt; **declining must write the file** or the
    prompt returns forever. Declining stores no device id. The file is read once per process into
    a `OnceLock`, so a change in one running DAW reaches other processes at their next launch.
-3. **No thread outlives the dylib.** One worker thread per process, shared by every instance via
-   a `Mutex<Weak<Worker>>` registry; each `AnalyticsHandle` holds a strong ref. `Worker::drop`
-   sets a shutdown flag, drops the sender (which is what wakes a worker parked in `recv()` —
-   joining before disconnecting would deadlock), then joins. Sends are `try_send` on a 32-slot
-   bounded channel: a wedged network drops events, never blocks a caller or grows a backlog.
-   The drop-side join is bounded because every stage of `post()` is: DNS runs on a throwaway
-   helper thread awaited with a timeout (`resolve_bounded` — the ONE deliberate exception to
-   this rule, mirroring ureq's resolver: on timeout that thread is abandoned inside
-   `getaddrinfo`, accepted because the alternative was a certain DAW-unload hang, and the
-   image outlives it in practice — macOS pins ObjC-bearing images), every resolved address is
-   tried, connect/read/write carry per-op timeouts, and the response read has a wall-clock
-   deadline plus a size cap.
+   There are now **two** independent answers in that one file (`src/config.rs`): this one, under
+   the JSON key `"consent"`, and the update check's, under `"updates"`. The key did not get
+   renamed to match its Rust field (`Config::analytics`) on purpose — renaming it would read
+   every existing install's answer as "never asked". The prompt appears while *either* is `None`
+   and renders only the unanswered questions, which is what let the second question be added
+   without re-asking the first.
+3. **No thread outlives the dylib.** All of this now lives in `src/net.rs`, shared with the
+   update check — one worker thread per process for both, via a `Mutex<Weak<Worker>>` registry;
+   each `AnalyticsHandle`/`UpdateHandle` holds a `net::WorkerHandle`. `Worker::drop` sets a
+   shutdown flag, drops the sender (which is what wakes a worker parked in `recv()` — joining
+   before disconnecting would deadlock), then joins; while that flag is set queued jobs are
+   drained *unrun*, which is what bounds the join to at most one in-flight request. Jobs are
+   opaque `Box<dyn FnOnce()>` on a 32-slot bounded `try_send` channel: a wedged network drops
+   work, never blocks a caller or grows a backlog. **Never let a job own the last strong ref to
+   the worker** — dropping it on the worker thread makes `Worker::drop` join its own thread,
+   which is precisely the nih-plug teardown bug below; `WorkerHandle` is the only route in, and
+   it lives on a plugin instance. The drop-side join is bounded because every stage of a request
+   is: DNS runs on a throwaway helper thread awaited with a timeout (`resolve_bounded` — the ONE
+   deliberate exception to this rule, mirroring ureq's resolver: on timeout that thread is
+   abandoned inside `getaddrinfo`, accepted because the alternative was a certain DAW-unload
+   hang, and the image outlives it in practice — macOS pins ObjC-bearing images), every resolved
+   address is tried, connect/read/write carry per-op timeouts, and the response read has a
+   wall-clock deadline plus a size cap.
 
-Transport is a hand-written HTTP/1.1 POST over `native-tls` rather than an HTTP client crate:
-the request is one fire-and-forget JSON body to a fixed host, and native-tls binds the OS stack
-(Security.framework / SChannel) so there is no `ring`/nasm build-tooling risk on the Windows CI
-and no bundled root store to go stale. **`native-tls` is target-gated to macOS+Windows** — on
-other targets it would drag in openssl, and Linux is a build-from-source platform here, so
-`config_path()` returns `None`, `consent()` reports a settled `Some(false)`, and the whole
-feature is inert. `CONJURE_ALIGN_ANALYTICS_URL` overrides the endpoint for a local sink.
+Transport (`src/net.rs`) is a hand-written HTTP/1.1 client over `native-tls` rather than an HTTP
+client crate: the analytics request is one fire-and-forget JSON body to a fixed host, and
+native-tls binds the OS stack (Security.framework / SChannel) so there is no `ring`/nasm
+build-tooling risk on the Windows CI and no bundled root store to go stale. **`native-tls` is
+target-gated to macOS+Windows** — on other targets it would drag in openssl, and Linux is a
+build-from-source platform here, so `config_path()` returns `None`, both consent answers report
+a settled `Some(false)`, and all three features are inert. `CONJURE_ALIGN_ANALYTICS_URL`
+overrides the endpoint for a local sink.
+
+`post()` returns the response *raw*, headers and all, because analytics discards it and the
+smoke test wants to grep it. `get()` does not: it decodes the framing (status line stripped,
+`Transfer-Encoding: chunked` de-framed) on **bytes**, not on a `String`. Both halves matter —
+GitHub chunks, and chunk-size lines sit inside the byte stream, so an un-de-framed body is not
+valid JSON; and chunk boundaries fall at arbitrary byte offsets, so decoding to text first and
+slicing by byte index would corrupt any multi-byte character split across two chunks (an emoji
+in a release note). The response size cap is per-call for the same reason: 64 KB is right for a
+status reply and would silently truncate a release document into a parse failure.
 
 The payload is bucketed on purpose (`confidence_bucket`, `offset_bucket`): raw figures would
 describe the user's material. `MIXPANEL_TOKEN` holds the ConjureAlign project's token;
@@ -247,8 +273,10 @@ picker. Check `Get-Events` before naming anything new. Verify ingestion with
 
 UI: the first-run prompt (`editor::consent_modal`) and the ⚙ popover (`settings_menu`) are both
 drawn OUTSIDE `draw_ui` / from the control bar respectively, and both are `pub` so
-`examples/gui_preview.rs` can render them headless (`_consent.png`, `_settings.png`) — a
-consent dialog has no business in the panel screenshots. Two layout constraints learned the
+`examples/gui_preview.rs` can render them headless (`_consent.png`, `_settings.png`,
+`_settings_update.png`) — a consent dialog has no business in the panel screenshots. The prompt
+renders only its unanswered questions, so the preview points `HOME` at a scratch directory to
+get a virgin install; without that it would render whatever this machine has already answered. Two layout constraints learned the
 hard way: the status strip has **zero slack at the 600×460 minimum** (its labels already reach
 the Capture button and *overflow* rather than truncate, so anything parked there gets drawn
 through), which is why the gear rides the centered control-bar row's spare width instead; and
@@ -266,7 +294,7 @@ reports are labelled with `analytics::device_id()`, the same random install id.
 
 The two analytics invariants above hold here too (nothing before consent; no thread outliving
 the dylib — `Reporter` is held through a `Mutex<Weak<Reporter>>` registry exactly like
-`Worker`, and dropping the last strong ref closes the client, which ends the release-health
+`net::Worker`, and dropping the last strong ref closes the client, which ends the release-health
 session and joins Sentry's transport thread). Three things are specific to panics:
 
 1. **The hook is per-image, gated on consent only, and captures via `Hub::main()`.** A panic
@@ -319,7 +347,8 @@ backs a promise in the README/consent copy: `server_name` is nulled (`sentry-con
 from the `hostname` crate), `user` is reduced to the device id, and `debug_meta.images` is
 trimmed to our own dylib — `debug-images` otherwise enumerates every shared library in the
 process, i.e. every other plugin the user owns. **Changing what is sent means changing
-`consent_modal`, `settings_menu` and the README Privacy table too.**
+`consent_modal`, `settings_menu` and the README Privacy table too** — and that rule now covers
+the update question's copy as well.
 
 `RejectReason` is NOT an error: it is an expected user outcome, already logged and already a
 Mixpanel event. Routing it here would bury real crashes. Only panics and genuine
@@ -406,6 +435,59 @@ configured — and debug files match by build id, so a release shipped without t
 symbolicated afterwards without reproducing a byte-identical binary. Adding the
 dep cost ~1.8 MB per architecture slice (4.996 → 6.803 MB), i.e. ~10.8 MB on the macOS pkg (two
 architectures × three bundles) and ~3.6 MB on the Windows zip.
+
+### Update checks (opt-in, `src/update.rs`)
+
+Asks GitHub's `/repos/michaeljancsy/ConjureAlign/releases/latest` for `tag_name` and compares
+it to `CARGO_PKG_VERSION`. **It notifies and nothing else** — no download, no install, no
+self-update. The bundle is mapped into a running host, `/Library/Audio/Plug-Ins` needs admin
+rights, and the shipped pkg is signed/notarized/stapled; re-implementing any part of that
+inside a plugin buys nothing. The REST API rather than a manifest committed here, deliberately:
+a manifest is one more thing to bump at release time, and forgetting it fails silently in the
+"nobody hears about the new version" direction, i.e. the exact failure the feature exists to
+prevent. `/releases/latest` already skips drafts and pre-releases, so un-advertising a bad
+release means marking it pre-release — which is the right thing to do to it anyway. No release
+script changes; the notice appears as soon as the Release is published.
+
+Its own consent answer (`"updates"` in `analytics.json`), asked as a **second question in the
+same first-run prompt**, deliberately not folded into the analytics one: this check shares no
+data and mints no identifier, so tying it to the analytics answer would cost update notices to
+users who declined for reasons that have nothing to do with it.
+
+Four invariants:
+
+1. **Checks run from the editor only, NEVER from `initialize()`.** `auval`, `pluginval` and
+   Logic's scan all instantiate and initialize the plugin headlessly; a network request during
+   a plugin scan is bad manners and can slow it. The one automatic check is in `editor::create`'s
+   *build* closure (a window opened, so a human is present), gated on a granted answer and on
+   `config::should_check` (24 h after a success, 6 h after a failure, and a clock that went
+   backwards forces one rather than locking it out). This is the same reasoning that forbids a
+   native consent dialog.
+2. **A manual check ("Check now" in the ⚙ popover) runs whatever the stored answer is** — the
+   click is the consent for that one request — and must never write an answer the user did not
+   give. `tests/update_check.rs` pins that.
+3. **The link is a compile-time constant, never a URL from the response.** Clicking it hands a
+   URL to the OS browser via `open::that_detached`, so `html_url` is read from the JSON by
+   nobody: `parse_release` takes `tag_name`, parses it to three integers, and renders them back
+   out, so nothing attacker-shaped can reach the UI, the config file or the browser.
+4. **A queued check that never runs must not wedge anything.** `net`'s worker drops whatever is
+   still queued at shutdown, and refuses work when its queue is full or its thread never
+   spawned. Left alone that would strand `IN_FLIGHT` (no further check for the life of the
+   process) and the status on `Checking` — which the editor treats as "animate", i.e. a
+   permanent 60 Hz repaint in a DAW. A `CheckGuard` moved into the closure releases both from
+   `Drop`, so dropping the job unrun is self-correcting.
+
+UI: the whole notification is the ⚙ button's label — plain `⚙`, or `⚙ Update` in
+`ACCENT_DETECTED` when there is something to see. It rides the centred control row's spare
+width (~140 px at the 600 px minimum) for the same reason the gear itself does; the status
+strip has none. Nothing louder: an update notice must never interrupt a session, and a banner
+would cost a row out of the graphs' budget. "Skip this version" stores `update_skipped`, and
+anything newer notifies again — an unparseable stored value fails *open* (notify), because a
+silenced-forever update the user cannot see or clear is the worse bug. `Status::Failed` is
+surfaced only inside the popover, which the user opened on purpose; a failed automatic check
+produces no label, no banner and no dialog.
+
+`CONJURE_ALIGN_UPDATE_URL` overrides the endpoint for a local sink.
 
 ### AudioUnit v2 (clap-wrapper)
 

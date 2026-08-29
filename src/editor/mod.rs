@@ -31,9 +31,11 @@ use crate::capture::{
     CaptureHandle, GATE_MAIN_QUIET, GATE_OPEN, GATE_REF_QUIET, PHASE_ANALYZING, PHASE_ARMED,
     PHASE_CAPTURING, PHASE_IDLE,
 };
+use crate::config;
 use crate::crash;
 use crate::params::{ConjureAlignParams, PolarityMode, TRIM_RANGE_MS};
 use crate::shared::{AnalysisSnapshot, GuiShared};
+use crate::update;
 
 use correlation_view::{CorrArgs, CorrCache, CorrViewState};
 use spectrum_view::{SpecViewState, SpectrumArgs, SpectrumCache};
@@ -215,12 +217,14 @@ pub fn create(
     shared: Arc<GuiShared>,
     capture: CaptureHandle,
     crash: Arc<crash::CrashHandle>,
+    updates: Arc<update::UpdateHandle>,
 ) -> Option<Box<dyn Editor>> {
     let egui_state: Arc<EguiState> = params.editor_state.clone();
+    let build_updates = updates.clone();
     create_egui_editor(
         egui_state.clone(),
         EditorState::default(),
-        |ctx, state| {
+        move |ctx, state| {
             // Same guard as the draw closure below: first-frame/context setup
             // is a prime spot for a panic, and it must be attributed to us.
             let _scope = crash::scope();
@@ -232,6 +236,15 @@ pub fn create(
                 style.visuals = egui::Visuals::dark();
                 style.visuals.panel_fill = Color32::from_gray(18);
                 ctx.set_style(style);
+
+                // The ONLY automatic update check, and deliberately here
+                // rather than in `initialize()`: a window has opened, so a
+                // human is present. `auval`, `pluginval` and Logic's plugin
+                // scan all instantiate and initialize the plugin headlessly,
+                // and a scan has no business making network requests. It is a
+                // no-op unless the user granted update checks and the interval
+                // has elapsed.
+                build_updates.check(update::Trigger::Auto);
             });
         },
         move |ctx, setter, state| {
@@ -291,7 +304,7 @@ pub fn create(
                         egui::Frame::new()
                             .inner_margin(egui::Margin::symmetric(10, 8))
                             .show(ui, |ui| {
-                                draw_ui(ui, setter, state, &params, &shared, &capture);
+                                draw_ui(ui, setter, state, &params, &shared, &capture, &updates);
                             });
                     });
 
@@ -299,7 +312,7 @@ pub fn create(
                 // Deliberately outside `draw_ui`: the gui-preview example renders
                 // that directly, and a consent dialog has no business in a
                 // screenshot of the panels.
-                if analytics::consent().is_none() {
+                if config::needs_prompt() {
                     consent_modal(ctx);
                 }
 
@@ -310,8 +323,11 @@ pub fn create(
                 crash.sync_consent();
 
                 // Keep animating through captures/analysis and drags even if the
-                // host stops delivering input events.
-                if capture.phase() != PHASE_IDLE {
+                // host stops delivering input events. An in-flight update check
+                // is on that list for the same reason: its result arrives on
+                // the network worker, and without this the "Checking…" line
+                // would sit there until the user happened to move the mouse.
+                if capture.phase() != PHASE_IDLE || update::status() == update::Status::Checking {
                     ctx.request_repaint();
                 }
             });
@@ -401,6 +417,7 @@ pub fn panic_screen(ctx: &egui::Context, state: &mut EditorState) {
 
 /// The whole editor body, one window margin in. Public so the `gui-preview`
 /// example can render it headless (see examples/gui_preview.rs).
+#[allow(clippy::too_many_arguments)]
 pub fn draw_ui(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
@@ -408,6 +425,7 @@ pub fn draw_ui(
     params: &ConjureAlignParams,
     shared: &GuiShared,
     capture: &CaptureHandle,
+    updates: &update::UpdateHandle,
 ) {
     let (net_ms, net_clamped) = net_shift(params, shared);
     let phase = capture.phase();
@@ -432,7 +450,7 @@ pub fn draw_ui(
         .frame(egui::Frame::new())
         .show_inside(ui, |ui| {
             ui.add_space(6.0);
-            control_bar(ui, setter, params, &mut state.capture_row_w);
+            control_bar(ui, setter, params, updates, &mut state.capture_row_w);
         });
 
     egui::CentralPanel::default()
@@ -655,65 +673,141 @@ fn capture_toggle(label: &str, fill: Color32, text: Color32) -> egui::Button<'_>
     egui::Button::new(egui::RichText::new(label).strong().color(text)).fill(fill)
 }
 
-/// The one-time privacy prompt, covering both usage analytics and crash
-/// reporting — one question, one answer. It has no dismiss and no default: closing
-/// the plugin window leaves the question unanswered and asks again next time,
-/// which is the only reading of silence that isn't a "yes" by attrition.
+/// The one-time first-run prompt. Two independent questions — usage analytics
+/// plus crash reporting (one answer, one identifier, one thing to explain), and
+/// the update check — and it renders only the ones still unanswered. That is
+/// what lets a new question be added without re-litigating a settled one: an
+/// install upgrading from a version that only ever asked about analytics sees
+/// the update question alone, with its stored answer untouched.
+///
+/// Every question has two explicit buttons, no default and no dismiss. Closing
+/// the plugin window records nothing and asks again next time, which is the
+/// only reading of silence that isn't a "yes" by attrition.
 ///
 /// Public for the same reason as [`draw_ui`] — it is deliberately drawn
 /// outside `draw_ui`, so the `gui-preview` example is the only way to see it
 /// without a DAW.
 pub fn consent_modal(ctx: &egui::Context) {
+    let cfg = config::snapshot();
     egui::Modal::new(egui::Id::new("conjure-align-consent")).show(ctx, |ui| {
         ui.set_max_width(400.0);
-        ui.heading("Share anonymous usage and crash data?");
-        ui.add_space(8.0);
-        ui.label(
-            "It shows me how often ConjureAlign is used, how often a capture fails, \
-             and when it crashes — which is what tells me where to spend effort.",
-        );
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(
-                "Sent: plugin version and format (VST3/CLAP), operating system, sample \
-                 rate, whether a capture succeeded or why it was rejected, and whether \
-                 a run ended in a crash. A crash also sends the error and the code that \
-                 led to it — ConjureAlign's own and the open-source libraries built \
-                 into it — labelled with a random ID.",
-            )
-            .small()
-            .color(TEXT_DIM),
-        );
-        ui.label(
-            egui::RichText::new(
-                "Never sent: your audio, any measurement of it, your file or project \
-                 names, your computer's name, or anything that identifies you.",
-            )
-            .small()
-            .color(TEXT_DIM),
-        );
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if ui.button("No thanks").clicked() {
-                analytics::set_consent(false);
-            }
-            if ui
-                .add(capture_toggle(
-                    "Share anonymous data",
-                    CAPTURE_GREEN,
-                    Color32::BLACK,
-                ))
-                .clicked()
-            {
-                analytics::set_consent(true);
-            }
-        });
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("You can change this any time under ⚙.")
-                .small()
-                .color(TEXT_DIM),
-        );
+        // Two questions at the 600x460 minimum is the tightest this window
+        // ever gets. The scroll area is insurance, not layout: with the copy
+        // as written nothing scrolls, but a translation or a larger host font
+        // must not be able to push a button off the bottom where it cannot be
+        // clicked at all.
+        egui::ScrollArea::vertical()
+            .max_height((ctx.screen_rect().height() - 90.0).max(200.0))
+            .show(ui, |ui| {
+                let mut asked_something = false;
+
+                if cfg.analytics.is_none() {
+                    analytics_question(ui);
+                    asked_something = true;
+                }
+
+                if cfg.updates.is_none() {
+                    if asked_something {
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+                    }
+                    updates_question(ui);
+                }
+
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("You can change either of these any time under \u{2699}.")
+                        .small()
+                        .color(TEXT_DIM),
+                );
+            });
+    });
+}
+
+/// Question one. The wording here is a promise: it must stay in step with what
+/// `analytics::build_payload` and `crash::scrub` actually send, and with the
+/// README's Privacy table.
+fn analytics_question(ui: &mut egui::Ui) {
+    ui.heading("Share anonymous usage and crash data?");
+    ui.add_space(8.0);
+    ui.label(
+        "It shows me how often ConjureAlign is used, how often a capture fails, \
+         and when it crashes — which is what tells me where to spend effort.",
+    );
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(
+            "Sent: plugin version and format (VST3/CLAP), operating system, sample \
+             rate, whether a capture succeeded or why it was rejected, and whether \
+             a run ended in a crash. A crash also sends the error and the code \
+             that led to it — ConjureAlign's own and the open-source libraries \
+             built into it — labelled with a random ID.",
+        )
+        .small()
+        .color(TEXT_DIM),
+    );
+    ui.label(
+        egui::RichText::new(
+            "Never sent: your audio, any measurement of it, your file or project \
+             names, your computer's name, or anything that identifies you.",
+        )
+        .small()
+        .color(TEXT_DIM),
+    );
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        if ui.button("No thanks").clicked() {
+            analytics::set_consent(false);
+        }
+        if ui
+            .add(capture_toggle(
+                "Share anonymous data",
+                CAPTURE_GREEN,
+                Color32::BLACK,
+            ))
+            .clicked()
+        {
+            analytics::set_consent(true);
+        }
+    });
+}
+
+/// Question two. Deliberately separate from the one above rather than folded
+/// into it: this one shares no data and mints no identifier, and rolling the
+/// two together would mean a user who declines analytics also loses update
+/// notices for a reason that has nothing to do with why they declined.
+fn updates_question(ui: &mut egui::Ui) {
+    ui.heading("Check for new versions?");
+    ui.add_space(8.0);
+    ui.label(
+        "Once a day, ConjureAlign can ask GitHub whether a newer release exists \
+         and show a link if there is one. It never downloads or installs anything.",
+    );
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(
+            "Nothing about you is sent — no ID, no usage, no audio. GitHub sees the \
+             request the way it would see your browser opening the releases page.",
+        )
+        .small()
+        .color(TEXT_DIM),
+    );
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        if ui.button("No thanks").clicked() {
+            config::set_update_consent(false);
+        }
+        if ui
+            .add(capture_toggle(
+                "Check for updates",
+                CAPTURE_GREEN,
+                Color32::BLACK,
+            ))
+            .clicked()
+        {
+            config::set_update_consent(true);
+        }
     });
 }
 
@@ -729,9 +823,31 @@ pub fn open_settings_popup(ctx: &egui::Context) {
     ctx.memory_mut(|mem| mem.open_popup(settings_popup_id()));
 }
 
-fn settings_menu(ui: &mut egui::Ui) {
+fn settings_menu(ui: &mut egui::Ui, updates: &update::UpdateHandle) {
     let popup_id = settings_popup_id();
-    let button = ui.small_button("⚙").on_hover_text("About and privacy");
+
+    // The whole notification, and all of it: the gear grows a word when there
+    // is something to look at. It rides the centred control row's spare width
+    // (~140 px at the 600 px minimum) because the status strip has none — its
+    // labels already reach the Capture button and overflow rather than
+    // truncate — and it is drawn after `capture_row_w` has been measured, so
+    // widening it cannot disturb that row's centring.
+    //
+    // Nothing louder than this: an update notice must never interrupt a
+    // session, and a banner would cost a row out of the graphs' budget.
+    let pending = update::pending_version();
+    let button = match &pending {
+        Some(version) => ui
+            .small_button(
+                egui::RichText::new("\u{2699} Update")
+                    .color(ACCENT_DETECTED)
+                    .strong(),
+            )
+            .on_hover_text(format!(
+                "ConjureAlign {version} is available — click for details"
+            )),
+        None => ui.small_button("\u{2699}").on_hover_text("About and privacy"),
+    };
     if button.clicked() {
         ui.memory_mut(|mem| mem.toggle_popup(popup_id));
     }
@@ -745,38 +861,151 @@ fn settings_menu(ui: &mut egui::Ui) {
         egui::AboveOrBelow::Above,
         egui::PopupCloseBehavior::CloseOnClickOutside,
         |ui| {
-            ui.set_min_width(280.0);
+            ui.set_min_width(300.0);
             ui.label(
                 egui::RichText::new(concat!("ConjureAlign v", env!("CARGO_PKG_VERSION"))).strong(),
             );
             ui.separator();
-            if analytics::is_supported() {
-                let mut share = analytics::enabled();
-                if ui
-                    .checkbox(&mut share, "Share usage and crash data")
-                    .changed()
-                {
-                    analytics::set_consent(share);
-                }
+            update_section(ui, updates);
+            ui.separator();
+            privacy_section(ui);
+        },
+    );
+}
+
+/// The update status and its two buttons. Failures are reported *here* and
+/// nowhere else: the popover is a surface the user opened on purpose, so
+/// telling them the check failed is informative rather than intrusive — while
+/// a failed automatic check still produces no banner, no gear label and no
+/// dialog.
+fn update_section(ui: &mut egui::Ui, updates: &update::UpdateHandle) {
+    if !config::is_supported() {
+        ui.label(
+            egui::RichText::new("Update checks are not available on this platform.")
+                .small()
+                .color(TEXT_DIM),
+        );
+        return;
+    }
+
+    let status = update::status();
+    let skipped = config::update_skipped();
+    let notifying = update::notifies(&status, skipped.as_deref());
+
+    match &status {
+        update::Status::Checking => {
+            ui.horizontal(|ui| {
+                ui.spinner();
                 ui.label(
-                    egui::RichText::new(
-                        "Plugin version and format (VST3/CLAP), OS, sample rate, capture \
-                         outcomes and crash reports, labelled with a random ID. Never \
-                         your audio.",
-                    )
-                    .small()
-                    .color(TEXT_DIM),
+                    egui::RichText::new("Checking for updates\u{2026}")
+                        .small()
+                        .color(TEXT_DIM),
                 );
-            } else {
+            });
+        }
+        update::Status::Available { version } => {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(ACCENT_DETECTED, format!("Version {version} is available"));
+                // A constant URL, never one from the response — see the rules
+                // in `update.rs`. egui-baseview turns this into the OS's
+                // default browser via the `open` crate.
+                ui.hyperlink_to("Release notes \u{2197}", update::RELEASES_URL);
+            });
+            if !notifying {
                 ui.label(
-                    egui::RichText::new(
-                        "Usage and crash reporting are not available on this platform.",
-                    )
-                    .small()
-                    .color(TEXT_DIM),
+                    egui::RichText::new("You chose to skip this one.")
+                        .small()
+                        .color(TEXT_DIM),
                 );
             }
-        },
+        }
+        update::Status::UpToDate => {
+            ui.label(
+                egui::RichText::new("You have the latest version.")
+                    .small()
+                    .color(TEXT_DIM),
+            );
+        }
+        update::Status::Failed => {
+            ui.label(
+                egui::RichText::new("Couldn't reach GitHub to check for updates.")
+                    .small()
+                    .color(TEXT_DIM),
+            );
+        }
+        update::Status::Unknown => {}
+    }
+
+    ui.horizontal(|ui| {
+        // Available whatever the stored answer is: clicking it *is* the
+        // consent for this one request, and it never writes an answer the user
+        // did not give.
+        if ui
+            .small_button("Check now")
+            .on_hover_text("Ask GitHub once whether a newer release exists")
+            .clicked()
+        {
+            updates.check(update::Trigger::Manual);
+        }
+        if notifying
+            && ui
+                .small_button("Skip this version")
+                .on_hover_text("Stop showing this one. Anything newer still appears.")
+                .clicked()
+        {
+            update::skip_current();
+        }
+    });
+}
+
+/// The two consent checkboxes. Consent must be as easy to withdraw as it was
+/// to give, but it doesn't earn permanent space in the main UI.
+///
+/// The copy in both explainers is a promise. Changing what either feature sends
+/// means changing this, [`consent_modal`], and the README's Privacy table.
+fn privacy_section(ui: &mut egui::Ui) {
+    if !config::is_supported() {
+        ui.label(
+            egui::RichText::new("Usage and crash reporting are not available on this platform.")
+                .small()
+                .color(TEXT_DIM),
+        );
+        return;
+    }
+
+    let mut share = analytics::enabled();
+    if ui
+        .checkbox(&mut share, "Share usage and crash data")
+        .changed()
+    {
+        analytics::set_consent(share);
+    }
+    ui.label(
+        egui::RichText::new(
+            "Plugin version and format (VST3/CLAP), OS, sample rate, capture \
+             outcomes and crash reports, labelled with a random ID. Never \
+             your audio.",
+        )
+        .small()
+        .color(TEXT_DIM),
+    );
+
+    ui.add_space(6.0);
+
+    let mut check_updates = config::update_checks_enabled();
+    if ui
+        .checkbox(&mut check_updates, "Check for new versions")
+        .changed()
+    {
+        config::set_update_consent(check_updates);
+    }
+    ui.label(
+        egui::RichText::new(
+            "Once a day, asks GitHub whether a newer release exists. Sends \
+             nothing about you, and never installs anything.",
+        )
+        .small()
+        .color(TEXT_DIM),
     );
 }
 
@@ -898,6 +1127,7 @@ fn control_bar(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
     params: &ConjureAlignParams,
+    updates: &update::UpdateHandle,
     capture_row_w: &mut f32,
 ) {
     ui.horizontal(|ui| {
@@ -926,7 +1156,7 @@ fn control_bar(
         // would be drawn through. Measured above, so this cannot disturb the
         // centering.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            settings_menu(ui);
+            settings_menu(ui, updates);
         });
     });
     ui.horizontal(|ui| {
