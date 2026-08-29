@@ -107,11 +107,12 @@ you opt in.
 
 | | |
 |---|---|
-| Sent | Plugin version, plugin format (VST3/CLAP), operating system, sample rate, and whether a capture succeeded or why it was rejected (bucketed — "0.9+" confidence, "1–10 ms" offset, not the actual figures). Whether a run ended in a crash. If it did: the error, and the ConjureAlign functions and source lines that led to it. |
+| Sent | Plugin version, plugin format (VST3/CLAP), operating system, sample rate, and whether a capture succeeded or why it was rejected (bucketed — "0.9+" confidence, "1–10 ms" offset, not the actual figures). Whether a run ended in a crash. If it did: the error, and the functions and source lines inside ConjureAlign's binary that led to it — its own code and the open-source libraries compiled into it. |
 | Never sent | Your audio, any measurement of it, your file or project names, host or machine names, IP-derived identity, or anything else. |
 
-A crash report names ConjureAlign's *own* code — its functions, and paths inside its source
-tree as it was built. It carries nothing from your machine: the list of other plugins loaded
+A crash report names code inside ConjureAlign's *own* binary — its functions and those of the
+open-source libraries compiled into it, with source paths as they were on the build machine,
+never yours. It carries nothing from your machine: the list of other plugins loaded
 alongside it is stripped before sending, and so is your computer's name.
 
 **2. Check for new versions?** A separate question, because it shares no data and creates no

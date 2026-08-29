@@ -740,8 +740,9 @@ fn analytics_question(ui: &mut egui::Ui) {
         egui::RichText::new(
             "Sent: plugin version and format (VST3/CLAP), operating system, sample \
              rate, whether a capture succeeded or why it was rejected, and whether \
-             a run ended in a crash. A crash also sends the error and the \
-             ConjureAlign code that led to it — labelled with a random ID.",
+             a run ended in a crash. A crash also sends the error and the code \
+             that led to it — ConjureAlign's own and the open-source libraries \
+             built into it — labelled with a random ID.",
         )
         .small()
         .color(TEXT_DIM),
