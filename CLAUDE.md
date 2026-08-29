@@ -46,7 +46,10 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   renderer: the panels alone (`gui_preview.png`, `_zoom`, `_spectrum`, `_spectrum_trim`)
   and — via a stub `GuiContext` behind a `ParamSetter` — the WHOLE editor at its 600×460
   minimum window (`_full.png`), which is the only scene that shows the vertical budget
-  (dead space under the control bar, a clipped bar), plus the floating surfaces that
+  (dead space under the control bar, a clipped bar); the same window mid-capture
+  (`_capturing.png`, `_capturing_paused.png`), which is the status strip at its tightest —
+  Stop+Cancel up and the longest messages, where every label must elide at the button edge
+  rather than paint through it; plus the floating surfaces that
   live outside `draw_ui` and would otherwise need a DAW and a click to see: the first-run
   prompt (`_consent.png`, both questions — the example points HOME at a scratch dir so it
   renders a virgin install rather than this machine's answers) and the ⚙ popover, with an
@@ -349,8 +352,9 @@ the update check. It renders only its unanswered questions, so the preview point
 scratch directory to get a virgin install; without that it would render whatever this machine
 has already answered. Two layout constraints learned the
 hard way: the status strip has **zero slack at the 600×460 minimum** (its labels already reach
-the Capture button and *overflow* rather than truncate, so anything parked there gets drawn
-through), which is why the gear rides the centered control-bar row's spare width instead; and
+the Capture button; every one goes through the truncating `status_label` and the row clips at
+the button edge — full text on hover — so parking anything else there costs status text),
+which is why the gear rides the centered control-bar row's spare width instead; and
 egui never flips a popup, so the gear's popover is explicitly `AboveOrBelow::Above` or it opens
 out through the window bottom.
 

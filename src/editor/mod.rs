@@ -610,10 +610,13 @@ fn active_window_ms(shared: &GuiShared) -> Option<f32> {
     Some(w as f32 / sr.max(1.0) * 1000.0)
 }
 
-/// A status message that truncates instead of running under the capture
-/// button when the window is narrow.
-fn status_label(ui: &mut egui::Ui, color: Color32, text: String) {
-    ui.add(egui::Label::new(egui::RichText::new(text).color(color)).truncate());
+/// A status-strip label: truncates (with the full text on hover) instead of
+/// running under the capture buttons when the row is narrow. EVERY label in
+/// the strip goes through this — the row is at its longest mid-capture,
+/// exactly when the wider Stop/Cancel pair is up, so any plain label after
+/// the phase message would otherwise be drawn through the buttons.
+fn status_label(ui: &mut egui::Ui, text: impl Into<egui::RichText>) {
+    ui.add(egui::Label::new(text.into()).truncate());
 }
 
 /// The capture control, top right of the status strip. Its buttons are
@@ -981,19 +984,21 @@ fn status_strip(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             capture_button(ui, capture, capture.phase());
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                // Backstop for status_label's truncation: once the width is
+                // exhausted, whatever still gets placed (a separator, the
+                // "…" stub of a later label) lands past the row's right
+                // edge, where the buttons already sit — clip it away.
+                ui.shrink_clip_rect(egui::Rect::everything_left_of(ui.max_rect().right()));
                 match capture.phase() {
                     PHASE_ARMED => {
                         let gate = capture.gate_state();
-                        // Truncating, not wrapping: these messages are the
-                        // long ones, and the row now ends at the capture
-                        // button rather than at the window edge.
                         status_label(
                             ui,
-                            ACCENT_LIVE,
-                            format!(
+                            egui::RichText::new(format!(
                                 "● Armed — waiting for signal ({})",
                                 quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)
-                            ),
+                            ))
+                            .color(ACCENT_LIVE),
                         );
                     }
                     PHASE_CAPTURING => {
@@ -1004,22 +1009,26 @@ fn status_strip(
                         if gate & GATE_OPEN == 0 {
                             status_label(
                                 ui,
-                                ACCENT_MAIN,
-                                format!(
+                                egui::RichText::new(format!(
                                     "● Capturing {secs:.1} s (paused — {}; analyzes after ~2 s of silence)",
                                     quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)
-                                ),
+                                ))
+                                .color(ACCENT_MAIN),
                             );
                         } else {
-                            ui.colored_label(ACCENT_MAIN, format!("● Capturing {secs:.1} s"));
+                            status_label(
+                                ui,
+                                egui::RichText::new(format!("● Capturing {secs:.1} s"))
+                                    .color(ACCENT_MAIN),
+                            );
                         }
                     }
                     PHASE_ANALYZING => {
-                        ui.colored_label(ACCENT_LIVE, "● Analyzing…");
+                        status_label(ui, egui::RichText::new("● Analyzing…").color(ACCENT_LIVE));
                         ui.spinner();
                     }
                     _ => {
-                        ui.colored_label(TEXT_DIM, "● Idle");
+                        status_label(ui, egui::RichText::new("● Idle").color(TEXT_DIM));
                     }
                 }
                 ui.separator();
@@ -1028,24 +1037,34 @@ fn status_strip(
                 if conf > 0.0 {
                     let off = params.detected_offset_ms.load(Ordering::Relaxed);
                     let pol = params.detected_polarity.load(Ordering::Relaxed);
-                    ui.label(format!("Detected {off:+.2} ms"));
-                    ui.label(format!("Confidence {:.0}%", conf * 100.0));
-                    ui.label(if pol {
-                        "Polarity inverted"
-                    } else {
-                        "Polarity normal"
-                    });
+                    status_label(ui, format!("Detected {off:+.2} ms"));
+                    status_label(ui, format!("Confidence {:.0}%", conf * 100.0));
+                    status_label(
+                        ui,
+                        if pol {
+                            "Polarity inverted"
+                        } else {
+                            "Polarity normal"
+                        },
+                    );
                 } else {
-                    ui.colored_label(TEXT_DIM, "No offset detected yet");
+                    status_label(
+                        ui,
+                        egui::RichText::new("No offset detected yet").color(TEXT_DIM),
+                    );
                 }
                 ui.separator();
 
                 if !params.align_on.value() {
-                    ui.colored_label(TEXT_DIM, "Alignment off");
+                    status_label(ui, egui::RichText::new("Alignment off").color(TEXT_DIM));
                 } else if net_clamped {
-                    ui.colored_label(ACCENT_WARN, format!("Applied {net_ms:+.2} ms (clamped)"));
+                    status_label(
+                        ui,
+                        egui::RichText::new(format!("Applied {net_ms:+.2} ms (clamped)"))
+                            .color(ACCENT_WARN),
+                    );
                 } else {
-                    ui.label(format!("Applied {net_ms:+.2} ms"));
+                    status_label(ui, format!("Applied {net_ms:+.2} ms"));
                 }
             });
         });
