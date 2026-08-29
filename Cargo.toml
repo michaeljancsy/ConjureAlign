@@ -51,6 +51,29 @@ getrandom = "0.4"
 # in without taking an unreleased git rev.
 [target.'cfg(target_os = "macos")'.dependencies]
 clap-wrapper = { path = "deps/clap-wrapper-rs", default-features = false, features = ["auv2", "parallel"] }
+# Host/OS identification for the opt-in reporters (src/host.rs). Both were
+# already compiled into this target before being declared here — `libc` is an
+# unconditional dependency of sentry-contexts, and `core-foundation-sys` arrives
+# under both baseview and native-tls — so neither adds build time or binary
+# weight, only an explicit edge.
+#
+# `core-foundation-sys`, NOT the safe `core-foundation` wrapper: its
+# `CFBundle::main_bundle()` goes through `wrap_under_get_rule`, which asserts on
+# a NULL reference. `CFBundleGetMainBundle()` legitimately returns NULL in an
+# unbundled host (auval, clap-validator), and that assert would fire inside the
+# host's `extern "C"` activation frame — a DAW abort, not a missing property.
+libc = "0.2"
+core-foundation-sys = "0.8"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# The host executable's VS_FIXEDFILEINFO block (src/host.rs). `version.dll` has
+# no crates.io-free alternative, and windows-sys is bindings only.
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+# The running Windows version, via RtlGetVersion — which, unlike GetVersionEx,
+# does not lie to a process with no compatibility manifest. Already in the graph
+# here: sentry-contexts uses os_info on Windows (and `uname` elsewhere, which is
+# why macOS reads sysctl instead).
+os_info = { version = "3", default-features = false }
 
 # Networking for the two opt-in reporters, on the two platforms that ship binaries.
 # native-tls is a thin binding to the OS stack — Security.framework on macOS,

@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use atomic_float::AtomicF32;
 
 use crate::analysis::RejectReason;
+use crate::host::HostInfo;
 use crate::net::{self, Endpoint};
 
 // Consent is one question covering analytics and crash reporting, stored
@@ -59,9 +60,25 @@ pub enum AnalyticsEvent {
     /// "Session Start" — Mixpanel ships a built-in virtual event,
     /// `$session_start`, whose display name is exactly "Session Start", and
     /// two identically labelled entries in the event picker is a trap.
-    PluginLoaded { sample_rate: f32 },
-    CaptureCompleted { confidence: f32, offset_ms: f32 },
-    CaptureRejected { reason: RejectReason },
+    PluginLoaded {
+        sample_rate: f32,
+    },
+    CaptureCompleted {
+        confidence: f32,
+        offset_ms: f32,
+        /// Seconds of *gated* signal, not wall clock: silence is spliced out
+        /// as it is recorded.
+        capture_seconds: f32,
+        splice_count: usize,
+        polarity_inverted: bool,
+    },
+    CaptureRejected {
+        reason: RejectReason,
+        /// Carried here too, because it is what separates "the user never
+        /// played anything" from "they played, and the correlation was bad".
+        capture_seconds: f32,
+        splice_count: usize,
+    },
 }
 
 /// Bucketed, never raw: a precise confidence figure would say more about the
@@ -87,6 +104,38 @@ pub fn offset_bucket(offset_ms: f32) -> &'static str {
     }
 }
 
+/// Bucketed like the rest: the exact length of a take describes the user's
+/// material. The edges are the ones that change a decision — the top bucket is
+/// "hit the `CAPTURE_MAX_SECS` buffer cap", the bottom is "barely anything got
+/// through the gate".
+pub fn capture_seconds_bucket(seconds: f32) -> &'static str {
+    match seconds {
+        s if s < 0.5 => "<0.5s",
+        s if s < 1.0 => "0.5-1s",
+        s if s < 2.0 => "1-2s",
+        s if s < 4.0 => "2-4s",
+        // Also catches a non-finite reading. That cannot come from a real
+        // capture — the buffers are sized in `initialize()` and the sample
+        // rate is known — but a NaN failing every guard above must not be
+        // reported as the *shortest* bucket.
+        _ => "4s+",
+    }
+}
+
+/// How badly the gate chopped a take up, which is the readable symptom of a
+/// wrong `gate_threshold` default. `"max"` is its own bucket because at
+/// `MAX_SPLICES` the seam list stops growing and the rest of the capture
+/// records continuously — past that point the count is a floor, not a total.
+pub fn splice_count_bucket(count: usize) -> &'static str {
+    match count {
+        0 => "0",
+        1..=3 => "1-3",
+        4..=10 => "4-10",
+        c if c < crate::capture::MAX_SPLICES => "11+",
+        _ => "max",
+    }
+}
+
 pub fn reason_str(reason: RejectReason) -> &'static str {
     match reason {
         RejectReason::TooShort => "too_short",
@@ -96,19 +145,45 @@ pub fn reason_str(reason: RejectReason) -> &'static str {
     }
 }
 
-/// One Mixpanel event object. `time` is milliseconds since the epoch, which is
-/// what the ingestion API expects.
-pub fn build_payload(
-    event: &AnalyticsEvent,
-    device_id: &str,
-    now_millis: u64,
-) -> serde_json::Value {
+/// Everything an event carries that is not the event itself: the identity, the
+/// clock, and the environment. Passed in rather than read from globals so
+/// `build_payload` stays pure and its assertions stay meaningful on any machine.
+pub struct EventContext<'a> {
+    pub device_id: &'a str,
+    /// Milliseconds since the epoch — what the ingestion API expects.
+    pub now_millis: u64,
+    /// The API this instance is hosted through: "CLAP", "VST3" or
+    /// "standalone". `None` before `initialize()` has run.
+    ///
+    /// AudioUnit reports as CLAP, and there is no fixing that here:
+    /// clap-wrapper translates AU calls into calls on our own `clap_entry`, so
+    /// nih-plug genuinely never sees an AU. The `daw` property is what
+    /// separates them in practice — Logic and GarageBand load only the AU.
+    pub plugin_format: Option<&'static str>,
+    pub host: &'a HostInfo,
+}
+
+/// One Mixpanel event object.
+pub fn build_payload(event: &AnalyticsEvent, ctx: &EventContext) -> serde_json::Value {
     let mut props = serde_json::Map::new();
     props.insert("token".into(), MIXPANEL_TOKEN.into());
-    props.insert("distinct_id".into(), device_id.into());
-    props.insert("time".into(), now_millis.into());
+    props.insert("distinct_id".into(), ctx.device_id.into());
+    props.insert("time".into(), ctx.now_millis.into());
     props.insert("plugin_version".into(), env!("CARGO_PKG_VERSION").into());
+    // The build target, which cannot move for a given install...
     props.insert("os".into(), std::env::consts::OS.into());
+    // ...as opposed to the running OS, which can, and which is what tells a
+    // crash cluster apart from a platform-wide regression.
+    if let Some(version) = &ctx.host.os_version {
+        props.insert("os_version".into(), version.as_str().into());
+    }
+    props.insert("daw".into(), ctx.host.daw.into());
+    if let Some(version) = &ctx.host.daw_version {
+        props.insert("daw_version".into(), version.as_str().into());
+    }
+    if let Some(format) = ctx.plugin_format {
+        props.insert("plugin_format".into(), format.into());
+    }
 
     let name = match event {
         AnalyticsEvent::PluginLoaded { sample_rate } => {
@@ -118,13 +193,31 @@ pub fn build_payload(
         AnalyticsEvent::CaptureCompleted {
             confidence,
             offset_ms,
+            capture_seconds,
+            splice_count,
+            polarity_inverted,
         } => {
             props.insert("confidence".into(), confidence_bucket(*confidence).into());
             props.insert("offset".into(), offset_bucket(*offset_ms).into());
+            props.insert(
+                "capture_length".into(),
+                capture_seconds_bucket(*capture_seconds).into(),
+            );
+            props.insert("splices".into(), splice_count_bucket(*splice_count).into());
+            props.insert("polarity_inverted".into(), (*polarity_inverted).into());
             "Capture Completed"
         }
-        AnalyticsEvent::CaptureRejected { reason } => {
+        AnalyticsEvent::CaptureRejected {
+            reason,
+            capture_seconds,
+            splice_count,
+        } => {
             props.insert("reason".into(), reason_str(*reason).into());
+            props.insert(
+                "capture_length".into(),
+                capture_seconds_bucket(*capture_seconds).into(),
+            );
+            props.insert("splices".into(), splice_count_bucket(*splice_count).into());
             "Capture Rejected"
         }
     };
@@ -162,6 +255,10 @@ pub struct AnalyticsHandle {
     session_sent: AtomicBool,
     /// Zero until `note_session` has run; also the Plugin Loaded payload.
     sample_rate: AtomicF32,
+    /// Set once by `note_session`. A `OnceLock` rather than a plain field
+    /// because hosts re-run `initialize()` freely, but never with a different
+    /// plugin API for the same instance.
+    plugin_format: OnceLock<&'static str>,
 }
 
 impl AnalyticsHandle {
@@ -171,8 +268,9 @@ impl AnalyticsHandle {
 
     /// Called from `initialize()`. Idempotent across host re-initializations,
     /// so a state load or sample-rate change never doubles the session count.
-    pub fn note_session(&self, sample_rate: f32) {
+    pub fn note_session(&self, sample_rate: f32, plugin_format: &'static str) {
         self.sample_rate.store(sample_rate, Ordering::Relaxed);
+        let _ = self.plugin_format.set(plugin_format);
         self.flush_session();
     }
 
@@ -215,7 +313,15 @@ impl AnalyticsHandle {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let batch = serde_json::Value::Array(vec![build_payload(&event, &device_id, now_millis)]);
+        // `host::info()` resolves on first use and is cached process-wide; it
+        // runs here, on the main or background thread, never on the audio one.
+        let ctx = EventContext {
+            device_id: &device_id,
+            now_millis,
+            plugin_format: self.plugin_format.get().copied(),
+            host: crate::host::info(),
+        };
+        let batch = serde_json::Value::Array(vec![build_payload(&event, &ctx)]);
         let body = batch.to_string();
 
         // The return value is deliberately ignored: a dropped analytics event
@@ -230,6 +336,26 @@ impl AnalyticsHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::params::CAPTURE_MAX_SECS;
+
+    /// A fixed environment, so payload assertions do not depend on the machine
+    /// the tests happen to run on.
+    fn test_host() -> HostInfo {
+        HostInfo {
+            daw: "Ableton Live",
+            daw_version: Some("12.1.5".into()),
+            os_version: Some("26.3.1".into()),
+        }
+    }
+
+    fn ctx<'a>(device_id: &'a str, now_millis: u64, host: &'a HostInfo) -> EventContext<'a> {
+        EventContext {
+            device_id,
+            now_millis,
+            plugin_format: Some("VST3"),
+            host,
+        }
+    }
 
     #[test]
     fn confidence_buckets_cover_the_range() {
@@ -259,8 +385,12 @@ mod tests {
         let event = AnalyticsEvent::CaptureCompleted {
             confidence: 0.94,
             offset_ms: -3.75,
+            capture_seconds: 2.8125,
+            splice_count: 7,
+            polarity_inverted: true,
         };
-        let v = build_payload(&event, "abc123", 1_700_000_000_000);
+        let host = test_host();
+        let v = build_payload(&event, &ctx("abc123", 1_700_000_000_000, &host));
         assert_eq!(v["event"], "Capture Completed");
         let props = &v["properties"];
         assert_eq!(props["token"], MIXPANEL_TOKEN);
@@ -269,34 +399,150 @@ mod tests {
         assert_eq!(props["plugin_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(props["confidence"], "0.9+");
         assert_eq!(props["offset"], "1-10ms");
+        assert_eq!(props["capture_length"], "2-4s");
+        assert_eq!(props["splices"], "4-10");
+        // The one raw value that ships: a single bit about the wiring, which
+        // no bucket could coarsen further.
+        assert_eq!(props["polarity_inverted"], true);
 
         // The raw measurements must not survive anywhere in the payload.
         let text = v.to_string();
         assert!(!text.contains("0.94"), "raw confidence leaked: {text}");
         assert!(!text.contains("3.75"), "raw offset leaked: {text}");
+        assert!(!text.contains("2.8125"), "raw capture length leaked: {text}");
+        assert!(!text.contains(":7"), "raw splice count leaked: {text}");
     }
 
     #[test]
-    fn rejection_payload_names_the_reason() {
-        let v = build_payload(
-            &AnalyticsEvent::CaptureRejected {
-                reason: RejectReason::LowConfidence,
-            },
-            "d",
-            1,
-        );
-        assert_eq!(v["event"], "Capture Rejected");
-        assert_eq!(v["properties"]["reason"], "low_confidence");
+    fn capture_length_buckets_cover_the_range() {
+        assert_eq!(capture_seconds_bucket(0.0), "<0.5s");
+        assert_eq!(capture_seconds_bucket(0.49), "<0.5s");
+        assert_eq!(capture_seconds_bucket(0.5), "0.5-1s");
+        assert_eq!(capture_seconds_bucket(0.99), "0.5-1s");
+        assert_eq!(capture_seconds_bucket(1.0), "1-2s");
+        assert_eq!(capture_seconds_bucket(2.0), "2-4s");
+        assert_eq!(capture_seconds_bucket(3.99), "2-4s");
+        // The buffer cap: "the user filled it and we stopped for them".
+        assert_eq!(capture_seconds_bucket(CAPTURE_MAX_SECS as f32), "4s+");
+
+        // A non-finite reading must not read as the shortest capture.
+        assert_eq!(capture_seconds_bucket(f32::NAN), "4s+");
+        assert_eq!(capture_seconds_bucket(f32::INFINITY), "4s+");
     }
 
     #[test]
-    fn session_payload_carries_the_sample_rate() {
+    fn splice_buckets_separate_the_tracking_limit() {
+        assert_eq!(splice_count_bucket(0), "0");
+        assert_eq!(splice_count_bucket(1), "1-3");
+        assert_eq!(splice_count_bucket(3), "1-3");
+        assert_eq!(splice_count_bucket(4), "4-10");
+        assert_eq!(splice_count_bucket(10), "4-10");
+        assert_eq!(splice_count_bucket(11), "11+");
+        assert_eq!(splice_count_bucket(crate::capture::MAX_SPLICES - 1), "11+");
+        // At capacity the seam list stops growing, so the count is a floor
+        // rather than a total — a distinction the bucket has to preserve.
+        assert_eq!(splice_count_bucket(crate::capture::MAX_SPLICES), "max");
+        assert_eq!(splice_count_bucket(crate::capture::MAX_SPLICES + 100), "max");
+    }
+
+    #[test]
+    fn payload_carries_the_host_environment() {
+        let host = test_host();
         let v = build_payload(
             &AnalyticsEvent::PluginLoaded {
                 sample_rate: 48_000.0,
             },
-            "d",
-            1,
+            &ctx("d", 1, &host),
+        );
+        let props = &v["properties"];
+        assert_eq!(props["daw"], "Ableton Live");
+        assert_eq!(props["daw_version"], "12.1.5");
+        assert_eq!(props["os_version"], "26.3.1");
+        assert_eq!(props["plugin_format"], "VST3");
+        // The build target stays alongside the running version, not replaced
+        // by it: they answer different questions.
+        assert_eq!(props["os"], std::env::consts::OS);
+    }
+
+    /// Absent values are left OUT of the payload rather than sent as null —
+    /// a null lands in Mixpanel's lexicon as a real value and pollutes every
+    /// breakdown on the property.
+    #[test]
+    fn unresolved_environment_values_are_omitted_not_nulled() {
+        let host = HostInfo {
+            daw: crate::host::UNKNOWN_DAW,
+            daw_version: None,
+            os_version: None,
+        };
+        let v = build_payload(
+            &AnalyticsEvent::PluginLoaded {
+                sample_rate: 48_000.0,
+            },
+            &EventContext {
+                device_id: "d",
+                now_millis: 1,
+                // Before `initialize()` has run there is no format to report.
+                plugin_format: None,
+                host: &host,
+            },
+        );
+        let props = v["properties"].as_object().unwrap();
+        assert_eq!(props["daw"], "other");
+        assert!(!props.contains_key("daw_version"), "{props:?}");
+        assert!(!props.contains_key("os_version"), "{props:?}");
+        assert!(!props.contains_key("plugin_format"), "{props:?}");
+    }
+
+    /// What leaves names the DAW, never the path it was found at.
+    #[test]
+    fn payload_never_carries_a_filesystem_path() {
+        let event = AnalyticsEvent::CaptureCompleted {
+            confidence: 0.94,
+            offset_ms: -3.75,
+            capture_seconds: 2.8125,
+            splice_count: 7,
+            polarity_inverted: false,
+        };
+        let text = build_payload(&event, &ctx("abc123", 1, crate::host::info())).to_string();
+        for fragment in ["/Users/", "/Applications", "C:\\", "\\Program Files", "/home/"] {
+            assert!(!text.contains(fragment), "path leaked ({fragment}): {text}");
+        }
+    }
+
+    #[test]
+    fn rejection_payload_names_the_reason() {
+        let host = test_host();
+        let v = build_payload(
+            &AnalyticsEvent::CaptureRejected {
+                reason: RejectReason::LowConfidence,
+                capture_seconds: 0.2,
+                splice_count: 0,
+            },
+            &ctx("d", 1, &host),
+        );
+        assert_eq!(v["event"], "Capture Rejected");
+        assert_eq!(v["properties"]["reason"], "low_confidence");
+        // A rejection carries the capture's shape too: "nothing got through
+        // the gate" and "plenty did, but it did not correlate" are different
+        // problems with the same `reason`.
+        assert_eq!(v["properties"]["capture_length"], "<0.5s");
+        assert_eq!(v["properties"]["splices"], "0");
+        // No result, so no polarity to report.
+        assert!(v["properties"]
+            .as_object()
+            .unwrap()
+            .get("polarity_inverted")
+            .is_none());
+    }
+
+    #[test]
+    fn session_payload_carries_the_sample_rate() {
+        let host = test_host();
+        let v = build_payload(
+            &AnalyticsEvent::PluginLoaded {
+                sample_rate: 48_000.0,
+            },
+            &ctx("d", 1, &host),
         );
         assert_eq!(v["event"], "Plugin Loaded");
         assert_eq!(v["properties"]["sample_rate"], 48_000u64);
@@ -330,12 +576,18 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
+        // The live environment on purpose: the smoke test is also how a new
+        // `daw` / `os_version` value gets seen once in the real project.
         let body = serde_json::Value::Array(vec![build_payload(
             &AnalyticsEvent::PluginLoaded {
                 sample_rate: 48_000.0,
             },
-            "smoke-test",
-            now_millis,
+            &EventContext {
+                device_id: "smoke-test",
+                now_millis,
+                plugin_format: Some("standalone"),
+                host: crate::host::info(),
+            },
         )])
         .to_string();
 

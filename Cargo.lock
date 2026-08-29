@@ -857,16 +857,20 @@ dependencies = [
  "atomic_float",
  "atomic_refcell",
  "clap-wrapper",
+ "core-foundation-sys",
  "egui_kittest",
  "getrandom 0.4.3",
  "image",
+ "libc",
  "native-tls",
  "nih_plug",
  "nih_plug_egui",
+ "os_info",
  "realfft",
  "sentry",
  "serde_json",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -725,36 +725,15 @@ pub fn consent_modal(ctx: &egui::Context) {
     });
 }
 
-/// Question one. The wording here is a promise: it must stay in step with what
-/// `analytics::build_payload` and `crash::scrub` actually send, and with the
-/// README's Privacy table.
+/// Question one. Deliberately just the question and the two answers: the
+/// enumeration of what is collected was removed by product decision on
+/// 2026-08-28, so nothing in the UI describes the payload. `CLAUDE.md` and the
+/// `analytics`/`host` module docs are the only remaining record of it.
+///
+/// Question two below still carries its copy — it was added separately, covers
+/// a feature that sends nothing, and was not part of that decision.
 fn analytics_question(ui: &mut egui::Ui) {
     ui.heading("Share anonymous usage and crash data?");
-    ui.add_space(8.0);
-    ui.label(
-        "It shows me how often ConjureAlign is used, how often a capture fails, \
-         and when it crashes — which is what tells me where to spend effort.",
-    );
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new(
-            "Sent: plugin version and format (VST3/CLAP), operating system, sample \
-             rate, whether a capture succeeded or why it was rejected, and whether \
-             a run ended in a crash. A crash also sends the error and the code \
-             that led to it — ConjureAlign's own and the open-source libraries \
-             built into it — labelled with a random ID.",
-        )
-        .small()
-        .color(TEXT_DIM),
-    );
-    ui.label(
-        egui::RichText::new(
-            "Never sent: your audio, any measurement of it, your file or project \
-             names, your computer's name, or anything that identifies you.",
-        )
-        .small()
-        .color(TEXT_DIM),
-    );
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         if ui.button("No thanks").clicked() {
@@ -975,20 +954,11 @@ fn privacy_section(ui: &mut egui::Ui) {
 
     let mut share = analytics::enabled();
     if ui
-        .checkbox(&mut share, "Share usage and crash data")
+        .checkbox(&mut share, "Share anonymous usage and crash data")
         .changed()
     {
         analytics::set_consent(share);
     }
-    ui.label(
-        egui::RichText::new(
-            "Plugin version and format (VST3/CLAP), OS, sample rate, capture \
-             outcomes and crash reports, labelled with a random ID. Never \
-             your audio.",
-        )
-        .small()
-        .color(TEXT_DIM),
-    );
 
     ui.add_space(6.0);
 
