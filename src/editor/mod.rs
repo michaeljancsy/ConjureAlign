@@ -269,19 +269,14 @@ pub fn create(
                 }
 
                 // Pick up a freshly published snapshot; invalidate the caches and
-                // refit the waveform view when it changes.
-                // Poison-tolerant: a panic in the analysis task while publishing
-                // would otherwise turn every subsequent frame into a panic of its
-                // own — each one now a Sentry report plus a blocking flush.
-                let latest = shared
-                    .snapshot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
+                // refit the waveform view when it changes. `Some → None` is a
+                // change too: a state load restoring a pre-capture session
+                // clears the cell, and the graphs must follow.
+                let latest = shared.snapshot.get();
                 let changed = match (&state.snapshot, &latest) {
                     (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
-                    (None, Some(_)) => true,
-                    _ => false,
+                    (None, Some(_)) | (Some(_), None) => true,
+                    (None, None) => false,
                 };
                 if changed {
                     state.snapshot = latest;

@@ -36,7 +36,7 @@ use crate::analysis::{AnalysisReport, AnalysisResult, RejectReason};
 pub const DB_FLOOR_POWER: f32 = 1e-12;
 
 /// No FFT shorter than this — fewer bins than pixels helps nobody.
-const MIN_NFFT: usize = 256;
+pub const MIN_NFFT: usize = 256;
 
 /// Welch-averaged spectra of a capture pair. Bin `k` covers frequency
 /// `k · sample_rate / nfft`; all three vectors have `nfft/2 + 1` bins.

@@ -171,11 +171,22 @@ reach `data`). Waveform and correlation data reach the GUI exclusively through
 positions ride along for the waveform markers) plus the normalized correlation curve per
 integer lag, built by the
 background task at the end of `Task::Analyze` (allocation is fine there) and published via
-`Mutex<Option<Arc<AnalysisSnapshot>>>` before the phase returns to Idle. The audio thread
+`shared::SnapshotCell` (a poison-tolerant `Mutex<Option<Arc<AnalysisSnapshot>>>`) before the
+phase returns to Idle. The audio thread
 never touches that mutex; its only GUI-related work is a handful of atomic loads/stores per
-block (capture request swap, progress). The snapshot is deliberately not persisted: after a
-session reload the GUI shows the restored detected values but no waveforms until the next
-capture. The editor decimates the raw snapshot per zoom level GUI-side
+block (capture request swap, progress). The snapshot IS persisted into the DAW session: the
+cell is also the `#[persist = "analysis-snapshot"]` field on the Params struct (one shared
+`Arc`, wired in `ConjureAlign::default()`), so a host save picks up whatever the task last
+published and a reload restores the graphs alongside the detected values.
+`src/snapshot_persist.rs` owns the wire format — a versioned DTO with the sample buffers as
+base64 raw-LE-f32 inside nih-plug's JSON state, full fidelity by explicit product decision
+(2026-08-29) at ≈2.3 MB of state per instance at 48 kHz (≈9 MB at 192 kHz), rewritten every
+host save. Its decode side trusts nothing (validators fuzz plugin state): every length is
+capped before the allocation it sizes, and any failure — or a future format version —
+degrades to "no snapshot" without disturbing the other persist fields. Encode runs outside
+the cell's lock, so an editor frame never waits behind a save; a state load CAN store `None`
+(pre-capture save), which is why the editor's change detector treats `Some → None` as a
+change. The editor decimates the raw snapshot per zoom level GUI-side
 (`editor/decimate.rs`, pure + unit-tested); the applied-shift math in `editor::net_shift`
 mirrors `ConjureAlign::current_target` — keep the two in sync. Editor window size persists via
 `#[persist = "editor-state"]` (`Arc<EguiState>`).

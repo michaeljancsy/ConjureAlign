@@ -66,6 +66,14 @@ fn main() {
         spectrum,
         outcome: report.outcome,
     });
+    // Every scene renders from a snapshot that has been through the session
+    // persistence codec: the codec is bit-preserving, so identical PNGs are
+    // the proof that a reloaded project draws exactly what was saved.
+    let snapshot = conjure_align::snapshot_persist::decode(
+        &conjure_align::snapshot_persist::encode(Some(&snapshot)),
+    )
+    .expect("preview snapshot should survive its own codec")
+    .expect("encode(Some) must decode to Some");
 
     // Live marker deliberately off-peak: trim = +1.5 ms on top of detection.
     let trim_ms = 1.5f32;
@@ -245,7 +253,7 @@ fn render_full(out: &str, snapshot: &Arc<AnalysisSnapshot>, detected_ms: f32, ov
         .store(0.9, std::sync::atomic::Ordering::Relaxed);
     let shared = GuiShared::default();
     shared.set_window(960, snapshot.sample_rate);
-    *shared.snapshot.lock().unwrap() = Some(snapshot.clone());
+    shared.snapshot.store(Some(snapshot.clone()));
     let capture = Arc::new(CaptureState::new()).handle();
     let updates = Arc::new(conjure_align::update::UpdateHandle::new());
     // Scenes render in one process and the status is process-wide, so each one

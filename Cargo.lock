@@ -856,6 +856,7 @@ version = "1.1.0"
 dependencies = [
  "atomic_float",
  "atomic_refcell",
+ "base64",
  "clap-wrapper",
  "core-foundation-sys",
  "egui_kittest",
@@ -868,6 +869,7 @@ dependencies = [
  "os_info",
  "realfft",
  "sentry",
+ "serde",
  "serde_json",
  "ureq",
  "windows-sys 0.61.2",
