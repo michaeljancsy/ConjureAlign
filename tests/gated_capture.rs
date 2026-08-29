@@ -154,7 +154,10 @@ fn gated_capture_analyze_correct_leaves_residual_below_a_tenth_sample() {
         }
         prev_record = record;
     }
-    assert_eq!(filled, cap_len, "8 s of bursts must fill the 4 s gated buffer");
+    assert_eq!(
+        filled, cap_len,
+        "8 s of bursts must fill the 4 s gated buffer"
+    );
     assert!(
         !splices.is_empty() && splices.len() <= 4,
         "expected a few seams, got {:?}",
@@ -191,14 +194,9 @@ fn gated_capture_analyze_correct_leaves_residual_below_a_tenth_sample() {
     // splice guards (width = the window) cover that mismatch region
     // (true_offset + FIR tail ≈ 364 samples).
     let compensated: Vec<f32> = output[latency..].to_vec();
-    let residual = analysis::analyze_spliced(
-        &compensated,
-        &cr[..compensated.len()],
-        600,
-        &splices,
-    )
-    .outcome
-    .expect("residual analysis must succeed");
+    let residual = analysis::analyze_spliced(&compensated, &cr[..compensated.len()], 600, &splices)
+        .outcome
+        .expect("residual analysis must succeed");
     assert!(
         residual.offset_samples.abs() < 0.1,
         "residual misalignment {} samples",

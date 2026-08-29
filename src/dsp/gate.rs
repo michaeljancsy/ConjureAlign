@@ -275,6 +275,8 @@ mod tests {
         assert!(!nans[59_999]);
         // And NaN alone never opens a closed gate.
         let mut gate = CaptureGate::new(SR, THRESH);
-        assert!(run(&mut gate, f32::NAN, f32::NAN, 48_000).iter().all(|&r| !r));
+        assert!(run(&mut gate, f32::NAN, f32::NAN, 48_000)
+            .iter()
+            .all(|&r| !r));
     }
 }

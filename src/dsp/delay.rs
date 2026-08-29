@@ -212,7 +212,11 @@ mod tests {
                 .enumerate()
                 .max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap())
                 .unwrap();
-            assert_eq!(peak.0, d_total, "impulse arrived at {} not {d_total}", peak.0);
+            assert_eq!(
+                peak.0, d_total,
+                "impulse arrived at {} not {d_total}",
+                peak.0
+            );
             assert!((peak.1 - 1.0).abs() < 1e-4, "peak amplitude {}", peak.1);
         }
     }
@@ -234,8 +238,7 @@ mod tests {
         let out = process_all(&mut delay, &[input]);
         // Compare against the analytically delayed sine, well after startup.
         for i in 1000..n {
-            let expected =
-                (2.0 * std::f64::consts::PI * freq * (i as f64 - d_total)).sin() as f32;
+            let expected = (2.0 * std::f64::consts::PI * freq * (i as f64 - d_total)).sin() as f32;
             assert!(
                 (out[0][i] - expected).abs() < 1e-3,
                 "sample {i}: {} vs {expected}",
@@ -293,8 +296,8 @@ mod tests {
         }
         // After the fade the output equals the pure new-tap signal.
         for i in n - 1000..n {
-            let expected = (2.0 * std::f64::consts::PI * freq * ((8192 + i) as f64 - 700.5))
-                .sin() as f32;
+            let expected =
+                (2.0 * std::f64::consts::PI * freq * ((8192 + i) as f64 - 700.5)).sin() as f32;
             assert!(
                 (out[0][i] - expected).abs() < 1e-3,
                 "sample {i}: {} vs {expected}",

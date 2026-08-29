@@ -706,7 +706,10 @@ mod imp {
                     next: ureq::middleware::MiddlewareNext,
                 ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
                     *self.0.lock().unwrap() = Some((
-                        std::thread::current().name().unwrap_or("<unnamed>").to_owned(),
+                        std::thread::current()
+                            .name()
+                            .unwrap_or("<unnamed>")
+                            .to_owned(),
                         is_sentry_internal_thread(),
                     ));
                     next.handle(request)

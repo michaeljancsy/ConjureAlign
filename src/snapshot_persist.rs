@@ -42,8 +42,7 @@ pub const BLOB_VERSION: u32 = 1;
 /// host runs at; the caps only need to bound hostile input, not to be tight.
 const MAX_SAMPLE_RATE: f32 = 384_000.0;
 const MAX_WAVE_SAMPLES: usize = CAPTURE_MAX_SECS * MAX_SAMPLE_RATE as usize;
-const MAX_SHIFT_SAMPLES_CAP: usize =
-    (MAX_SHIFT_MAX_MS / 1000.0 * MAX_SAMPLE_RATE) as usize;
+const MAX_SHIFT_SAMPLES_CAP: usize = (MAX_SHIFT_MAX_MS / 1000.0 * MAX_SAMPLE_RATE) as usize;
 /// `pick_nfft` at the rate cap: `(384_000 / 6).next_power_of_two()`.
 const MAX_NFFT: usize = 65_536;
 
@@ -326,7 +325,9 @@ mod tests {
             reference: vec![0.5, -0.5, 0.125, -0.125, 3.0e5, -3.0e5],
             sample_rate: 48_000.0,
             max_shift_samples,
-            corr: (0..2 * max_shift_samples + 1).map(|i| i as f32 * 0.1).collect(),
+            corr: (0..2 * max_shift_samples + 1)
+                .map(|i| i as f32 * 0.1)
+                .collect(),
             splices: vec![2, 4],
             spectrum: Some(SpectrumData {
                 nfft: 256,
@@ -501,9 +502,9 @@ mod tests {
 
         let snap = sample_snapshot(Err(RejectReason::Silence));
         let source = ConjureAlignParams::default();
-        source.snapshot.store(Some(Arc::new(sample_snapshot(Err(
-            RejectReason::Silence,
-        )))));
+        source
+            .snapshot
+            .store(Some(Arc::new(sample_snapshot(Err(RejectReason::Silence)))));
         let fields = source.serialize_fields();
         assert!(fields.contains_key("analysis-snapshot"));
 

@@ -70,7 +70,11 @@ pub fn config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var_os("APPDATA")?;
-        Some(PathBuf::from(appdata).join("ConjureDSP").join("ConjureAlign"))
+        Some(
+            PathBuf::from(appdata)
+                .join("ConjureDSP")
+                .join("ConjureAlign"),
+        )
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -410,7 +414,9 @@ mod tests {
         declined.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path), declined);
         // A declined install must leave no identifier behind.
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("device_id"));
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("device_id"));
     }
 
     /// The upgrade path: a file written before update checks existed must read
@@ -439,7 +445,9 @@ mod tests {
         cfg.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path), cfg);
         // Saying yes to update checks must not mint an identifier.
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("device_id"));
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("device_id"));
     }
 
     #[test]

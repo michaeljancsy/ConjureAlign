@@ -43,7 +43,8 @@ use crate::net::{self, Endpoint};
 /// The release feed. `/releases/latest` already excludes drafts and
 /// pre-releases, so un-advertising a bad release means marking it pre-release —
 /// which is the right thing to do to it anyway.
-const DEFAULT_ENDPOINT: &str = "https://api.github.com/repos/michaeljancsy/ConjureAlign/releases/latest";
+const DEFAULT_ENDPOINT: &str =
+    "https://api.github.com/repos/michaeljancsy/ConjureAlign/releases/latest";
 /// Points the check at a local sink for tests and manual QA, mirroring
 /// `analytics`'s and `crash`'s overrides.
 const ENDPOINT_ENV: &str = "CONJURE_ALIGN_UPDATE_URL";
@@ -72,7 +73,9 @@ pub enum Status {
     UpToDate,
     /// A newer release exists. Carries only the version — the link is
     /// [`RELEASES_URL`], never anything from the response.
-    Available { version: String },
+    Available {
+        version: String,
+    },
     /// The last check did not produce an answer. Surfaced only for a manual
     /// check, where the user is waiting for one.
     Failed,
@@ -103,7 +106,10 @@ pub fn current_version() -> &'static str {
 /// older, or does not exist.
 pub fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
     let s = s.trim();
-    let s = s.strip_prefix('v').or_else(|| s.strip_prefix('V')).unwrap_or(s);
+    let s = s
+        .strip_prefix('v')
+        .or_else(|| s.strip_prefix('V'))
+        .unwrap_or(s);
     let mut parts = s.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -375,7 +381,10 @@ mod tests {
 
     #[test]
     fn newer_is_compared_numerically_not_lexically() {
-        assert!(is_newer("1.9.0", "1.10.0"), "the classic string-compare bug");
+        assert!(
+            is_newer("1.9.0", "1.10.0"),
+            "the classic string-compare bug"
+        );
         assert!(is_newer("1.1.0", "2.0.0"));
         assert!(is_newer("1.1.0", "1.2.0"));
         assert!(is_newer("1.1.0", "1.1.1"));
@@ -508,7 +517,13 @@ mod tests {
         let endpoint = net::parse_endpoint(DEFAULT_ENDPOINT).unwrap();
         let latest = fetch(&endpoint)
             .expect("TLS handshake, GET, response framing and JSON parse should all complete");
-        println!("--- latest release: {latest} (running {}) ---", current_version());
-        assert!(parse_version(&latest).is_some(), "unusable version: {latest}");
+        println!(
+            "--- latest release: {latest} (running {}) ---",
+            current_version()
+        );
+        assert!(
+            parse_version(&latest).is_some(),
+            "unusable version: {latest}"
+        );
     }
 }

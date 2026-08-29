@@ -7,11 +7,11 @@
 use std::sync::Arc;
 
 use conjure_align::analysis;
+use conjure_align::capture::{CaptureState, GATE_OPEN, GATE_REF_QUIET, PHASE_CAPTURING};
 use conjure_align::editor::correlation_view::{self, CorrArgs, CorrViewState};
 use conjure_align::editor::spectrum_view::{self, SpecViewState, SpectrumArgs};
 use conjure_align::editor::waveform_view::{self, CaptureOverlay, WaveArgs, WaveViewState};
 use conjure_align::editor::LowerPanelTab;
-use conjure_align::capture::{CaptureState, GATE_OPEN, GATE_REF_QUIET, PHASE_CAPTURING};
 use conjure_align::params::ConjureAlignParams;
 use conjure_align::shared::{AnalysisSnapshot, GuiShared};
 use conjure_align::spectrum;

@@ -308,7 +308,14 @@ pub fn show(
     let as_line = span / (cols as f64) < 1.0;
     let half = rect.height() / 2.0 - 4.0;
     let y_of = |v: f32| rect.center().y - (v * cache.gain).clamp(-1.0, 1.0) * half;
-    draw_envelope(&painter, rect, &cache.raw, y_of, TEXT_DIM.gamma_multiply(0.4), as_line);
+    draw_envelope(
+        &painter,
+        rect,
+        &cache.raw,
+        y_of,
+        TEXT_DIM.gamma_multiply(0.4),
+        as_line,
+    );
     draw_envelope(
         &painter,
         rect,
@@ -390,7 +397,10 @@ fn draw_time_grid(painter: &egui::Painter, rect: egui::Rect, view: &TimeView) {
     let stroke = Stroke::new(1.0, GRID_COLOR);
     while t < view.start_s + view.span_s {
         let x = rect.left() + ((t - view.start_s) / view.span_s) as f32 * rect.width();
-        painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], stroke);
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            stroke,
+        );
         painter.text(
             Pos2::new(x + 3.0, rect.bottom() - 3.0),
             Align2::LEFT_BOTTOM,
@@ -420,7 +430,10 @@ fn draw_capture_overlay(painter: &egui::Painter, rect: egui::Rect, overlay: &Cap
             painter.text(
                 rect.center_top() + Vec2::new(0.0, 10.0),
                 Align2::CENTER_CENTER,
-                format!("Armed — waiting for signal ({})", quiet_label(main_quiet, ref_quiet)),
+                format!(
+                    "Armed — waiting for signal ({})",
+                    quiet_label(main_quiet, ref_quiet)
+                ),
                 FontId::proportional(12.0),
                 ACCENT_LIVE,
             );

@@ -136,9 +136,7 @@ pub fn estimate(
     let bins = nfft / 2 + 1;
 
     let window: Vec<f32> = (0..nfft)
-        .map(|i| {
-            0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / nfft as f64).cos() as f32
-        })
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / nfft as f64).cos() as f32)
         .collect();
 
     let mut buf = r2c.make_input_vec();
@@ -247,7 +245,11 @@ pub fn welch_for_capture(
     if report.corr_curve.is_empty() {
         return None;
     }
-    let d = prealign_lag(&report.outcome, &report.corr_curve, report.max_shift_samples);
+    let d = prealign_lag(
+        &report.outcome,
+        &report.corr_curve,
+        report.max_shift_samples,
+    );
     let usable = main
         .len()
         .min(reference.len())
@@ -338,8 +340,7 @@ mod tests {
                     } else {
                         (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
                     };
-                    let w = 0.5
-                        + 0.5 * (std::f64::consts::PI * x / (width as f64 + 1.0)).cos();
+                    let w = 0.5 + 0.5 * (std::f64::consts::PI * x / (width as f64 + 1.0)).cos();
                     acc += signal[m as usize] as f64 * s * w;
                 }
                 acc as f32
@@ -461,16 +462,18 @@ mod tests {
                 continue;
             }
             // Fully coherent sum per bin.
-            let expect = db_of_power(
-                ((spec.pmm[k] as f64).sqrt() + (spec.prr[k] as f64).sqrt()).powi(2),
-            );
+            let expect =
+                db_of_power(((spec.pmm[k] as f64).sqrt() + (spec.prr[k] as f64).sqrt()).powi(2));
             assert!(
                 (v as f64 - expect).abs() < 2.0,
                 "bin {k}: {v} vs coherent {expect:.2}"
             );
             checked += 1;
         }
-        assert!(checked > 1000, "energetic-bin filter too aggressive: {checked}");
+        assert!(
+            checked > 1000,
+            "energetic-bin filter too aggressive: {checked}"
+        );
     }
 
     /// Inverted polarity turns the comb inside out: peaks where the normal
@@ -599,7 +602,10 @@ mod tests {
                 continue;
             }
             let rel = v as f64 - incoherent_db(&spec, k);
-            assert!((rel - 3.01).abs() < 1.0, "bin {k}: {rel:.2} dB over incoherent");
+            assert!(
+                (rel - 3.01).abs() < 1.0,
+                "bin {k}: {rel:.2} dB over incoherent"
+            );
         }
     }
 
