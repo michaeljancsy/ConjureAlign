@@ -60,9 +60,7 @@ pub enum AnalyticsEvent {
     /// "Session Start" — Mixpanel ships a built-in virtual event,
     /// `$session_start`, whose display name is exactly "Session Start", and
     /// two identically labelled entries in the event picker is a trap.
-    PluginLoaded {
-        sample_rate: f32,
-    },
+    PluginLoaded { sample_rate: f32 },
     CaptureCompleted {
         confidence: f32,
         offset_ms: f32,
@@ -409,7 +407,10 @@ mod tests {
         let text = v.to_string();
         assert!(!text.contains("0.94"), "raw confidence leaked: {text}");
         assert!(!text.contains("3.75"), "raw offset leaked: {text}");
-        assert!(!text.contains("2.8125"), "raw capture length leaked: {text}");
+        assert!(
+            !text.contains("2.8125"),
+            "raw capture length leaked: {text}"
+        );
         assert!(!text.contains(":7"), "raw splice count leaked: {text}");
     }
 
@@ -442,7 +443,10 @@ mod tests {
         // At capacity the seam list stops growing, so the count is a floor
         // rather than a total — a distinction the bucket has to preserve.
         assert_eq!(splice_count_bucket(crate::capture::MAX_SPLICES), "max");
-        assert_eq!(splice_count_bucket(crate::capture::MAX_SPLICES + 100), "max");
+        assert_eq!(
+            splice_count_bucket(crate::capture::MAX_SPLICES + 100),
+            "max"
+        );
     }
 
     #[test]
@@ -504,7 +508,13 @@ mod tests {
             polarity_inverted: false,
         };
         let text = build_payload(&event, &ctx("abc123", 1, crate::host::info())).to_string();
-        for fragment in ["/Users/", "/Applications", "C:\\", "\\Program Files", "/home/"] {
+        for fragment in [
+            "/Users/",
+            "/Applications",
+            "C:\\",
+            "\\Program Files",
+            "/home/",
+        ] {
             assert!(!text.contains(fragment), "path leaked ({fragment}): {text}");
         }
     }
@@ -591,8 +601,7 @@ mod tests {
         )])
         .to_string();
 
-        let response =
-            net::post(&endpoint, &body).expect("TLS handshake and POST should complete");
+        let response = net::post(&endpoint, &body).expect("TLS handshake and POST should complete");
         println!("--- Mixpanel response ---\n{response}\n---");
         assert!(
             response.contains("\"status\": 1") || response.contains("\"status\":1"),

@@ -110,7 +110,10 @@ fn nothing_is_reported_until_consent_is_granted() {
     let frames = issue["threads"]["values"][0]["stacktrace"]["frames"]
         .as_array()
         .expect("a reported issue carried no stacktrace");
-    assert!(!frames.is_empty(), "a reported issue had an empty stacktrace");
+    assert!(
+        !frames.is_empty(),
+        "a reported issue had an empty stacktrace"
+    );
 
     // ---- a panic inside a scope is reported and tagged as a known callback ----
     //
@@ -122,7 +125,11 @@ fn nothing_is_reported_until_consent_is_granted() {
         panic!("conjure-align-in-scope-marker");
     }));
     assert!(panicked.is_err());
-    let reported = exactly_one_event(&rx, "conjure-align-in-scope-marker", Duration::from_secs(10));
+    let reported = exactly_one_event(
+        &rx,
+        "conjure-align-in-scope-marker",
+        Duration::from_secs(10),
+    );
     assert_eq!(reported["level"], "fatal");
     assert_eq!(reported["tags"]["in_scope"], "true");
 

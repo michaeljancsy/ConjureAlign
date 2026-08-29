@@ -153,17 +153,21 @@ impl ConjureAlign {
                 inverted: false,
             };
         }
-        let offset_ms = self.params.detected_offset_ms.load(Ordering::Relaxed)
-            + self.params.trim.value();
+        let offset_ms =
+            self.params.detected_offset_ms.load(Ordering::Relaxed) + self.params.trim.value();
         // A host's generic UI can feed a literal NaN into `trim` (the default
         // text parser accepts it and the range clamps propagate rather than
         // rescue it), and `clamp()` below passes NaN straight through into
         // the tap — which would pin the shift to −window and restart the
         // crossfade every block. Mirrored in `editor::net_shift`.
-        let offset_ms = if offset_ms.is_finite() { offset_ms } else { 0.0 };
+        let offset_ms = if offset_ms.is_finite() {
+            offset_ms
+        } else {
+            0.0
+        };
         let max_shift = self.reported_window_samples() as f64;
-        let offset = (offset_ms as f64 / 1000.0 * self.sample_rate as f64)
-            .clamp(-max_shift, max_shift);
+        let offset =
+            (offset_ms as f64 / 1000.0 * self.sample_rate as f64).clamp(-max_shift, max_shift);
         let inverted = match self.params.polarity.value() {
             PolarityMode::Auto => self.params.detected_polarity.load(Ordering::Relaxed),
             PolarityMode::Normal => false,
@@ -251,8 +255,7 @@ fn analyze_and_publish(
         );
         match report.outcome {
             Ok(result) => {
-                let offset_ms =
-                    (result.offset_samples / data.sample_rate as f64 * 1000.0) as f32;
+                let offset_ms = (result.offset_samples / data.sample_rate as f64 * 1000.0) as f32;
                 params
                     .detected_offset_ms
                     .store(offset_ms, Ordering::Relaxed);
@@ -267,7 +270,11 @@ fn analyze_and_publish(
                      polarity {}, confidence {:.2}",
                     offset_ms,
                     result.offset_samples,
-                    if result.inverted { "inverted" } else { "normal" },
+                    if result.inverted {
+                        "inverted"
+                    } else {
+                        "normal"
+                    },
                     result.confidence
                 );
                 event = analytics::AnalyticsEvent::CaptureCompleted {
@@ -470,8 +477,7 @@ impl Plugin for ConjureAlign {
         if !fast {
             // Size everything for the parameter maxima so no later change ever
             // allocates on the audio thread.
-            let max_shift_max =
-                (MAX_SHIFT_MAX_MS / 1000.0 * self.sample_rate).ceil() as usize;
+            let max_shift_max = (MAX_SHIFT_MAX_MS / 1000.0 * self.sample_rate).ceil() as usize;
             let trim_max = (TRIM_RANGE_MS / 1000.0 * self.sample_rate).ceil() as usize;
             let max_delay = 2 * max_shift_max + trim_max + FIR_CENTER + 1;
             let fade_len = (CROSSFADE_SECONDS * self.sample_rate) as usize;
@@ -526,9 +532,7 @@ impl Plugin for ConjureAlign {
                         nih_log!(
                             "ConjureAlign: reclaimed a queued/lost analysis task after 500 ms"
                         );
-                        crash::report_issue(
-                            "initialize(): reclaimed a queued/lost analysis task",
-                        );
+                        crash::report_issue("initialize(): reclaimed a queued/lost analysis task");
                     }
                     Err(_) => {
                         // The task is actively mid-analysis. Leave the buffers
@@ -549,8 +553,10 @@ impl Plugin for ConjureAlign {
                 }
             }
             if !keep_buffers && !reallocated {
-                self.capture
-                    .allocate(CAPTURE_MAX_SECS * self.sample_rate as usize, self.sample_rate);
+                self.capture.allocate(
+                    CAPTURE_MAX_SECS * self.sample_rate as usize,
+                    self.sample_rate,
+                );
             }
             // Recorded only when the buffers really match this config: the
             // keep-buffers arm leaves them sized for the previous rate, and
@@ -762,8 +768,7 @@ impl Plugin for ConjureAlign {
                     // `== capacity` with gate.step still run: a gap can only
                     // START below capacity, and the push terminating it
                     // finds len == cap−1 — so no gap ever goes untracked.
-                    let record =
-                        self.gate.step(mono_main, mono_ref) || data.splices.len() == cap;
+                    let record = self.gate.step(mono_main, mono_ref) || data.splices.len() == cap;
                     if record {
                         if !self.prev_record && data.filled > 0 && data.splices.len() < cap {
                             // Within capacity: push never allocates.

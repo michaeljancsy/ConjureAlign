@@ -74,7 +74,11 @@ pub struct AnalysisReport {
 /// captures recorded simultaneously), searching lags within
 /// `±max_shift_samples`. Returns `None` when either signal is near-silent or
 /// the correlation peak is too weak to trust.
-pub fn analyze(main: &[f32], reference: &[f32], max_shift_samples: usize) -> Option<AnalysisResult> {
+pub fn analyze(
+    main: &[f32],
+    reference: &[f32],
+    max_shift_samples: usize,
+) -> Option<AnalysisResult> {
     analyze_detailed(main, reference, max_shift_samples)
         .outcome
         .ok()
@@ -376,10 +380,7 @@ mod tests {
                         (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
                     };
                     // Hann window over the sinc to bound truncation error.
-                    let w = 0.5
-                        + 0.5
-                            * (std::f64::consts::PI * x / (width as f64 + 1.0))
-                                .cos();
+                    let w = 0.5 + 0.5 * (std::f64::consts::PI * x / (width as f64 + 1.0)).cos();
                     acc += signal[m as usize] as f64 * s * w;
                 }
                 acc as f32

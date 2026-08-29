@@ -53,6 +53,7 @@ pub(crate) const ACCENT_DETECTED: Color32 = Color32::from_rgb(0x81, 0xc7, 0x84);
 pub(crate) const ACCENT_LIVE: Color32 = Color32::from_rgb(0xff, 0xd5, 0x4f); // yellow
 pub(crate) const ACCENT_WARN: Color32 = Color32::from_rgb(0xe5, 0x73, 0x73); // red
 pub(crate) const CURVE_COLOR: Color32 = Color32::from_rgb(0x64, 0xb5, 0xf6); // blue
+
 // The capture button's fills — deliberately the loudest thing in the window,
 // since nothing else happens until a user finds it. Green when idle (press
 // me), red while a capture is running (recording, press to stop).
@@ -117,8 +118,7 @@ pub(crate) fn gesture_legend(ui: &mut egui::Ui) {
             const LEGEND: &str = "drag / scroll: pan  ·  pinch or ctrl-scroll: zoom  ·  \
                                   arrow keys: nudge trim  ·  double-click: fit";
             ui.add(
-                egui::Label::new(egui::RichText::new(LEGEND).small().color(TEXT_DIM))
-                    .truncate(),
+                egui::Label::new(egui::RichText::new(LEGEND).small().color(TEXT_DIM)).truncate(),
             );
         },
     );
@@ -433,7 +433,15 @@ pub fn draw_ui(
         }
     }
 
-    status_strip(ui, params, capture, shared, state.snapshot.as_deref(), net_ms, net_clamped);
+    status_strip(
+        ui,
+        params,
+        capture,
+        shared,
+        state.snapshot.as_deref(),
+        net_ms,
+        net_clamped,
+    );
     ui.separator();
 
     // The control bar sizes itself as a bottom panel and the graphs take
@@ -451,7 +459,17 @@ pub fn draw_ui(
     egui::CentralPanel::default()
         .frame(egui::Frame::new())
         .show_inside(ui, |ui| {
-            graphs(ui, setter, state, params, shared, capture, net_ms, net_clamped, phase);
+            graphs(
+                ui,
+                setter,
+                state,
+                params,
+                shared,
+                capture,
+                net_ms,
+                net_clamped,
+                phase,
+            );
         });
 }
 
@@ -490,9 +508,8 @@ fn graphs(
                     0.0
                 },
                 secs: filled as f32 / sr.max(1.0),
-                paused_reason: (gate & GATE_OPEN == 0).then(|| {
-                    quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)
-                }),
+                paused_reason: (gate & GATE_OPEN == 0)
+                    .then(|| quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)),
             }
         }
         _ => CaptureOverlay::Idle,
@@ -532,10 +549,7 @@ fn graphs(
             let corr_args = CorrArgs {
                 snapshot: state.snapshot.as_ref(),
                 detected_ms,
-                held: state
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|s| s.outcome.is_err()),
+                held: state.snapshot.as_ref().is_some_and(|s| s.outcome.is_err()),
                 net_ms,
                 clamped: net_clamped,
                 align_on: params.align_on.value(),
@@ -814,7 +828,9 @@ fn settings_menu(ui: &mut egui::Ui, updates: &update::UpdateHandle) {
             .on_hover_text(format!(
                 "ConjureAlign {version} is available — click for details"
             )),
-        None => ui.small_button("\u{2699}").on_hover_text("About and privacy"),
+        None => ui
+            .small_button("\u{2699}")
+            .on_hover_text("About and privacy"),
     };
     if button.clicked() {
         ui.memory_mut(|mem| mem.toggle_popup(popup_id));
@@ -1232,4 +1248,3 @@ fn snap_trim(ms: f64) -> f32 {
     let clamped = ms.clamp(-TRIM_RANGE_MS as f64, TRIM_RANGE_MS as f64);
     ((clamped / 0.01).round() * 0.01) as f32
 }
-

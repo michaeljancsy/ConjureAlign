@@ -505,8 +505,9 @@ mod tests {
     fn macos_reports_a_dotted_os_version() {
         let version = os_version().expect("kern.osproductversion is always readable on macOS");
         assert!(
-            version.split('.').all(|part| !part.is_empty()
-                && part.chars().all(|c| c.is_ascii_digit())),
+            version
+                .split('.')
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())),
             "unexpected shape: {version:?}"
         );
     }

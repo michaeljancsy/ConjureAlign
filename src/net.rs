@@ -227,7 +227,13 @@ fn send(
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
     if endpoint.tls {
-        write_tls(&endpoint.host, stream, request.as_bytes(), deadline, max_bytes)
+        write_tls(
+            &endpoint.host,
+            stream,
+            request.as_bytes(),
+            deadline,
+            max_bytes,
+        )
     } else {
         exchange(stream, request.as_bytes(), deadline, max_bytes)
     }
@@ -390,9 +396,7 @@ fn dechunk(mut rest: &[u8]) -> Vec<u8> {
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 // ---------------------------------------------------------------------------
@@ -605,7 +609,10 @@ mod tests {
             "{request}"
         );
         assert!(
-            request.contains(concat!("User-Agent: ConjureAlign/", env!("CARGO_PKG_VERSION"))),
+            request.contains(concat!(
+                "User-Agent: ConjureAlign/",
+                env!("CARGO_PKG_VERSION")
+            )),
             "{request}"
         );
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -742,7 +749,8 @@ mod tests {
 
     #[test]
     fn chunk_extensions_are_ignored() {
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;foo=bar\r\nhello\r\n0\r\n\r\n";
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;foo=bar\r\nhello\r\n0\r\n\r\n";
         assert_eq!(parse_response(raw).unwrap().body, "hello");
     }
 
@@ -842,7 +850,10 @@ mod tests {
         let response = post(&endpoint, "[]").unwrap();
         let elapsed = start.elapsed();
         assert_eq!(response, "");
-        assert!(elapsed < DEADLINE, "silent server held post for {elapsed:?}");
+        assert!(
+            elapsed < DEADLINE,
+            "silent server held post for {elapsed:?}"
+        );
 
         let _ = done_tx.send(());
         sink.join().unwrap();

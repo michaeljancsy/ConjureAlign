@@ -231,7 +231,10 @@ pub fn show(
     let mut t = (x0 / step).ceil() * step;
     while t <= x1 {
         let x = x_of(t);
-        painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], stroke);
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            stroke,
+        );
         let label = if step < 1.0 {
             format!("{t:+.2}")
         } else {
@@ -339,7 +342,11 @@ pub fn show(
     }
 
     // --- Live (dashed) marker at the applied shift ---
-    let live_color = if args.clamped { ACCENT_WARN } else { ACCENT_LIVE };
+    let live_color = if args.clamped {
+        ACCENT_WARN
+    } else {
+        ACCENT_LIVE
+    };
     // Marker and readout both use the clamped lag so the dot always sits on
     // the drawn curve; a shift beyond the snapshot's search window (possible
     // after a Max Shift change without a recapture) is reported as off-curve

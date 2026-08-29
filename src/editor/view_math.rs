@@ -82,7 +82,10 @@ mod tests {
         // At the right edge, start moves left so the view stays inside.
         let (s, sp) = zoom_about(8.0, 2.0, 0.9, 0.5, 0.1, 0.0, 10.0);
         assert!((sp - 4.0).abs() < 1e-12);
-        assert!((s + sp - 10.0).abs() < 1e-12, "view exceeds range: {s}+{sp}");
+        assert!(
+            (s + sp - 10.0).abs() < 1e-12,
+            "view exceeds range: {s}+{sp}"
+        );
     }
 
     #[test]
@@ -134,7 +137,15 @@ mod tests {
         );
         // A hard zoom-out from the fitted view, anchored anywhere.
         for frac in [0.0, 0.25, 0.5, 1.0] {
-            let (s, sp) = zoom_about(lo, hi - lo, frac, 1e-6, std::f64::consts::LN_2 / 2.0, lo, hi);
+            let (s, sp) = zoom_about(
+                lo,
+                hi - lo,
+                frac,
+                1e-6,
+                std::f64::consts::LN_2 / 2.0,
+                lo,
+                hi,
+            );
             assert!(s >= lo && s + sp <= hi + 1e-12, "escaped range: {s}+{sp}");
             assert!((sp - (hi - lo)).abs() < 1e-12, "span should be full: {sp}");
         }
@@ -164,7 +175,10 @@ mod tests {
 
     #[test]
     fn degenerate_inputs_are_no_ops() {
-        assert_eq!(zoom_about(1.0, 2.0, 0.5, f64::NAN, 0.1, 0.0, 10.0), (1.0, 2.0));
+        assert_eq!(
+            zoom_about(1.0, 2.0, 0.5, f64::NAN, 0.1, 0.0, 10.0),
+            (1.0, 2.0)
+        );
         assert_eq!(zoom_about(1.0, 2.0, 0.5, 0.0, 0.1, 0.0, 10.0), (1.0, 2.0));
         assert_eq!(zoom_about(1.0, 2.0, 0.5, -1.0, 0.1, 0.0, 10.0), (1.0, 2.0));
         assert_eq!(zoom_about(1.0, 2.0, 0.5, 2.0, 0.1, 5.0, 5.0), (1.0, 2.0));

@@ -19,8 +19,7 @@ use super::decimate::MinMax;
 use super::freq_scale::{bucket_curve, bucket_edges, fmt_hz, log_ticks};
 use super::waveform_view::{legend_chip, nice_step};
 use super::{
-    view_math, LowerPanelTab, PanelOutput, ACCENT_LIVE, CURVE_COLOR, GRID_COLOR, PANEL_BG,
-    TEXT_DIM,
+    view_math, LowerPanelTab, PanelOutput, ACCENT_LIVE, CURVE_COLOR, GRID_COLOR, PANEL_BG, TEXT_DIM,
 };
 use crate::params::SPECTRUM_NFFT_OPTIONS;
 use crate::shared::AnalysisSnapshot;
@@ -172,7 +171,9 @@ pub fn show(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .selectable_label(*log_axis, "Log f")
-                .on_hover_text("Logarithmic frequency axis (comb notches are evenly spaced on a linear one)")
+                .on_hover_text(
+                    "Logarithmic frequency axis (comb notches are evenly spaced on a linear one)",
+                )
                 .clicked()
             {
                 *log_axis = !*log_axis;
@@ -261,7 +262,11 @@ pub fn show(
 
     let sr = snap.sample_rate.max(1.0) as f64;
     let base_hi = sr / 2.0;
-    let base_lo = if log { LOG_F_LO.min(base_hi / 2.0) } else { 0.0 };
+    let base_lo = if log {
+        LOG_F_LO.min(base_hi / 2.0)
+    } else {
+        0.0
+    };
 
     // Resolve the view, then apply this frame's gestures to it. Horizontal
     // pan/zoom operates in ln-f space on the log axis so gestures feel
@@ -358,8 +363,7 @@ pub fn show(
         flip: args.flip_main,
     };
     let rebuild_static = !cache.as_ref().is_some_and(|c| c.static_key == static_key);
-    let rebuild_live =
-        rebuild_static || !cache.as_ref().is_some_and(|c| c.live_key == live_key);
+    let rebuild_live = rebuild_static || !cache.as_ref().is_some_and(|c| c.live_key == live_key);
     let mut c = cache.take().unwrap_or_else(|| SpectrumCache {
         static_key,
         live_key,
@@ -420,7 +424,10 @@ pub fn show(
     };
     for &f in &ticks {
         let x = x_of(f);
-        painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], stroke);
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            stroke,
+        );
         // Skip labels that would collide with the "Hz" unit in the corner.
         if x < rect.right() - 30.0 {
             painter.text(
@@ -435,7 +442,10 @@ pub fn show(
     for i in 0..=(SPAN_DB as i32 / 10) {
         let db = c.y_top_db - 10.0 * i as f32;
         let y = y_of(db);
-        painter.line_segment([Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)], stroke);
+        painter.line_segment(
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+            stroke,
+        );
         let label = if i == 0 {
             format!("{db:.0} dB")
         } else {
@@ -461,7 +471,13 @@ pub fn show(
     // At the max-shift extreme the comb spacing drops below the bin spacing;
     // min/max bucketing then honestly renders a filled band instead of
     // aliased wiggles.
-    draw_envelope(&painter, rect, &c.captured_env, y_of, CURVE_COLOR.gamma_multiply(0.55));
+    draw_envelope(
+        &painter,
+        rect,
+        &c.captured_env,
+        y_of,
+        CURVE_COLOR.gamma_multiply(0.55),
+    );
     draw_envelope(&painter, rect, &c.corrected_env, y_of, ACCENT_LIVE);
 
     // --- Readout, mirroring the correlation panel's live-marker language ---
@@ -469,7 +485,10 @@ pub fn show(
         ("alignment off — corrected = captured".to_string(), TEXT_DIM)
     } else {
         let pol = if args.flip_main { ", inverted" } else { "" };
-        (format!("corrected @ {:+.2} ms{pol}", args.net_ms), ACCENT_LIVE)
+        (
+            format!("corrected @ {:+.2} ms{pol}", args.net_ms),
+            ACCENT_LIVE,
+        )
     };
     painter.text(
         Pos2::new(rect.right() - 6.0, rect.top() + 4.0),
@@ -554,7 +573,13 @@ fn pan_view(
         (s.exp(), (s + span).exp())
     } else {
         let span = v_hi - v_lo;
-        let s = view_math::pan(v_lo, span, -(px as f64) * span / width as f64, base_lo, base_hi);
+        let s = view_math::pan(
+            v_lo,
+            span,
+            -(px as f64) * span / width as f64,
+            base_lo,
+            base_hi,
+        );
         (s, s + span)
     }
 }

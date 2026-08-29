@@ -173,7 +173,11 @@ fn null_depth_table() {
     // Documented expectations: integer offsets null essentially perfectly;
     // fractional offsets null deeply in the audible band but are floored
     // broadband by near-Nyquist content no real filter can fractionally delay.
-    assert!(int_white.0 < -80.0, "integer null too shallow: {} dB", int_white.0);
+    assert!(
+        int_white.0 < -80.0,
+        "integer null too shallow: {} dB",
+        int_white.0
+    );
     assert!(
         frac_white.1 < -60.0,
         "audible-band fractional null too shallow: {} dB",
