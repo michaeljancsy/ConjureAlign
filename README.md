@@ -88,8 +88,9 @@ never sends anything before you answer. One answer covers both. There is no acco
 and no identifier tied to you: everything carries a random ID generated on the machine when you
 opt in.
 
-A crash report names ConjureAlign's *own* code — its functions, and paths inside its source
-tree as it was built. It carries nothing from your machine: the list of other plugins loaded
+A crash report names code inside ConjureAlign's *own* binary — its functions and those of the
+open-source libraries compiled into it, with source paths as they were on the build machine,
+never yours. It carries nothing from your machine: the list of other plugins loaded
 alongside it is stripped before sending, and so is your computer's name.
 
 Change your mind at any time with the **⚙** button in the plugin's control bar. Your answer is

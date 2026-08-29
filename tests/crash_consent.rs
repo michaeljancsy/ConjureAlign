@@ -1,154 +1,34 @@
 //! Crash reporting rides the same opt-in as analytics, and the same property
 //! has to hold: nothing leaves the machine until the user says yes. Beyond
 //! that, two things specific to panics are checked here — that a panic raised
-//! inside ConjureAlign code is reported, and that one raised outside it is not,
-//! which is the whole difference between reporting our own crashes and
-//! reporting the host's.
+//! anywhere in this dylib is reported once consent is granted (the hook is
+//! per-image, so the host's panics can never reach it), and that each report
+//! carries the `in_scope` tag saying whether a `crash::scope()` guard was
+//! held, which is what separates a known callback's crash from one in the GUI
+//! event loop or a helper thread.
 //!
 //! Runs against a temporary `HOME`/`APPDATA` so it can never read or clobber
 //! the developer's own preference file, and against a local TCP sink so it
 //! never talks to Sentry.
 //!
-//! Two panics are deliberately raised below. The hook chains to whatever was
+//! Three panics are deliberately raised below. The hook chains to whatever was
 //! installed before it — here, the test harness's — so their backtraces print
 //! to stderr even when this test passes. That output is expected.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+mod sentry_sink;
+
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::mpsc::{channel, Receiver};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use conjure_align::analytics;
 use conjure_align::crash::{self, CrashHandle};
-
-/// Reads one HTTP request off the socket, answers it, and returns the body.
-fn read_request(stream: TcpStream) -> Option<String> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut reader = BufReader::new(stream);
-    let mut content_length = 0usize;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).ok()? == 0 {
-            return None;
-        }
-        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-            content_length = v.trim().parse().ok()?;
-        }
-        if line == "\r\n" {
-            break;
-        }
-    }
-    let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body).ok()?;
-    // Answering matters: `TransportThread::drop` joins its worker with no
-    // timeout, so a request left unanswered would stall the client shutdown at
-    // the end of this test for as long as its request timeout allows.
-    let _ = reader
-        .get_mut()
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-    String::from_utf8_lossy(&body).into_owned().into()
-}
-
-/// Accepts for the lifetime of the test, including during the client shutdown
-/// that runs when `CrashHandle` drops.
-fn spawn_sink(listener: TcpListener) -> Receiver<String> {
-    let (tx, rx) = channel();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { break };
-            if let Some(body) = read_request(stream) {
-                if tx.send(body).is_err() {
-                    break;
-                }
-            }
-        }
-    });
-    rx
-}
-
-/// A Sentry envelope is newline-delimited: a header line, then alternating
-/// item-header / item-payload lines. Returns the `event` items — the only type
-/// this test cares about, since release-health sessions share the stream.
-fn event_items(envelope: &str) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    let mut lines = envelope.lines();
-    let _envelope_header = lines.next();
-    while let Some(item_header) = lines.next() {
-        let Some(payload) = lines.next() else { break };
-        let Ok(header) = serde_json::from_str::<serde_json::Value>(item_header) else {
-            continue;
-        };
-        if header["type"] == "event" {
-            if let Ok(v) = serde_json::from_str(payload) {
-                out.push(v);
-            }
-        }
-    }
-    out
-}
-
-/// Every event reaching the sink within `budget`.
-fn collect_events(rx: &Receiver<String>, budget: Duration) -> Vec<serde_json::Value> {
-    let deadline = Instant::now() + budget;
-    let mut events = Vec::new();
-    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        match rx.recv_timeout(remaining) {
-            Ok(body) => events.extend(event_items(&body)),
-            Err(_) => break,
-        }
-    }
-    events
-}
-
-/// Like `collect_events`, but stops as soon as `marker` shows up.
-fn wait_for_event(
-    rx: &Receiver<String>,
-    marker: &str,
-    budget: Duration,
-) -> Option<serde_json::Value> {
-    let deadline = Instant::now() + budget;
-    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        let Ok(body) = rx.recv_timeout(remaining) else {
-            break;
-        };
-        if let Some(hit) = event_items(&body)
-            .into_iter()
-            .find(|e| e.to_string().contains(marker))
-        {
-            return Some(hit);
-        }
-    }
-    None
-}
+use sentry_sink::{collect_events, exactly_one_event, setup, wait_for_event};
 
 #[test]
 fn nothing_is_reported_until_consent_is_granted() {
-    // Set before anything touches the config: it is cached in a OnceLock on
-    // first read. Safe here because this is the only test in this binary, so
-    // no other thread is reading the environment.
-    let home = std::env::temp_dir().join("conjure-align-crash-e2e");
-    let _ = std::fs::remove_dir_all(&home);
-    std::fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
-    std::env::set_var("APPDATA", &home);
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::env::set_var(
-        "CONJURE_ALIGN_SENTRY_DSN",
-        format!("http://00000000000000000000000000000000@127.0.0.1:{port}/1"),
-    );
-    // Belt and braces: the analytics sender is not exercised here, but if it
-    // ever were, it must not reach the real Mixpanel either.
-    std::env::set_var(
-        "CONJURE_ALIGN_ANALYTICS_URL",
-        format!("http://127.0.0.1:{port}/track"),
-    );
-
-    let rx = spawn_sink(listener);
+    // Temp HOME and the local sink, before anything touches the consent
+    // config — see `sentry_sink::setup` for the ordering invariants.
+    let (home, rx) = setup("conjure-align-crash-e2e");
     // Declared after `rx` so it drops first: the client shutdown it triggers
     // needs the sink still accepting.
     let handle = CrashHandle::new();
@@ -223,33 +103,43 @@ fn nothing_is_reported_until_consent_is_granted() {
     // on the audio thread must carry these too.
     assert_eq!(issue["tags"]["plugin_api"], "CLAP");
     assert_eq!(issue["tags"]["sample_rate"], "48000");
+    // `attach_stacktrace`: a `report_issue` message is just a string, and the
+    // stack is what turns "still borrowed" into a place in the code. Without
+    // the option the AttachStacktrace integration is inert and the event
+    // arrives with no stacktrace at all.
+    let frames = issue["threads"]["values"][0]["stacktrace"]["frames"]
+        .as_array()
+        .expect("a reported issue carried no stacktrace");
+    assert!(!frames.is_empty(), "a reported issue had an empty stacktrace");
 
-    // ---- a panic inside our code is ours to report ----
+    // ---- a panic inside a scope is reported and tagged as a known callback ----
+    //
+    // `exactly_one_event`, not `wait_for_event`: exactly one report per panic
+    // is what pins "Rule 3" — a second event for the same marker means a
+    // blanket hook (a registered PanicIntegration) is reporting next to ours.
     let panicked = catch_unwind(AssertUnwindSafe(|| {
         let _scope = crash::scope();
         panic!("conjure-align-in-scope-marker");
     }));
     assert!(panicked.is_err());
-    let reported = wait_for_event(
-        &rx,
-        "conjure-align-in-scope-marker",
-        Duration::from_secs(10),
-    )
-    .expect("a panic inside a scope was not reported");
+    let reported = exactly_one_event(&rx, "conjure-align-in-scope-marker", Duration::from_secs(10));
     assert_eq!(reported["level"], "fatal");
+    assert_eq!(reported["tags"]["in_scope"], "true");
 
-    // ---- a panic outside it belongs to whoever raised it ----
+    // ---- a panic outside any scope is still ours — only this dylib's panics
+    // ---- can reach the hook — but is tagged as unscoped ----
     assert!(!crash::in_plugin_code());
     let panicked = catch_unwind(AssertUnwindSafe(|| {
         panic!("conjure-align-out-of-scope-marker");
     }));
     assert!(panicked.is_err());
-    assert!(
-        !collect_events(&rx, Duration::from_secs(2))
-            .iter()
-            .any(|e| e.to_string().contains("conjure-align-out-of-scope-marker")),
-        "a panic raised outside ConjureAlign code was reported as ours"
+    let stray = exactly_one_event(
+        &rx,
+        "conjure-align-out-of-scope-marker",
+        Duration::from_secs(10),
     );
+    assert_eq!(stray["level"], "fatal");
+    assert_eq!(stray["tags"]["in_scope"], "false");
 
     // ---- withdrawn: the client is torn down, and reports stop ----
     analytics::set_consent(false);

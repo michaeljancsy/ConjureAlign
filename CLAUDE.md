@@ -326,14 +326,24 @@ the dylib — `Reporter` is held through a `Mutex<Weak<Reporter>>` registry exac
 `Worker`, and dropping the last strong ref closes the client, which ends the release-health
 session and joins Sentry's transport thread). Three things are specific to panics:
 
-1. **The hook is scoped, not blanket.** A plugin shares its process with the DAW and every other
-   plugin. Sentry's stock `PanicIntegration` installs a hook that captures *any* panic anywhere
-   in that process, which would file the host's bugs — and every other Rust plugin's — as ours.
-   So `default_integrations` is `false`, the other four integrations are listed by hand, and
+1. **The hook is per-image, gated on consent only, and captures via `Hub::main()`.** A panic
+   hook lives in the panicking image's own statically-linked std, so the host's panics and
+   other Rust plugins' can physically never reach ours — every panic our hook sees was raised
+   inside this dylib, and all of those are reported (a panic in egui/baseview/nih-plug code we
+   ship is still our crash). The `crash::scope()` guards in `initialize()`, `process()`,
+   `reset()`, the `task_executor` closure and the editor's build and draw closures feed the
+   `in_scope` tag — attribution (known callback vs GUI event loop / helper thread / dependency
+   internals), NOT a gate. The one skip: panics on Sentry's own `sentry-*` threads, which are
+   must-not-panic and where a capture+flush would wait on the failing machinery itself.
    `PanicIntegration` is only ever *constructed* (for `event_from_panic_info`), never
-   registered. Our own hook reports only when `crash::in_plugin_code()` — a thread-local depth
-   counter raised by the `crash::scope()` guards in `initialize()`, `process()`, `reset()`,
-   the `task_executor` closure and the editor's build and draw closures. Everything the hook
+   registered — registering would install a second, ungated hook next to ours
+   (`default_integrations` is `false`, the other four listed by hand; `attach_stacktrace` is
+   on so `report_issue` messages carry a stack). Captures and the hook's bounded flush go
+   through `Hub::main()`, and `reporter()` re-binds the fresh client on that hub after every
+   `sentry::init` — init alone binds only the *calling* thread's hub while every other
+   thread's hub is a never-re-synced snapshot, so a consent decline→re-grant from the editor
+   would otherwise leave audio/main/bg-worker panics captured into the closed client for the
+   rest of the process (pinned by `tests/crash_regrant_threads.rs`). Everything the hook
    (and `crash::scrub`) touches on the panicking thread must use the `_in_hook` analytics
    accessors / `try_lock` — the panicking frame may hold those very locks, so a blocking
    `lock().unwrap()` there is a same-thread deadlock or a panic-inside-the-hook abort.
@@ -451,7 +461,11 @@ checks the env vars directly, because on a runner that is the only route they ca
 there reports a perfectly authenticated machine as unconfigured and silently drops the symbols.
 Note that `login` sets the token but NOT the org/project defaults, so those still need to be in
 the environment or in `~/.sentryclirc`'s `[defaults]`; that is the likeliest way an
-authenticated machine still fails the upload.
+authenticated machine still fails the upload. The second likeliest is scope: uploads need a
+token carrying `project:releases`, and `sentry-cli info` passes on a read-only token — the
+upload then 403s and the script warns and continues, so a release built that way is
+permanently unsymbolicatable. `sentry-cli info` lists the token's scopes; an org auth token
+(sentry.io → Settings → Auth Tokens) is the easy fix.
 
 Both call sites name the plugin's own binary and dSYM/PDB explicitly rather than pointing at a
 release directory. That is not tidiness: `sentry-cli` searches paths recursively, so a whole
