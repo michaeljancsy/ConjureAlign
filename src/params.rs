@@ -13,6 +13,8 @@ use nih_plug_egui::EguiState;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 
+use crate::shared::SnapshotCell;
+
 /// Upper bound of the Max Shift parameter; delay lines and capture buffers are
 /// sized for this at initialization so parameter changes never allocate.
 pub const MAX_SHIFT_MAX_MS: f32 = 200.0;
@@ -120,6 +122,16 @@ pub struct ConjureAlignParams {
     /// key fall back to the default.
     #[persist = "editor-state"]
     pub editor_state: Arc<EguiState>,
+
+    /// The last analysis snapshot — the raw captures, correlation curve and
+    /// spectra behind the editor's graphs. The same cell `GuiShared` exposes
+    /// (the plugin clones this `Arc` into it), so the background task's
+    /// publish is exactly what a host save picks up and a state load lands
+    /// where the editor already looks. Wire format, size cost and the
+    /// hostile-input hardening live in `snapshot_persist.rs`. Additive like
+    /// `editor-state`: old sessions restore no snapshot.
+    #[persist = "analysis-snapshot"]
+    pub snapshot: Arc<SnapshotCell>,
 }
 
 impl Default for ConjureAlignParams {
@@ -168,6 +180,7 @@ impl Default for ConjureAlignParams {
             detected_confidence: Arc::new(AtomicF32::new(0.0)),
             spectrum_nfft: Arc::new(AtomicU32::new(0)),
             editor_state: EguiState::from_size(820, 560),
+            snapshot: Arc::default(),
         }
     }
 }

@@ -34,6 +34,13 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 # device id. The TLS stack is target-gated below — see the note there.
 serde_json = "1.0"
 getrandom = "0.4"
+# The persisted analysis snapshot (src/snapshot_persist.rs): serde derives the
+# session-state DTO nih-plug's persist machinery (de)serializes, base64 carries
+# the raw f32 sample bytes inside that JSON. Neither is new compilation work on
+# the shipping targets — serde (with derive) is already in the graph via
+# nih_plug, base64 via ureq.
+serde = { version = "1.0", features = ["derive"] }
+base64 = "0.23"
 
 # AudioUnit v2 export (macOS only). clap-wrapper re-exports the `clap_entry` that
 # `nih_export_clap!` already emits behind an AudioComponentFactoryFunction named

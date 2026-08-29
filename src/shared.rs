@@ -7,16 +7,17 @@
 //! touches the `Mutex`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::analysis::{AnalysisResult, RejectReason};
 
 /// Everything the last analysis produced, frozen for display. Built on the
 /// background thread at the end of `Task::Analyze`; immutable afterwards.
 /// Holds full raw copies of the captures (≤ ~6 MB at 192 kHz / 4 s) so the
-/// GUI can decimate per zoom level. Deliberately NOT persisted: after a
-/// session reload the GUI shows the restored detected values but no
-/// waveforms until the next capture.
+/// GUI can decimate per zoom level. Persisted into the DAW session via the
+/// `analysis-snapshot` field on the Params struct (see `snapshot_persist.rs`
+/// for the wire format and its size cost), so a reopened project shows the
+/// graphs behind its restored detected values.
 pub struct AnalysisSnapshot {
     /// Mono-summed main input as captured (pre-delay).
     pub main: Vec<f32>,
@@ -41,13 +42,41 @@ pub struct AnalysisSnapshot {
     pub outcome: Result<AnalysisResult, RejectReason>,
 }
 
+/// Home of the snapshot `Mutex`. One `Arc<SnapshotCell>` is shared between
+/// [`GuiShared`] (the background task publishes through it, the editor reads
+/// it every frame) and the `#[persist = "analysis-snapshot"]` field on the
+/// Params struct — which is what lets a host save pick up whatever the last
+/// analysis published without any extra hand-off, and a state load land where
+/// the editor already looks.
+#[derive(Default)]
+pub struct SnapshotCell(Mutex<Option<Arc<AnalysisSnapshot>>>);
+
+impl SnapshotCell {
+    /// Clone out the current snapshot. Poison-tolerant: a panic in the
+    /// analysis task while publishing must not turn every subsequent GUI
+    /// frame (or host save) into a panic of its own.
+    pub fn get(&self) -> Option<Arc<AnalysisSnapshot>> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace the snapshot: the background task on publish, a state load on
+    /// restore (`None` when the saved session had no capture).
+    pub fn store(&self, snapshot: Option<Arc<AnalysisSnapshot>>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = snapshot;
+    }
+}
+
 /// Cross-thread channel between the plugin and its editor. The audio thread
 /// touches only the atomics (written in `initialize()`); the `Mutex` is
-/// shared only by the background task (one pointer store per analysis) and
-/// the GUI (one clone of the `Arc` per frame).
+/// shared only by the background task (one pointer store per analysis), the
+/// GUI (one clone of the `Arc` per frame), and the host's state save/load on
+/// the main thread.
 pub struct GuiShared {
-    /// Latest analysis snapshot.
-    pub snapshot: Mutex<Option<Arc<AnalysisSnapshot>>>,
+    /// Latest analysis snapshot; the same cell the Params struct persists.
+    pub snapshot: Arc<SnapshotCell>,
     /// Mirror of `reported_window_samples()` (high 32 bits) packed with the
     /// sample rate's bits (low 32). The two are one logical value, and a
     /// single atomic keeps a GUI frame from ever pairing a new window with a
@@ -59,6 +88,15 @@ pub struct GuiShared {
 }
 
 impl GuiShared {
+    /// `snapshot` is the Params struct's persisted cell — the plugin passes
+    /// `params.snapshot.clone()` so both ends are one object.
+    pub fn new(snapshot: Arc<SnapshotCell>) -> Self {
+        Self {
+            snapshot,
+            window_and_rate: AtomicU64::new(48_000.0f32.to_bits() as u64),
+        }
+    }
+
     /// Called from `initialize()` only.
     pub fn set_window(&self, window_samples: u32, sample_rate: f32) {
         let packed = ((window_samples as u64) << 32) | sample_rate.to_bits() as u64;
@@ -72,11 +110,10 @@ impl GuiShared {
     }
 }
 
+/// A standalone channel with its own (un-persisted) cell — the previews and
+/// tests that never load host state.
 impl Default for GuiShared {
     fn default() -> Self {
-        Self {
-            snapshot: Mutex::new(None),
-            window_and_rate: AtomicU64::new(48_000.0f32.to_bits() as u64),
-        }
+        Self::new(Arc::default())
     }
 }

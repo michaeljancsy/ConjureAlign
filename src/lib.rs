@@ -16,6 +16,7 @@ pub mod host;
 pub mod net;
 pub mod params;
 pub mod shared;
+pub mod snapshot_persist;
 pub mod spectrum;
 pub mod update;
 
@@ -99,10 +100,15 @@ fn gate_bits(gate: &CaptureGate) -> u8 {
 
 impl Default for ConjureAlign {
     fn default() -> Self {
+        let params = Arc::new(ConjureAlignParams::default());
+        // The GUI channel wraps the params' persisted snapshot cell: one
+        // object, so the background task's publish is what a host save picks
+        // up and a state load lands where the editor already looks.
+        let shared = Arc::new(GuiShared::new(params.snapshot.clone()));
         Self {
-            params: Arc::new(ConjureAlignParams::default()),
+            params,
             capture: Arc::new(CaptureState::new()),
-            shared: Arc::new(GuiShared::default()),
+            shared,
             // Placeholders until `initialize()` knows the real sample rate.
             delay: AlignDelay::new(2, 1024, 64),
             gate: CaptureGate::new(48_000.0, 1e-3),
@@ -314,10 +320,7 @@ fn analyze_and_publish(
             outcome: report.outcome,
         })
     };
-    *shared
-        .snapshot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+    shared.snapshot.store(Some(snapshot));
     // A CAS, not a blind store — and deliberately NOT generation-guarded.
     // The publish above can block briefly on the GUI-contended mutex, and a
     // slow-path `initialize()` landing in that gap may have reclaimed the
