@@ -725,11 +725,15 @@ pub fn consent_modal(ctx: &egui::Context) {
     });
 }
 
-/// Question one. Heading and buttons only: the prompt asks, it does not
-/// explain. What the two features actually send is stated in
-/// [`privacy_section`] (the ⚙ popover) and in the README's Privacy table —
-/// those are the copy that must stay in step with `analytics::build_payload`
-/// and `crash::scrub`.
+/// Question one. Deliberately just the question and the two answers: the
+/// enumeration of what is collected was removed by product decision on
+/// 2026-08-28, so nothing in the UI describes the payload — not here, and not
+/// on the [`privacy_section`] checkbox either. `CLAUDE.md` and the
+/// `analytics`/`host` module docs are the only remaining record of it.
+///
+/// Question two below is also bare, but for an unrelated reason — prompt
+/// length, not disclosure — and its copy still exists in [`privacy_section`]
+/// and the README.
 fn analytics_question(ui: &mut egui::Ui) {
     ui.heading("Share anonymous usage and crash data?");
     ui.add_space(12.0);
@@ -941,20 +945,11 @@ fn privacy_section(ui: &mut egui::Ui) {
 
     let mut share = analytics::enabled();
     if ui
-        .checkbox(&mut share, "Share usage and crash data")
+        .checkbox(&mut share, "Share anonymous usage and crash data")
         .changed()
     {
         analytics::set_consent(share);
     }
-    ui.label(
-        egui::RichText::new(
-            "Plugin version and format (VST3/CLAP), OS, sample rate, capture \
-             outcomes and crash reports, labelled with a random ID. Never \
-             your audio.",
-        )
-        .small()
-        .color(TEXT_DIM),
-    );
 
     ui.add_space(6.0);
 

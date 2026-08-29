@@ -91,6 +91,7 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
 ## Architecture
 
 - `src/analytics.rs` — opt-in Mixpanel telemetry (see its own section below);
+  `src/host.rs` — which DAW and OS the plugin is running in (see below);
   `src/update.rs` — the opt-in update check; `src/net.rs` — the one HTTP client and the one
   background network thread both of them (and nothing else) go through; `src/config.rs` —
   the install-wide preferences file holding both consent answers;
@@ -258,9 +259,63 @@ slicing by byte index would corrupt any multi-byte character split across two ch
 in a release note). The response size cap is per-call for the same reason: 64 KB is right for a
 status reply and would silently truncate a release document into a parse failure.
 
-The payload is bucketed on purpose (`confidence_bucket`, `offset_bucket`): raw figures would
-describe the user's material. `MIXPANEL_TOKEN` holds the ConjureAlign project's token;
+The payload is bucketed on purpose (`confidence_bucket`, `offset_bucket`,
+`capture_seconds_bucket`, `splice_count_bucket`): raw figures would describe the user's
+material. Both capture events also carry `capture_length` and `splices` — read once from
+`data.filled`/`data.sample_rate` and `data.splices.len()` inside the borrow that
+`analyze_and_publish` already holds, so they cost nothing and touch no new state — and
+`Capture Completed` adds `polarity_inverted`, the one un-bucketed value, because a single
+bit about mic wiring cannot be coarsened further. They are on the *rejected* event too on
+purpose: `reason` alone cannot separate "the user never played anything" from "they played
+and it did not correlate", and a high `splices` bucket is the readable symptom of a
+`gate_threshold` default that is chopping takes up. `splice_count_bucket` keeps `"max"`
+distinct because at `MAX_SPLICES` the seam list stops growing and the rest of the capture
+records continuously — past that the count is a floor, not a total. `capture_seconds_bucket`
+routes non-finite input to the TOP bucket, not the bottom: a NaN fails every `<` guard, and
+silently reporting a broken reading as the shortest capture would be worse than as the
+longest. `MIXPANEL_TOKEN` holds the ConjureAlign project's token;
 client-side tokens are public by design (write-only ingestion, no read access).
+
+Every event also carries the environment, assembled in `EventContext`: `plugin_version`, `os`
+(the *build target*, which cannot move), `os_version` and `daw`/`daw_version` from
+`src/host.rs`, and `plugin_format` from `context.plugin_api()` — CLAP, VST3 or standalone,
+with **AU folded into CLAP** because clap-wrapper translates AU calls onto our own
+`clap_entry` and nih-plug genuinely never sees an AU (`daw` is what separates them again:
+Logic and GarageBand load only the AU). `build_payload` takes that context as a parameter
+rather than reading globals, which is what keeps its assertions valid on any machine. An
+unresolved value is OMITTED, never sent as null — a null lands in Mixpanel's lexicon as a
+real value and pollutes every breakdown on the property.
+
+`src/host.rs` resolves the environment once per process into a `OnceLock`, and three rules
+hold it together. **Nothing there may panic**: it runs inside `initialize()`, inside the
+host's `extern "C"` activation frame, where an unwind aborts the DAW — which is why the
+macOS bundle lookup uses the raw `core-foundation-sys` externs with hand-written null checks
+instead of the safe `core-foundation` wrappers, whose `wrap_under_get_rule` asserts on the
+NULL that `CFBundleGetMainBundle()` legitimately returns in an unbundled host (`auval`,
+`clap-validator`). **The DAW is an allowlisted label, never a raw name or path** — the
+`current_exe()` path can contain the user's home directory, and even a bare unrecognized
+stem is a fingerprint; anything off the list is `"other"` and carries NO version, since an
+unknown program plus its version identifies far more than either half. **The labels are wire
+values**: renaming one splits its history in Mixpanel, so add freely and rename never.
+
+Why `current_exe()` and not the host name the plugin API offers: nih-plug exposes neither
+CLAP's `clap_host.name` nor VST3's `IHostApplication::getName`, so reaching them would mean a
+fourth patch on the vendored tree — and it would be *wrong* for AU, where clap-wrapper is the
+CLAP host and would name the wrapper rather than Logic. Platform sources: macOS reads
+`CFBundleShortVersionString` from the main bundle and `kern.osproductversion` via `sysctl`
+(note macOS serves a capped "10.16" to processes linked against a pre-Big-Sur SDK, so a very
+old DAW under-reports); Windows reads the executable's `VS_FIXEDFILEINFO` block via
+`version.dll` and the OS version from `os_info`. All four deps were already compiled into
+their targets before being declared — `os_info` is Windows-ONLY in this graph, because
+`sentry-contexts` uses `uname` elsewhere, which is why macOS goes through sysctl instead.
+The `daw` labels include `auval`, `pluginval` and `clap-validator`: they load the plugin on
+a machine that may well have consented, and labelling them is what lets them be filtered out
+of the real usage figures rather than silently inflating the "other" bucket.
+
+The bundle lookup cannot be reached by a unit test — a test binary has no `.app` around it.
+`host::tests::print_resolved_host_info` (`#[ignore]`d) exists for that: copy the test binary
+into `Foo.app/Contents/MacOS/<an allowlisted name>` with an Info.plist beside it and run it
+from there, which is the same shape as a DAW loading the plugin.
 
 Three events: **`Plugin Loaded`** (once per instance, from `initialize()`), **`Capture
 Completed`**, **`Capture Rejected`**. The first is deliberately NOT called "Session Start" —
@@ -269,16 +324,19 @@ Mixpanel ships a built-in virtual event, `$session_start`, whose *display name* 
 picker. Check `Get-Events` before naming anything new. Verify ingestion with
 `cargo test --release -- --ignored --nocapture smoke_test`, which asks Mixpanel for
 `verbose=1` and asserts `"status": 1` — a bad token otherwise reads as a silent bare `0`.
-**It writes one real event to the live project**, tagged `smoke-test`.
+**It writes one real event to the live project**, tagged `smoke-test` — and deliberately
+with the REAL host context, so a newly added `daw` or `os_version` value gets seen once in
+the project before it arrives from a user.
 
 UI: the first-run prompt (`editor::consent_modal`) and the ⚙ popover (`settings_menu`) are both
 drawn OUTSIDE `draw_ui` / from the control bar respectively, and both are `pub` so
 `examples/gui_preview.rs` can render them headless (`_consent.png`, `_settings.png`,
 `_settings_update.png`) — a consent dialog has no business in the panel screenshots. The prompt
 is each question's heading plus its two buttons and nothing else, with one closing line saying
-the answers are changeable under ⚙; the detail lives in the popover and the README. It
-renders only its unanswered questions, so the preview points `HOME` at a scratch directory to
-get a virgin install; without that it would render whatever this machine has already answered. Two layout constraints learned the
+the answers are changeable under ⚙; what detail survives is in the README, plus the popover for
+the update check. It renders only its unanswered questions, so the preview points `HOME` at a
+scratch directory to get a virgin install; without that it would render whatever this machine
+has already answered. Two layout constraints learned the
 hard way: the status strip has **zero slack at the 600×460 minimum** (its labels already reach
 the Capture button and *overflow* rather than truncate, so anything parked there gets drawn
 through), which is why the gear rides the centered control-bar row's spare width instead; and
@@ -344,15 +402,35 @@ session and joins Sentry's transport thread). Three things are specific to panic
    and a blocking 2 s flush at 60 Hz. Nothing here touches the audio thread, so a dead editor
    still leaves the correction running and every parameter reachable from the host's generic UI.
 
-`before_send` (`crash::scrub`) is the last gate before anything leaves, and each line in it
-backs a promise in the README/consent copy: `server_name` is nulled (`sentry-contexts` fills it
-from the `hostname` crate), `user` is reduced to the device id, and `debug_meta.images` is
-trimmed to our own dylib — `debug-images` otherwise enumerates every shared library in the
-process, i.e. every other plugin the user owns. **Changing what is sent means changing
-`settings_menu` (`privacy_section`) and the README Privacy table too** — and that rule now
-covers the update check's copy as well. The first-run prompt is deliberately NOT on that list:
-it is headings and buttons only and makes no claim about what is sent, so `privacy_section` and
-the README are the only places the promise is written down.
+Crash reports carry the same environment as the analytics events — `plugin_api`,
+`sample_rate`, `daw`, `daw_version`, `os_version` as tags. `set_host_context` resolves ALL of
+it on the main thread and stores plain data, so `scrub` (which runs on the *panicking* thread)
+only clones out of the mutex; calling `host::info()` from there instead would run
+`current_exe()` and a CoreFoundation lookup inside a panic hook. `os_version` is not
+redundant with sentry's own OS context: `sentry-contexts` fills that from `uname`, which on
+macOS reports the Darwin version ("25.3.0"), not the one users and release notes talk about
+("26.3.1").
+
+`before_send` (`crash::scrub`) is the last gate before anything leaves: `server_name` is
+nulled (`sentry-contexts` fills it from the `hostname` crate), `user` is reduced to the device
+id, and `debug_meta.images` is trimmed to our own dylib — `debug-images` otherwise enumerates
+every shared library in the process, i.e. every other plugin the user owns. The README's crash
+paragraph still backs the last two of those; the rest of `scrub` is now an unstated guarantee.
+
+**The analytics prompt no longer enumerates what is collected.** `analytics_question` is a
+bare question and its `privacy_section` checkbox a bare checkbox, by an explicit product
+decision on 2026-08-28 — so nothing in the UI describes the payload, and the README's
+Sent/Never-sent table that used to is gone. Adding a property therefore changes no
+user-facing text, which is exactly why it is worth noticing: this file and the
+`analytics`/`host` module docs are the only remaining record of what leaves the machine.
+Re-check the disclosure question before shipping a property more revealing than the bucketed
+outcomes already sent.
+
+That decision covers question ONE only, and it is about *disclosure*. `updates_question` is
+bare in the first-run prompt as well, but for an unrelated reason — the prompt was cut to
+headings and buttons on length grounds — and its half of `privacy_section` and the README
+still carry its copy. That copy is still a promise: "sends nothing about you, never installs
+anything" has to stay true of `update.rs`.
 
 `RejectReason` is NOT an error: it is an expected user outcome, already logged and already a
 Mixpanel event. Routing it here would bury real crashes. Only panics and genuine
