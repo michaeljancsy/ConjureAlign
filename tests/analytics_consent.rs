@@ -54,10 +54,13 @@ fn nothing_is_sent_until_consent_is_granted() {
     // behave exactly like a "no" on the wire.
     assert_eq!(analytics::consent(), None);
     assert!(!analytics::enabled());
-    handle.note_session(48_000.0);
+    handle.note_session(48_000.0, "VST3");
     handle.track(AnalyticsEvent::CaptureCompleted {
         confidence: 0.95,
         offset_ms: 5.0,
+        capture_seconds: 1.5,
+        splice_count: 2,
+        polarity_inverted: false,
     });
 
     listener.set_nonblocking(true).unwrap();
@@ -70,6 +73,8 @@ fn nothing_is_sent_until_consent_is_granted() {
     analytics::set_consent(false);
     handle.track(AnalyticsEvent::CaptureRejected {
         reason: conjure_align::analysis::RejectReason::Silence,
+        capture_seconds: 0.0,
+        splice_count: 0,
     });
     assert!(
         listener.accept().is_err(),
@@ -85,16 +90,35 @@ fn nothing_is_sent_until_consent_is_granted() {
     handle.track(AnalyticsEvent::CaptureCompleted {
         confidence: 0.95,
         offset_ms: 5.0,
+        capture_seconds: 1.5,
+        splice_count: 2,
+        polarity_inverted: false,
     });
 
     let session: serde_json::Value = serde_json::from_str(&read_request(&listener)).unwrap();
     assert_eq!(session[0]["event"], "Plugin Loaded");
     assert_eq!(session[0]["properties"]["sample_rate"], 48_000u64);
+    // The environment properties survive the whole path to the wire, not just
+    // `build_payload`: the format this instance was told about at
+    // `note_session`, and the host resolved once per process.
+    assert_eq!(session[0]["properties"]["plugin_format"], "VST3");
+    let daw = session[0]["properties"]["daw"].as_str().unwrap();
+    assert!(!daw.is_empty());
+    // The test binary is not a DAW, so it must land in the "other" bucket and
+    // carry no version — the invariant the consent copy promises.
+    assert_eq!(daw, "other");
+    assert!(
+        session[0]["properties"].get("daw_version").is_none(),
+        "an unrecognised host sent a version: {session}"
+    );
 
     let capture: serde_json::Value = serde_json::from_str(&read_request(&listener)).unwrap();
     assert_eq!(capture[0]["event"], "Capture Completed");
     assert_eq!(capture[0]["properties"]["confidence"], "0.9+");
     assert_eq!(capture[0]["properties"]["offset"], "1-10ms");
+    assert_eq!(capture[0]["properties"]["capture_length"], "1-2s");
+    assert_eq!(capture[0]["properties"]["splices"], "1-3");
+    assert_eq!(capture[0]["properties"]["polarity_inverted"], false);
 
     // Both events must carry the same freshly minted, non-empty device id.
     let device_id = session[0]["properties"]["distinct_id"].as_str().unwrap();
@@ -104,10 +128,13 @@ fn nothing_is_sent_until_consent_is_granted() {
     // A second capture must not re-send the session event.
     handle.track(AnalyticsEvent::CaptureRejected {
         reason: conjure_align::analysis::RejectReason::TooShort,
+        capture_seconds: 0.3,
+        splice_count: 0,
     });
     let second: serde_json::Value = serde_json::from_str(&read_request(&listener)).unwrap();
     assert_eq!(second[0]["event"], "Capture Rejected");
     assert_eq!(second[0]["properties"]["reason"], "too_short");
+    assert_eq!(second[0]["properties"]["capture_length"], "<0.5s");
 
     // The consent actually landed on disk, at the real config path.
     let stored = analytics::config_path().expect("a config path under the temp HOME");

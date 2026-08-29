@@ -667,30 +667,6 @@ pub fn consent_modal(ctx: &egui::Context) {
     egui::Modal::new(egui::Id::new("conjure-align-consent")).show(ctx, |ui| {
         ui.set_max_width(400.0);
         ui.heading("Share anonymous usage and crash data?");
-        ui.add_space(8.0);
-        ui.label(
-            "It shows me how often ConjureAlign is used, how often a capture fails, \
-             and when it crashes — which is what tells me where to spend effort.",
-        );
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(
-                "Sent: plugin version and format (VST3/CLAP), operating system, sample \
-                 rate, whether a capture succeeded or why it was rejected, and whether \
-                 a run ended in a crash. A crash also sends the error and the \
-                 ConjureAlign code that led to it — labelled with a random ID.",
-            )
-            .small()
-            .color(TEXT_DIM),
-        );
-        ui.label(
-            egui::RichText::new(
-                "Never sent: your audio, any measurement of it, your file or project \
-                 names, your computer's name, or anything that identifies you.",
-            )
-            .small()
-            .color(TEXT_DIM),
-        );
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             if ui.button("No thanks").clicked() {
@@ -707,12 +683,6 @@ pub fn consent_modal(ctx: &egui::Context) {
                 analytics::set_consent(true);
             }
         });
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("You can change this any time under ⚙.")
-                .small()
-                .color(TEXT_DIM),
-        );
     });
 }
 
@@ -752,20 +722,11 @@ fn settings_menu(ui: &mut egui::Ui) {
             if analytics::is_supported() {
                 let mut share = analytics::enabled();
                 if ui
-                    .checkbox(&mut share, "Share usage and crash data")
+                    .checkbox(&mut share, "Share anonymous usage and crash data")
                     .changed()
                 {
                     analytics::set_consent(share);
                 }
-                ui.label(
-                    egui::RichText::new(
-                        "Plugin version and format (VST3/CLAP), OS, sample rate, capture \
-                         outcomes and crash reports, labelled with a random ID. Never \
-                         your audio.",
-                    )
-                    .small()
-                    .color(TEXT_DIM),
-                );
             } else {
                 ui.label(
                     egui::RichText::new(

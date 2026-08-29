@@ -11,6 +11,7 @@ pub mod capture;
 pub mod crash;
 pub mod dsp;
 pub mod editor;
+pub mod host;
 pub mod params;
 pub mod shared;
 pub mod spectrum;
@@ -218,6 +219,16 @@ fn analyze_and_publish(
             );
             return None;
         }
+        // Both outcomes describe the same capture, so these are read once,
+        // here, inside the borrow that owns the buffers. Guarded against a
+        // zero sample rate so the bucket never sees a non-finite value.
+        let capture_seconds = if data.sample_rate > 0.0 {
+            data.filled as f32 / data.sample_rate
+        } else {
+            0.0
+        };
+        let splice_count = data.splices.len();
+
         let report = analysis::analyze_spliced(
             &data.main[..data.filled],
             &data.reference[..data.filled],
@@ -248,6 +259,9 @@ fn analyze_and_publish(
                 event = analytics::AnalyticsEvent::CaptureCompleted {
                     confidence: result.confidence,
                     offset_ms,
+                    capture_seconds,
+                    splice_count,
+                    polarity_inverted: result.inverted,
                 };
             }
             Err(reason) => {
@@ -255,7 +269,11 @@ fn analyze_and_publish(
                     "ConjureAlign: analysis rejected ({:?}); keeping previous offset",
                     reason
                 );
-                event = analytics::AnalyticsEvent::CaptureRejected { reason };
+                event = analytics::AnalyticsEvent::CaptureRejected {
+                    reason,
+                    capture_seconds,
+                    splice_count,
+                };
             }
         }
         // Freeze everything the GUI needs. Copying here — on the
@@ -562,17 +580,22 @@ impl Plugin for ConjureAlign {
         // spurious re-analysis on the first process() call.
         self.prev_capture = self.params.capture.value();
 
+        // AU reports as CLAP: clap-wrapper translates AU calls into calls on
+        // our own `clap_entry`, so nih-plug never sees an AU-specific api. The
+        // `daw` property both reporters carry is what separates them again.
+        let plugin_format = match context.plugin_api() {
+            PluginApi::Clap => "CLAP",
+            PluginApi::Vst3 => "VST3",
+            PluginApi::Standalone => "standalone",
+        };
         // Idempotent per instance, so the host re-initializing (state loads,
         // sample-rate changes) doesn't inflate the session count.
-        self.analytics.note_session(self.sample_rate);
+        self.analytics.note_session(self.sample_rate, plugin_format);
         // Arms or tears down crash reporting to match the stored answer. The
         // editor re-syncs every frame, which is what picks up a consent change
         // made while the plugin is already running.
         self.crash.sync_consent();
-        // AU reports as CLAP: clap-wrapper translates AU calls into calls on
-        // our own `clap_entry`, so nih-plug never sees an AU-specific api.
-        self.crash
-            .set_host_context(&context.plugin_api().to_string(), self.sample_rate);
+        self.crash.set_host_context(plugin_format, self.sample_rate);
 
         true
     }

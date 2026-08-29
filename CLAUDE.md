@@ -89,6 +89,7 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
 ## Architecture
 
 - `src/analytics.rs` — opt-in Mixpanel telemetry (see its own section below);
+  `src/host.rs` — which DAW and OS the plugin is running in (see below);
 - `src/lib.rs` — Plugin impl and orchestration; `src/params.rs` — the whole state model;
   `src/capture.rs` — capture buffers + phase machine + the GUI-safe `CaptureHandle`;
   `src/analysis.rs` — offset estimation (background thread only); `src/shared.rs` — the
@@ -232,9 +233,63 @@ other targets it would drag in openssl, and Linux is a build-from-source platfor
 `config_path()` returns `None`, `consent()` reports a settled `Some(false)`, and the whole
 feature is inert. `CONJURE_ALIGN_ANALYTICS_URL` overrides the endpoint for a local sink.
 
-The payload is bucketed on purpose (`confidence_bucket`, `offset_bucket`): raw figures would
-describe the user's material. `MIXPANEL_TOKEN` holds the ConjureAlign project's token;
+The payload is bucketed on purpose (`confidence_bucket`, `offset_bucket`,
+`capture_seconds_bucket`, `splice_count_bucket`): raw figures would describe the user's
+material. Both capture events also carry `capture_length` and `splices` — read once from
+`data.filled`/`data.sample_rate` and `data.splices.len()` inside the borrow that
+`analyze_and_publish` already holds, so they cost nothing and touch no new state — and
+`Capture Completed` adds `polarity_inverted`, the one un-bucketed value, because a single
+bit about mic wiring cannot be coarsened further. They are on the *rejected* event too on
+purpose: `reason` alone cannot separate "the user never played anything" from "they played
+and it did not correlate", and a high `splices` bucket is the readable symptom of a
+`gate_threshold` default that is chopping takes up. `splice_count_bucket` keeps `"max"`
+distinct because at `MAX_SPLICES` the seam list stops growing and the rest of the capture
+records continuously — past that the count is a floor, not a total. `capture_seconds_bucket`
+routes non-finite input to the TOP bucket, not the bottom: a NaN fails every `<` guard, and
+silently reporting a broken reading as the shortest capture would be worse than as the
+longest. `MIXPANEL_TOKEN` holds the ConjureAlign project's token;
 client-side tokens are public by design (write-only ingestion, no read access).
+
+Every event also carries the environment, assembled in `EventContext`: `plugin_version`, `os`
+(the *build target*, which cannot move), `os_version` and `daw`/`daw_version` from
+`src/host.rs`, and `plugin_format` from `context.plugin_api()` — CLAP, VST3 or standalone,
+with **AU folded into CLAP** because clap-wrapper translates AU calls onto our own
+`clap_entry` and nih-plug genuinely never sees an AU (`daw` is what separates them again:
+Logic and GarageBand load only the AU). `build_payload` takes that context as a parameter
+rather than reading globals, which is what keeps its assertions valid on any machine. An
+unresolved value is OMITTED, never sent as null — a null lands in Mixpanel's lexicon as a
+real value and pollutes every breakdown on the property.
+
+`src/host.rs` resolves the environment once per process into a `OnceLock`, and three rules
+hold it together. **Nothing there may panic**: it runs inside `initialize()`, inside the
+host's `extern "C"` activation frame, where an unwind aborts the DAW — which is why the
+macOS bundle lookup uses the raw `core-foundation-sys` externs with hand-written null checks
+instead of the safe `core-foundation` wrappers, whose `wrap_under_get_rule` asserts on the
+NULL that `CFBundleGetMainBundle()` legitimately returns in an unbundled host (`auval`,
+`clap-validator`). **The DAW is an allowlisted label, never a raw name or path** — the
+`current_exe()` path can contain the user's home directory, and even a bare unrecognized
+stem is a fingerprint; anything off the list is `"other"` and carries NO version, since an
+unknown program plus its version identifies far more than either half. **The labels are wire
+values**: renaming one splits its history in Mixpanel, so add freely and rename never.
+
+Why `current_exe()` and not the host name the plugin API offers: nih-plug exposes neither
+CLAP's `clap_host.name` nor VST3's `IHostApplication::getName`, so reaching them would mean a
+fourth patch on the vendored tree — and it would be *wrong* for AU, where clap-wrapper is the
+CLAP host and would name the wrapper rather than Logic. Platform sources: macOS reads
+`CFBundleShortVersionString` from the main bundle and `kern.osproductversion` via `sysctl`
+(note macOS serves a capped "10.16" to processes linked against a pre-Big-Sur SDK, so a very
+old DAW under-reports); Windows reads the executable's `VS_FIXEDFILEINFO` block via
+`version.dll` and the OS version from `os_info`. All four deps were already compiled into
+their targets before being declared — `os_info` is Windows-ONLY in this graph, because
+`sentry-contexts` uses `uname` elsewhere, which is why macOS goes through sysctl instead.
+The `daw` labels include `auval`, `pluginval` and `clap-validator`: they load the plugin on
+a machine that may well have consented, and labelling them is what lets them be filtered out
+of the real usage figures rather than silently inflating the "other" bucket.
+
+The bundle lookup cannot be reached by a unit test — a test binary has no `.app` around it.
+`host::tests::print_resolved_host_info` (`#[ignore]`d) exists for that: copy the test binary
+into `Foo.app/Contents/MacOS/<an allowlisted name>` with an Info.plist beside it and run it
+from there, which is the same shape as a DAW loading the plugin.
 
 Three events: **`Plugin Loaded`** (once per instance, from `initialize()`), **`Capture
 Completed`**, **`Capture Rejected`**. The first is deliberately NOT called "Session Start" —
@@ -243,7 +298,9 @@ Mixpanel ships a built-in virtual event, `$session_start`, whose *display name* 
 picker. Check `Get-Events` before naming anything new. Verify ingestion with
 `cargo test --release -- --ignored --nocapture smoke_test`, which asks Mixpanel for
 `verbose=1` and asserts `"status": 1` — a bad token otherwise reads as a silent bare `0`.
-**It writes one real event to the live project**, tagged `smoke-test`.
+**It writes one real event to the live project**, tagged `smoke-test` — and deliberately
+with the REAL host context, so a newly added `daw` or `os_version` value gets seen once in
+the project before it arrives from a user.
 
 UI: the first-run prompt (`editor::consent_modal`) and the ⚙ popover (`settings_menu`) are both
 drawn OUTSIDE `draw_ui` / from the control bar respectively, and both are `pub` so
@@ -304,12 +361,28 @@ session and joins Sentry's transport thread). Three things are specific to panic
    and a blocking 2 s flush at 60 Hz. Nothing here touches the audio thread, so a dead editor
    still leaves the correction running and every parameter reachable from the host's generic UI.
 
-`before_send` (`crash::scrub`) is the last gate before anything leaves, and each line in it
-backs a promise in the README/consent copy: `server_name` is nulled (`sentry-contexts` fills it
-from the `hostname` crate), `user` is reduced to the device id, and `debug_meta.images` is
-trimmed to our own dylib — `debug-images` otherwise enumerates every shared library in the
-process, i.e. every other plugin the user owns. **Changing what is sent means changing
-`consent_modal`, `settings_menu` and the README Privacy table too.**
+Crash reports carry the same environment as the analytics events — `plugin_api`,
+`sample_rate`, `daw`, `daw_version`, `os_version` as tags. `set_host_context` resolves ALL of
+it on the main thread and stores plain data, so `scrub` (which runs on the *panicking* thread)
+only clones out of the mutex; calling `host::info()` from there instead would run
+`current_exe()` and a CoreFoundation lookup inside a panic hook. `os_version` is not
+redundant with sentry's own OS context: `sentry-contexts` fills that from `uname`, which on
+macOS reports the Darwin version ("25.3.0"), not the one users and release notes talk about
+("26.3.1").
+
+`before_send` (`crash::scrub`) is the last gate before anything leaves: `server_name` is
+nulled (`sentry-contexts` fills it from the `hostname` crate), `user` is reduced to the device
+id, and `debug_meta.images` is trimmed to our own dylib — `debug-images` otherwise enumerates
+every shared library in the process, i.e. every other plugin the user owns. The README's crash
+paragraph still backs the last two of those; the rest of `scrub` is now an unstated guarantee.
+
+**The prompt no longer enumerates what is collected.** `consent_modal` is a bare question and
+`settings_menu` a bare checkbox, by an explicit product decision on 2026-08-28 — so nothing in
+the UI describes the payload, and the README's Sent/Never-sent table that used to is gone.
+Adding a property therefore changes no user-facing text, which is exactly why it is worth
+noticing: this file and the `analytics`/`host` module docs are the only remaining record of
+what leaves the machine. Re-check the disclosure question before shipping a property that is
+more revealing than the bucketed outcomes already sent.
 
 `RejectReason` is NOT an error: it is an expected user outcome, already logged and already a
 Mixpanel event. Routing it here would bury real crashes. Only panics and genuine

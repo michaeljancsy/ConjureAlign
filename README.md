@@ -88,11 +88,6 @@ never sends anything before you answer. One answer covers both. There is no acco
 and no identifier tied to you: everything carries a random ID generated on the machine when you
 opt in.
 
-| | |
-|---|---|
-| Sent | Plugin version, plugin format (VST3/CLAP), operating system, sample rate, and whether a capture succeeded or why it was rejected (bucketed — "0.9+" confidence, "1–10 ms" offset, not the actual figures). Whether a run ended in a crash. If it did: the error, and the ConjureAlign functions and source lines that led to it. |
-| Never sent | Your audio, any measurement of it, your file or project names, host or machine names, IP-derived identity, or anything else. |
-
 A crash report names ConjureAlign's *own* code — its functions, and paths inside its source
 tree as it was built. It carries nothing from your machine: the list of other plugins loaded
 alongside it is stripped before sending, and so is your computer's name.

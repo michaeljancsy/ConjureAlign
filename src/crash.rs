@@ -234,9 +234,23 @@ mod imp {
     /// to the thread that set it: `initialize()` runs on the host's main
     /// thread, while panics are captured from the audio thread and from
     /// nih-plug's `bg-worker`, which would not see it.
-    fn host_context() -> &'static Mutex<Option<(String, f32)>> {
-        static HOST: OnceLock<Mutex<Option<(String, f32)>>> = OnceLock::new();
+    fn host_context() -> &'static Mutex<Option<HostTags>> {
+        static HOST: OnceLock<Mutex<Option<HostTags>>> = OnceLock::new();
         HOST.get_or_init(|| Mutex::new(None))
+    }
+
+    /// What every report says about the environment it came from. Resolved in
+    /// full on the main thread by `set_host_context`, so that `scrub` — which
+    /// runs on the panicking thread — only ever clones plain data out of the
+    /// mutex. Resolving `host::info()` there instead would run `current_exe()`
+    /// and a CoreFoundation lookup inside a panic hook.
+    #[derive(Clone)]
+    struct HostTags {
+        plugin_api: String,
+        sample_rate: f32,
+        daw: &'static str,
+        daw_version: Option<String>,
+        os_version: Option<String>,
     }
 
     /// Last gate before anything leaves the machine. Everything dropped here is
@@ -269,11 +283,24 @@ mod imp {
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().clone(),
             Err(std::sync::TryLockError::WouldBlock) => None,
         };
-        if let Some((plugin_api, sample_rate)) = host {
-            event.tags.insert("plugin_api".into(), plugin_api);
+        if let Some(tags) = host {
+            event.tags.insert("plugin_api".into(), tags.plugin_api);
             event
                 .tags
-                .insert("sample_rate".into(), (sample_rate as u32).to_string());
+                .insert("sample_rate".into(), (tags.sample_rate as u32).to_string());
+            // Which DAW a panic came from is the single most useful thing to
+            // group crashes by — the wrappers, the editor's windowing and the
+            // threading all differ per host.
+            event.tags.insert("daw".into(), tags.daw.to_owned());
+            if let Some(version) = tags.daw_version {
+                event.tags.insert("daw_version".into(), version);
+            }
+            // `sentry-contexts` fills the OS context from `uname`, which on
+            // macOS reports the Darwin version ("25.3.0"), not the one users
+            // and release notes talk about ("26.3.1").
+            if let Some(version) = tags.os_version {
+                event.tags.insert("os_version".into(), version);
+            }
         }
 
         Some(event)
@@ -493,12 +520,21 @@ mod imp {
         /// unconditionally — consent may arrive later, and a report raised
         /// then should still say where it came from.
         pub fn set_host_context(&self, plugin_api: &str, sample_rate: f32) {
+            // Main thread, and the first call is what forces `host::info()` to
+            // resolve — deliberately here rather than lazily in `scrub`.
+            let host = crate::host::info();
+            let tags = HostTags {
+                plugin_api: plugin_api.to_owned(),
+                sample_rate,
+                daw: host.daw,
+                daw_version: host.daw_version.clone(),
+                os_version: host.os_version.clone(),
+            };
             // Poison-tolerant: the value is plain data, and one earlier
             // panic must not disable host tagging for the process's lifetime.
             *host_context()
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some((plugin_api.to_owned(), sample_rate));
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tags);
         }
     }
 
