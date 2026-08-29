@@ -275,6 +275,8 @@ UI: the first-run prompt (`editor::consent_modal`) and the ⚙ popover (`setting
 drawn OUTSIDE `draw_ui` / from the control bar respectively, and both are `pub` so
 `examples/gui_preview.rs` can render them headless (`_consent.png`, `_settings.png`,
 `_settings_update.png`) — a consent dialog has no business in the panel screenshots. The prompt
+is each question's heading plus its two buttons and nothing else, with one closing line saying
+the answers are changeable under ⚙; the detail lives in the popover and the README. It
 renders only its unanswered questions, so the preview points `HOME` at a scratch directory to
 get a virgin install; without that it would render whatever this machine has already answered. Two layout constraints learned the
 hard way: the status strip has **zero slack at the 600×460 minimum** (its labels already reach
@@ -347,8 +349,10 @@ backs a promise in the README/consent copy: `server_name` is nulled (`sentry-con
 from the `hostname` crate), `user` is reduced to the device id, and `debug_meta.images` is
 trimmed to our own dylib — `debug-images` otherwise enumerates every shared library in the
 process, i.e. every other plugin the user owns. **Changing what is sent means changing
-`consent_modal`, `settings_menu` and the README Privacy table too** — and that rule now covers
-the update question's copy as well.
+`settings_menu` (`privacy_section`) and the README Privacy table too** — and that rule now
+covers the update check's copy as well. The first-run prompt is deliberately NOT on that list:
+it is headings and buttons only and makes no claim about what is sent, so `privacy_section` and
+the README are the only places the promise is written down.
 
 `RejectReason` is NOT an error: it is an expected user outcome, already logged and already a
 Mixpanel event. Routing it here would bury real crashes. Only panics and genuine

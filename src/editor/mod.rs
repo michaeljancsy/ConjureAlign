@@ -725,36 +725,13 @@ pub fn consent_modal(ctx: &egui::Context) {
     });
 }
 
-/// Question one. The wording here is a promise: it must stay in step with what
-/// `analytics::build_payload` and `crash::scrub` actually send, and with the
-/// README's Privacy table.
+/// Question one. Heading and buttons only: the prompt asks, it does not
+/// explain. What the two features actually send is stated in
+/// [`privacy_section`] (the ⚙ popover) and in the README's Privacy table —
+/// those are the copy that must stay in step with `analytics::build_payload`
+/// and `crash::scrub`.
 fn analytics_question(ui: &mut egui::Ui) {
     ui.heading("Share anonymous usage and crash data?");
-    ui.add_space(8.0);
-    ui.label(
-        "It shows me how often ConjureAlign is used, how often a capture fails, \
-         and when it crashes — which is what tells me where to spend effort.",
-    );
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new(
-            "Sent: plugin version and format (VST3/CLAP), operating system, sample \
-             rate, whether a capture succeeded or why it was rejected, and whether \
-             a run ended in a crash. A crash also sends the error and the code \
-             that led to it — ConjureAlign's own and the open-source libraries \
-             built into it — labelled with a random ID.",
-        )
-        .small()
-        .color(TEXT_DIM),
-    );
-    ui.label(
-        egui::RichText::new(
-            "Never sent: your audio, any measurement of it, your file or project \
-             names, your computer's name, or anything that identifies you.",
-        )
-        .small()
-        .color(TEXT_DIM),
-    );
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         if ui.button("No thanks").clicked() {
@@ -777,22 +754,11 @@ fn analytics_question(ui: &mut egui::Ui) {
 /// into it: this one shares no data and mints no identifier, and rolling the
 /// two together would mean a user who declines analytics also loses update
 /// notices for a reason that has nothing to do with why they declined.
+///
+/// Heading and buttons only, for the same reason as [`analytics_question`];
+/// what the check does is described in [`privacy_section`] and the README.
 fn updates_question(ui: &mut egui::Ui) {
     ui.heading("Check for new versions?");
-    ui.add_space(8.0);
-    ui.label(
-        "Once a day, ConjureAlign can ask GitHub whether a newer release exists \
-         and show a link if there is one. It never downloads or installs anything.",
-    );
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new(
-            "Nothing about you is sent — no ID, no usage, no audio. GitHub sees the \
-             request the way it would see your browser opening the releases page.",
-        )
-        .small()
-        .color(TEXT_DIM),
-    );
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         if ui.button("No thanks").clicked() {
