@@ -198,8 +198,14 @@ impl Marker {
     /// Whether the exception handler or the panic hook left a fault record for
     /// this process. Checked at teardown: if something went wrong, the marker
     /// survives a clean exit so the next launch still reports it.
+    ///
+    /// **Non-empty, not merely present.** On Windows `veh::install` opens the
+    /// fault file with `OPEN_ALWAYS`, which creates it — so every consenting
+    /// session has one from the moment crash reporting arms. Testing for
+    /// existence would keep every marker across every clean exit and report a
+    /// false unclean shutdown on every launch.
     fn has_fault(&self) -> bool {
-        self.fault_path.exists()
+        std::fs::metadata(&self.fault_path).is_ok_and(|m| m.len() > 0)
     }
 }
 
@@ -212,6 +218,10 @@ impl Drop for Marker {
             return;
         }
         let _ = std::fs::remove_file(&self.path);
+        // The empty file the exception handler pre-opened, if it got that far.
+        // Left behind it would accumulate one per pid forever, and the next
+        // process to reuse this pid would inherit it.
+        let _ = std::fs::remove_file(&self.fault_path);
     }
 }
 
@@ -698,6 +708,66 @@ mod tests {
         assert!(std::fs::read_to_string(&marker.path)
             .unwrap()
             .contains("editor_closed"));
+    }
+
+    fn marker_for(dir: &Path, pid: u32) -> Marker {
+        Marker {
+            path: marker_path(dir, pid),
+            fault_path: fault_path(dir, pid),
+            env: Env {
+                pid,
+                started_at: 0,
+                plugin_version: "0.0.0",
+                daw: "LUNA",
+                daw_version: None,
+                os_version: None,
+            },
+            stage: Mutex::new(Stage::Initialized),
+        }
+    }
+
+    /// The Windows shape: `veh::install` opens the fault file with
+    /// `OPEN_ALWAYS`, so an *empty* one exists from the moment crash reporting
+    /// arms. Treating that as evidence would keep every marker across every
+    /// clean exit and report a false unclean shutdown on every launch.
+    #[test]
+    fn an_empty_fault_file_is_not_evidence_of_a_fault() {
+        let dir = temp_dir("empty-fault");
+        let marker = marker_for(&dir, 1);
+        marker.write(Stage::Initialized);
+        std::fs::write(fault_path(&dir, 1), "").unwrap();
+
+        assert!(!marker.has_fault());
+        drop(marker);
+
+        assert!(
+            !marker_path(&dir, 1).exists(),
+            "a clean exit left its marker behind and would be reported as a crash"
+        );
+        assert!(
+            !fault_path(&dir, 1).exists(),
+            "the empty fault file would accumulate one per pid forever"
+        );
+    }
+
+    /// The converse: a record with content keeps both files alive for the
+    /// sweep, even though this process is exiting cleanly.
+    #[test]
+    fn a_recorded_fault_keeps_the_marker_past_a_clean_exit() {
+        let dir = temp_dir("real-fault");
+        let marker = marker_for(&dir, 1);
+        marker.write(Stage::Initialized);
+        std::fs::write(
+            fault_path(&dir, 1),
+            "exception\tcode=0xc0000005 offset=0x1234 scope=1\n",
+        )
+        .unwrap();
+
+        assert!(marker.has_fault());
+        drop(marker);
+
+        assert!(marker_path(&dir, 1).exists());
+        assert!(fault_path(&dir, 1).exists());
     }
 
     /// The process running this test is, definitionally, alive.

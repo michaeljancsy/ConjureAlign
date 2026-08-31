@@ -555,6 +555,10 @@ deletes it. Anything left behind by a process that no longer exists was an abnor
 termination, and the next launch reports it. Four rules:
 
 1. **Consent gates the file, not just the report.** A declined user gets nothing on disk.
+   A fault record counts as evidence only when it is **non-empty**: `veh::install` opens
+   that file with `OPEN_ALWAYS`, so on Windows every consenting session has an empty one
+   from the moment reporting arms, and testing for existence kept every marker across every
+   clean exit — a false unclean-shutdown report on every launch (caught by CI, 2026-08-31).
 2. **Never from the audio thread, and never on the `initialize()` fast path.** The stages
    are `initializing` / `initialized` (from `initialize()`), `editor_creating` /
    `editor_open` (around `Editor::spawn`, via the delegating `StageStamped` wrapper in

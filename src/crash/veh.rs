@@ -53,7 +53,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, WriteFile, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, RemoveVectoredExceptionHandler, EXCEPTION_CONTINUE_SEARCH,
@@ -165,6 +165,11 @@ fn image_range() -> Option<(usize, usize)> {
 /// Opens the fault file for append. `FILE_APPEND_DATA` (rather than
 /// `GENERIC_WRITE` plus a seek) is what makes the handler's single `WriteFile`
 /// land at the end without a second call.
+///
+/// Note `OPEN_ALWAYS` **creates** the file, so an empty one exists from here
+/// on — which is why `session_marker` treats a fault record as evidence only
+/// when it is non-empty. `FILE_SHARE_DELETE` lets the marker's own teardown
+/// remove it without depending on this handle having been closed first.
 fn open_fault_file(path: &Path) -> Option<HANDLE> {
     use std::os::windows::ffi::OsStrExt;
 
@@ -184,7 +189,7 @@ fn open_fault_file(path: &Path) -> Option<HANDLE> {
         CreateFileW(
             wide.as_ptr(),
             FILE_APPEND_DATA,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             OPEN_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,
