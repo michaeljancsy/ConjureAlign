@@ -106,6 +106,26 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   cert — a different cert from the "Developer ID Application" one that signs the bundles.
   `--no-notarize` builds without the multi-minute notarization step; it is checked as `$1`,
   so it must be the FIRST argument.
+  - Each format package carries a **`preinstall` that sweeps its own format** out of
+    `/Library` and every real user's `~/Library` before its payload lands (generated once by
+    `make_scripts`, which stamps `SUBDIR`/`BUNDLE`/`CLEAR_AU_CACHE` onto one shared body).
+    `BundleIsRelocatable=false` stops Installer *redirecting* onto a hand-installed
+    `~/Library` copy but cannot remove it, and that shadow copy is the classic "my update
+    didn't take" bug. Per-format, not one global sweep: a component's own preinstall is
+    guaranteed to run before its own payload, whereas a separate sweep package would depend
+    on components installing in `choices-outline` order — undocumented, and not something to
+    put in front of an `rm -rf` of what you just installed. It also means a format
+    *deselected* under Customize is left alone rather than silently uninstalled.
+  - That script must never fail an install (a non-zero preinstall aborts the whole
+    installation), so it runs with neither `set -e` nor `set -u` and always `exit 0`. That
+    makes its two guards load-bearing rather than decorative: it refuses an empty
+    `$SUBDIR`/`$BUNDLE` (which would turn the `rm -rf` into one that takes every plug-in on
+    the machine) and refuses any `BUNDLE` not named `ConjureAlign.*`. Test it without
+    installing anything: build a plug-in tree under a scratch directory, pass that directory
+    as `$3`, and check that only the matching format disappears while the other two formats,
+    another vendor's bundle, and (for non-AU packages) the AU cache all survive. Honouring
+    `$3` is what makes that possible — and it is also required for real, since
+    `enable_localSystem` still lets the user pick a non-boot volume.
   - A fourth, hidden component installs `/Applications/ConjureDSP/Uninstall
     ConjureAlign.command` (`scripts/uninstall-macos.sh`). It is `visible="false"
     start_selected="true" start_enabled="false"` — always installed, never a checkbox,

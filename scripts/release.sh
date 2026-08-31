@@ -144,17 +144,104 @@ build_component() { # $1 bundle  $2 dest subdir  $3 pkg suffix  $4... extra pkgb
 # Logic caches AU registrations; a stale cache is the #1 "where is the plugin?" support
 # question, so the AU package clears it itself. AudioComponentRegistrar is an on-demand
 # daemon — killall failing because it is not running is success, hence the || true.
-mkdir -p "$WORK/au-scripts"
-cat > "$WORK/au-scripts/postinstall" <<'EOF'
+# Stale hand-installed copies are why DAWs keep loading old builds. The .pkg
+# writes to /Library; a copy in ~/Library shadows it; and BundleIsRelocatable
+# =false (above) only stops Installer from silently *redirecting* the install
+# onto that copy — it does not remove it. So each format's package sweeps
+# ITSELF out of /Library and out of every user's ~/Library before its own
+# payload lands.
+#
+# Per-format rather than one global sweep, for two reasons. A component's own
+# preinstall is guaranteed to run before that component's own payload; a
+# separate sweep package would have to run before the *other* packages, which
+# rests on component packages being installed in choices-outline order —
+# undocumented, and not something to put in front of an `rm -rf` of the thing
+# you just installed. And a preinstall on a deselected choice does not run at
+# all, so unchecking VST3 under Customize leaves VST3 copies alone instead of
+# quietly uninstalling a format the user never asked to touch.
+make_scripts() { # $1 pkg suffix  $2 plug-in subdir  $3 bundle name  $4 1 = clear AU cache
+    local dir="$WORK/scripts-$1"
+    mkdir -p "$dir"
+    {
+        printf '#!/bin/sh\n'
+        printf 'SUBDIR=%s\n' "$2"
+        printf 'BUNDLE=%s\n' "$3"
+        printf 'CLEAR_AU_CACHE=%s\n' "${4:-0}"
+        cat <<'SWEEP'
+# ConjureAlign preinstall — remove stale copies of THIS format, then let the
+# payload install. Runs as root, out of installd.
+#
+# No `set -e` and an unconditional `exit 0`: a non-zero preinstall aborts the
+# whole installation, and nothing in a best-effort sweep is worth failing an
+# install over. No `set -u` either, for the same reason — but that means the
+# guards in sweep() below are load-bearing rather than decorative, since an
+# empty $SUBDIR/$BUNDLE would turn the rm into one that takes every plug-in on
+# the machine with it.
+#
+# $3 is the destination volume ("/" for the boot disk). enable_localSystem does
+# not pin the install to the boot volume — the user can still pick another under
+# Change Install Location — so every path is built from it.
+VOL=${3:-/}
+[ "$VOL" = "/" ] && VOL=""
+
+sweep() { # $1 = a Plug-Ins root
+    # Never construct a path from an empty component...
+    [ -n "$SUBDIR" ] && [ -n "$BUNDLE" ] || return 0
+    # ...and never delete anything that is not ours by name.
+    case "$BUNDLE" in ConjureAlign.*) ;; *) return 0 ;; esac
+    t="$1/$SUBDIR/$BUNDLE"
+    if [ -e "$t" ] || [ -L "$t" ]; then
+        # Goes to /var/log/install.log: silent to the user, greppable in support.
+        echo "ConjureAlign: removing stale $t"
+        rm -rf "$t" 2>/dev/null
+    fi
+}
+
+sweep "$VOL/Library/Audio/Plug-Ins"
+
+# Every real user's home. As root $HOME is /var/root and ~ is useless, so ask
+# the directory service. `_`-prefixed accounts are macOS service accounts; a
+# home outside /Users is a network or mobile account that is not ours to reach
+# into. `read -r u h` rather than `awk '{print $2}'` keeps a home directory
+# containing a space in one piece. Note dscl reads the BOOTED system's
+# directory, not $3's — correct for a normal install, wrong for one onto a
+# non-boot volume, which is a tradeoff rather than a bug worth code.
+#
+# KEEP IN SYNC with user_homes() in scripts/uninstall-macos.sh.
+dscl . -list /Users NFSHomeDirectory 2>/dev/null | while read -r u h; do
+    case "$u" in _*|"") continue ;; esac
+    case "$h" in /Users/*) ;; *) continue ;; esac
+    sweep "$VOL$h/Library/Audio/Plug-Ins"
+    # AU package only: a cache entry surviving a component we just deleted is
+    # exactly how Logic keeps listing a plug-in that is gone. It is a cache —
+    # the cost of clearing it is one slower plug-in scan.
+    [ "$CLEAR_AU_CACHE" = 1 ] && rm -rf "$VOL$h/Library/Caches/AudioUnitCache"
+done
+
+exit 0
+SWEEP
+    } > "$dir/preinstall"
+    chmod +x "$dir/preinstall"
+}
+
+make_scripts vst3 VST3       ConjureAlign.vst3
+make_scripts clap CLAP       ConjureAlign.clap
+make_scripts au   Components ConjureAlign.component 1
+
+# Logic caches AU registrations; a stale cache is the #1 "where is the plugin?"
+# support question, so the AU package clears it itself. AudioComponentRegistrar
+# is an on-demand daemon — killall failing because it is not running is success,
+# hence the || true. (make_scripts au created this directory.)
+cat > "$WORK/scripts-au/postinstall" <<'EOF'
 #!/bin/sh
 killall -9 AudioComponentRegistrar 2>/dev/null || true
 exit 0
 EOF
-chmod +x "$WORK/au-scripts/postinstall"
+chmod +x "$WORK/scripts-au/postinstall"
 
-build_component ConjureAlign.vst3      VST3       vst3
-build_component ConjureAlign.clap      CLAP       clap
-build_component ConjureAlign.component Components au --scripts "$WORK/au-scripts"
+build_component ConjureAlign.vst3      VST3       vst3 --scripts "$WORK/scripts-vst3"
+build_component ConjureAlign.clap      CLAP       clap --scripts "$WORK/scripts-clap"
+build_component ConjureAlign.component Components au   --scripts "$WORK/scripts-au"
 
 # The uninstaller. Not a checkbox and not optional: a plugin that installs into
 # /Library with installer receipts needs a way out that is not a support email
@@ -218,9 +305,12 @@ cat > "$RES/conclusion.html" <<'EOF'
 <p>In Logic Pro it appears under Audio FX &rarr; ConjureDSP &rarr; ConjureAlign
 (first launch may revalidate plugins; check Settings &rarr; Plug-in Manager if it is
 missing).</p>
-<p>If you previously installed ConjureAlign by hand into
-<tt>~/Library/Audio/Plug-Ins</tt>, delete those copies so your DAW does not load the old
-version.</p>
+<p><b>Quit and reopen your DAW.</b> A host that already had ConjureAlign loaded keeps
+running the old code until it is relaunched.</p>
+<p>Any older copies of the formats you just installed were removed from the system and
+per-user plug-in folders (<tt>/Library/Audio/Plug-Ins</tt> and
+<tt>~/Library/Audio/Plug-Ins</tt>), so your DAW cannot keep loading an old build alongside
+this one. Formats you left unchecked were not touched.</p>
 <p>To remove ConjureAlign later, open <tt>/Applications/ConjureDSP</tt> and double-click
 <b>Uninstall ConjureAlign</b>.</p>
 <p>Usage guide: <a href="https://github.com/michaeljancsy/ConjureAlign#how-to-use-it">github.com/michaeljancsy/ConjureAlign</a></p>

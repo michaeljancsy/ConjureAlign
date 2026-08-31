@@ -26,8 +26,10 @@ One), **CLAP** (Bitwig, REAPER) — and puts them in the system plug-in folders
 (`/Library/Audio/Plug-Ins`). Click Customize to install only some of them. Restart your
 DAW afterwards; in Logic the plugin appears under Audio FX → ConjureDSP → ConjureAlign.
 
-If you previously copied the bundles into `~/Library/Audio/Plug-Ins` by hand, delete
-those copies so your DAW doesn't keep loading the old version.
+Installing removes older copies of the formats you selected from both
+`/Library/Audio/Plug-Ins` and every user's `~/Library/Audio/Plug-Ins`, so a build you
+copied there by hand can't keep loading alongside the new one. Formats you leave unchecked
+under Customize are not touched.
 
 ## Installation (Windows — beta)
 
