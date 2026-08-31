@@ -111,11 +111,20 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
     `make_scripts`, which stamps `SUBDIR`/`BUNDLE`/`CLEAR_AU_CACHE` onto one shared body).
     `BundleIsRelocatable=false` stops Installer *redirecting* onto a hand-installed
     `~/Library` copy but cannot remove it, and that shadow copy is the classic "my update
-    didn't take" bug. Per-format, not one global sweep: a component's own preinstall is
-    guaranteed to run before its own payload, whereas a separate sweep package would depend
-    on components installing in `choices-outline` order — undocumented, and not something to
-    put in front of an `rm -rf` of what you just installed. It also means a format
-    *deselected* under Customize is left alone rather than silently uninstalled.
+    didn't take" bug. Per-format, not one global sweep package: a component's own preinstall
+    is guaranteed to run before its own payload — definitional — whereas a separate sweep
+    package would depend on components installing in `choices-outline` order, which Apple
+    does not document and which is not something to put in front of an `rm -rf` of what you
+    just installed.
+  - What makes the per-format sweep *complete* is **`customize="never"`**. All three
+    components always install, so all three preinstalls always run, so between them they
+    cover every format — a global sweep's coverage with none of its ordering risk. Removing
+    the format checkboxes is a product decision first (2026-08-31): per-format deselection
+    is the only way a Mac can end up with formats at DIFFERENT versions, and "works in Logic
+    but not REAPER" is then a version mismatch nobody can see. It also matches the Windows
+    installer, which has no `[Components]` section and always writes both formats.
+    **Reintroducing per-format choice silently breaks the sweep**, because a preinstall on a
+    deselected component never runs; the `<options>` element carries that warning inline.
   - That script must never fail an install (a non-zero preinstall aborts the whole
     installation), so it runs with neither `set -e` nor `set -u` and always `exit 0`. That
     makes its two guards load-bearing rather than decorative: it refuses an empty

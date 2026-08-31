@@ -151,14 +151,20 @@ build_component() { # $1 bundle  $2 dest subdir  $3 pkg suffix  $4... extra pkgb
 # ITSELF out of /Library and out of every user's ~/Library before its own
 # payload lands.
 #
-# Per-format rather than one global sweep, for two reasons. A component's own
-# preinstall is guaranteed to run before that component's own payload; a
-# separate sweep package would have to run before the *other* packages, which
-# rests on component packages being installed in choices-outline order —
-# undocumented, and not something to put in front of an `rm -rf` of the thing
-# you just installed. And a preinstall on a deselected choice does not run at
-# all, so unchecking VST3 under Customize leaves VST3 copies alone instead of
-# quietly uninstalling a format the user never asked to touch.
+# Per-format rather than one global sweep package. A component's own preinstall
+# is guaranteed to run before that component's own payload — definitional,
+# needing no assumption. A separate sweep package would instead have to run
+# before the *other* packages, which rests on components being installed in
+# choices-outline order: undocumented, and not something to put in front of an
+# `rm -rf` of the thing you just installed.
+#
+# The usual objection to per-format is that a preinstall on a DESELECTED choice
+# never runs, leaving that format's stale copy behind. That cannot happen here:
+# distribution.xml sets customize="never", so all three components always
+# install and all three preinstalls always run. Together they cover every
+# format, which is what makes this equivalent to a global sweep with none of
+# the ordering risk. If per-format choice is ever reintroduced, this stops
+# being complete — see the comment on <options> in distribution.xml.
 make_scripts() { # $1 pkg suffix  $2 plug-in subdir  $3 bundle name  $4 1 = clear AU cache
     local dir="$WORK/scripts-$1"
     mkdir -p "$dir"
@@ -289,8 +295,9 @@ cat > "$RES/welcome.html" <<EOF
 <p><b>ConjureAlign $VERSION</b> time-aligns a mic signal to a reference mic with sub-sample
 precision and automatic polarity detection.</p>
 <p>This installer places the plugin into the system plug-in folders
-(<tt>/Library/Audio/Plug-Ins</tt>) for all users. All three formats are installed by
-default; click Customize to pick specific ones.</p>
+(<tt>/Library/Audio/Plug-Ins</tt>) for all users. All three formats are installed, and any
+older copies of them are removed &mdash; so every format on this Mac is the same
+version.</p>
 <ul>
 <li><b>Audio Unit</b> &mdash; Logic Pro, GarageBand</li>
 <li><b>VST3</b> &mdash; REAPER, Ableton Live, Cubase, Studio One</li>
@@ -298,7 +305,9 @@ default; click Customize to pick specific ones.</p>
 </ul>
 </body></html>
 EOF
-cat > "$RES/conclusion.html" <<'EOF'
+# Unquoted heredoc: $VERSION interpolates. The body carries no backticks or
+# backslashes, so nothing else here is shell-significant.
+cat > "$RES/conclusion.html" <<EOF
 <html><head><meta charset="utf-8"></head>
 <body style="font-family: -apple-system, sans-serif; font-size: 13px;">
 <p><b>ConjureAlign is installed.</b> Restart your DAW to pick it up.</p>
@@ -307,10 +316,10 @@ cat > "$RES/conclusion.html" <<'EOF'
 missing).</p>
 <p><b>Quit and reopen your DAW.</b> A host that already had ConjureAlign loaded keeps
 running the old code until it is relaunched.</p>
-<p>Any older copies of the formats you just installed were removed from the system and
-per-user plug-in folders (<tt>/Library/Audio/Plug-Ins</tt> and
-<tt>~/Library/Audio/Plug-Ins</tt>), so your DAW cannot keep loading an old build alongside
-this one. Formats you left unchecked were not touched.</p>
+<p>Older copies of all three formats were removed from the system and per-user plug-in
+folders (<tt>/Library/Audio/Plug-Ins</tt> and <tt>~/Library/Audio/Plug-Ins</tt>), including
+any you had copied there by hand &mdash; so no DAW can keep loading an old build alongside
+this one, and every format on this Mac is now $VERSION.</p>
 <p>To remove ConjureAlign later, open <tt>/Applications/ConjureDSP</tt> and double-click
 <b>Uninstall ConjureAlign</b>.</p>
 <p>Usage guide: <a href="https://github.com/michaeljancsy/ConjureAlign#how-to-use-it">github.com/michaeljancsy/ConjureAlign</a></p>
@@ -324,7 +333,18 @@ cat > "$WORK/distribution.xml" <<EOF
     <welcome file="welcome.html" mime-type="text/html"/>
     <license file="license.txt" mime-type="text/plain"/>
     <conclusion file="conclusion.html" mime-type="text/html"/>
-    <options customize="allow" require-scripts="false" hostArchitectures="arm64,x86_64"/>
+    <!-- customize="never": all three formats, always, with no checkboxes. This
+         is load-bearing, not a simplification. Per-format deselection is the
+         one way a machine can end up with formats at DIFFERENT versions — keep
+         1.3.0's VST3 while updating to 1.4.0's AU and "it works in Logic but
+         not REAPER" becomes a version mismatch nobody can see. It is also what
+         lets each format's own preinstall be a complete sweep: every component
+         always installs, so every component's preinstall always runs, so the
+         three of them together cover every format WITHOUT needing a separate
+         sweep package that would have to assume components install in
+         choices-outline order. Matches the Windows installer, which has no
+         [Components] section and always writes both formats. -->
+    <options customize="never" require-scripts="false" hostArchitectures="arm64,x86_64"/>
     <domains enable_localSystem="true"/>
     <choices-outline>
         <line choice="au"/>

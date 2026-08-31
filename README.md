@@ -23,13 +23,13 @@ Download `ConjureAlign-<version>-macOS.pkg` from the
 double-click it. The installer is signed and notarized; it offers all three formats —
 **Audio Unit** (Logic Pro, GarageBand), **VST3** (REAPER, Ableton Live, Cubase, Studio
 One), **CLAP** (Bitwig, REAPER) — and puts them in the system plug-in folders
-(`/Library/Audio/Plug-Ins`). Click Customize to install only some of them. Restart your
+(`/Library/Audio/Plug-Ins`). All three are always installed, so every format on the machine
+is the same version. Restart your
 DAW afterwards; in Logic the plugin appears under Audio FX → ConjureDSP → ConjureAlign.
 
-Installing removes older copies of the formats you selected from both
-`/Library/Audio/Plug-Ins` and every user's `~/Library/Audio/Plug-Ins`, so a build you
-copied there by hand can't keep loading alongside the new one. Formats you leave unchecked
-under Customize are not touched.
+Installing removes older copies of all three formats from both `/Library/Audio/Plug-Ins`
+and every user's `~/Library/Audio/Plug-Ins`, including any you copied there by hand, so an
+old build can't keep loading alongside the new one.
 
 ## Installation (Windows — beta)
 
