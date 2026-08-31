@@ -265,9 +265,20 @@ jobs:
 
           # The installed copy is what users load, so validate that one, not the
           # build tree.
+          #
+          # Start-Process -Wait, not `& $pv`: pluginval.exe is a GUI-subsystem
+          # binary, so PowerShell does not block on it and $LASTEXITCODE is still
+          # $null when the next line reads it — and `$null -ne 0` is true, so the
+          # check threw while pluginval was still printing SUCCESS. Waiting also
+          # matters for its own sake: phase 2 must not start sweeping while
+          # pluginval still has the DLL open.
           $pv = (Get-ChildItem validators -Recurse -Filter 'pluginval*.exe' | Select-Object -First 1).FullName
-          & $pv --strictness-level 10 --skip-gui-tests --validate $vst3
-          if ($LASTEXITCODE -ne 0) { throw 'pluginval failed against the installed bundle' }
+          $p = Start-Process -FilePath $pv -Wait -PassThru -NoNewWindow `
+                 -ArgumentList @('--strictness-level','10','--skip-gui-tests','--validate',$vst3) `
+                 -RedirectStandardOutput 'pluginval-installed.log' `
+                 -RedirectStandardError  'pluginval-installed.err'
+          Get-Content 'pluginval-installed.log','pluginval-installed.err' -ErrorAction SilentlyContinue | Write-Host
+          if ($p.ExitCode -ne 0) { throw "pluginval failed against the installed bundle (exit $($p.ExitCode))" }
 
           # --- phase 2: bad-extraction leftover + per-user copy, install over ---
           $leftover = 'C:\Program Files\Common Files\VST3\ConjureAlign-1.2.0'
