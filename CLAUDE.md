@@ -62,10 +62,33 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
 - VST3 validation: `pluginval --strictness-level 10 target/bundled/ConjureAlign.vst3`
 - Windows: no local toolchain — `.github/workflows/windows.yml` builds, tests, bundles and
   validates (pluginval `--skip-gui-tests`; clap-validator tolerating exactly the 4 known
-  upstream failures) on `windows-latest`, uploads `ConjureAlign-<v>-Windows.zip` as an
-  artifact, and attaches it to the GitHub Release on `v*` tag pushes (warns if the release
-  doesn't exist yet — create it and re-run the job). The editor is untestable in CI (no
-  GPU); GUI checks need a real Windows machine.
+  upstream failures) on `windows-latest`, packages `ConjureAlign-<v>-Windows-Setup.exe` with
+  Inno Setup (`packaging/windows/ConjureAlign.iss`; Inno 6 is preinstalled on the runner, so
+  no install step), uploads it as an artifact, and attaches it to the GitHub Release on `v*`
+  tag pushes (warns if the release doesn't exist yet — create it and re-run the job). The
+  editor is untestable in CI (no GPU); GUI checks need a real Windows machine.
+  - The runner IS a real Windows machine and the workflow uses it as one: the installer is
+    **smoke-tested end to end** (install over a planted loose-DLL mis-install → install again
+    over a planted `ConjureAlign-1.2.0\` leftover and a per-user copy, with a decoy that must
+    survive → uninstall), and pluginval is re-run against the *installed* bundle. That is not
+    belt-and-braces: an Inno 6 installer cannot be inspected offline — 7-Zip does not read the
+    format and `innoextract` lags Inno releases by years — so running it is the only
+    verification that exists.
+  - `AppId` in the `.iss` is a permanent identity, exactly like the AU `subtype`. Change it
+    and a later installer stops recognising existing installs: two Add/Remove entries, two
+    uninstallers, no upgrade path. The smoke test hard-codes the same GUID on purpose, so
+    changing one without the other fails CI instead of shipping.
+  - Two Inno settings are load-bearing and silently no-op if wrong.
+    `CloseApplicationsFilter` defaults to `*.exe,*.dll,*.chm`, which matches neither `.vst3`
+    nor `.clap` — without the override, `CloseApplications=yes` checks nothing and an install
+    against a running DAW half-fails. And `ignoreversion` on `[Files]` is mandatory now that
+    the DLL carries a version resource, or Inno skips a file whose installed copy is
+    equal-or-newer and a same-version reinstall installs nothing.
+  - Passing the version: `#define AppVersion GetEnv("CONJUREALIGN_VERSION")`, **not**
+    `ISCC /DAppVersion=…`. The step is `shell: bash`, i.e. Git Bash, whose MSYS layer rewrites
+    a leading-slash argument into a Windows path — `/DAppVersion=1.3.0` arrives as
+    `D:\AppVersion=1.3.0`. The same hazard is why the installer itself is driven from `pwsh`
+    (`/VERYSILENT` would be mangled too).
 - AU validation: install the `.component`, then
   `killall -9 AudioComponentRegistrar; auval -v aufx ALGN CONJ` (add `-strict` for the
   pedantic pass). The `;` is deliberate — `AudioComponentRegistrar` is an on-demand daemon,

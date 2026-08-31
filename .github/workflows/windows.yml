@@ -8,7 +8,18 @@
 # and tolerates exactly the 4 known upstream nih-plug issues (see CLAUDE.md,
 # "Known upstream issues"); a 5th failure fails the build.
 #
-# On a v* tag push, the zip is attached to that tag's GitHub Release if one
+# Packaging produces an Inno Setup installer, ConjureAlign-<v>-Windows-Setup.exe,
+# which replaced a zip users hand-copied into Common Files. It is UNSIGNED, so
+# SmartScreen warns on first download; accepted, since a code-signing certificate
+# is the only fix. Inno Setup 6 is preinstalled on the runner image, so `iscc`
+# needs no install step.
+#
+# The installer is smoke-tested end to end here — install, install again over
+# planted mis-installs, uninstall — because an Inno 6 installer cannot be
+# unpacked offline (7-Zip does not read the format, innoextract lags by years)
+# and this runner is the only Windows machine the project has.
+#
+# On a v* tag push, the installer is attached to that tag's GitHub Release if one
 # exists (create the release first, or re-run the job after creating it).
 
 name: Windows
@@ -174,36 +185,111 @@ jobs:
             exit 1
           fi
 
-      - name: Package
+      - name: Build installer (Inno Setup)
         shell: bash
         run: |
-          STAGE="ConjureAlign-$VERSION"
-          mkdir -p "$STAGE" dist
-          cp -R target/bundled/ConjureAlign.vst3 target/bundled/ConjureAlign.clap "$STAGE/"
-          cp LICENSE THIRD-PARTY.md "$STAGE/"
-          cat > "$STAGE/INSTALL.txt" <<'EOF'
-          ConjureAlign — installation (Windows)
+          rm -rf dist
+          mkdir -p dist/stage
+          cp -R target/bundled/ConjureAlign.vst3 target/bundled/ConjureAlign.clap dist/stage/
+          # CRLF: Inno renders LicenseFile in a rich-text control, and these also
+          # end up double-clickable in Notepad next to the uninstaller.
+          sed 's/$/\r/' LICENSE                      > dist/stage/LICENSE.txt
+          sed 's/$/\r/' THIRD-PARTY.md               > dist/stage/THIRD-PARTY.md
+          sed 's/$/\r/' packaging/windows/README.txt > dist/stage/README.txt
 
-          Copy each bundle to the matching folder (create it if missing):
-
-            ConjureAlign.vst3 -> C:\Program Files\Common Files\VST3\
-            ConjureAlign.clap -> C:\Program Files\Common Files\CLAP\
-
-          Then restart your DAW and rescan plugins if it does not appear.
-
-          The Windows build compiles and passes automated validation, but has had
-          less real-DAW testing than the macOS build. Please report problems at
-          https://github.com/michaeljancsy/ConjureAlign/issues
-
-          Usage: https://github.com/michaeljancsy/ConjureAlign#how-to-use-it
-          EOF
-          7z a -tzip "dist/ConjureAlign-$VERSION-Windows.zip" "$STAGE" >/dev/null
+          # ISCC reads the version from the environment rather than /DName=value;
+          # see the .iss header for why (Git Bash mangles leading slashes).
+          export CONJUREALIGN_VERSION="$VERSION"
+          # Inno Setup 6 is preinstalled on the runner image, with iscc on PATH
+          # via the Chocolatey shim. The fallback is in case that shim moves.
+          ISCC=$(command -v iscc || true)
+          [ -n "$ISCC" ] || ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          "$ISCC" packaging/windows/ConjureAlign.iss
           ls -la dist
+          # ISCC exits non-zero on a fatal error or a failed compile, which this
+          # step's `bash -e` turns into a job failure. It exits 0 on warnings,
+          # so also confirm the file landed where the .iss said it would.
+          test -f "dist/ConjureAlign-$VERSION-Windows-Setup.exe"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ConjureAlign-${{ env.VERSION }}-Windows
-          path: dist/*.zip
+          name: ConjureAlign-${{ env.VERSION }}-Windows-Setup
+          path: dist/ConjureAlign-*-Windows-Setup.exe
+
+      # The runner IS a real Windows machine, and the only one this project has.
+      # An Inno 6 installer cannot be unpacked offline — 7-Zip does not read the
+      # format and innoextract lags Inno releases by years — so actually running
+      # it here is not a nice-to-have, it is the only verification there is.
+      #
+      # Install, plant the two mis-install shapes [InstallDelete] exists for,
+      # install over them, then uninstall. pwsh throughout: from `shell: bash`,
+      # MSYS would rewrite /VERYSILENT into a Windows path.
+      #
+      # Runs AFTER the artifact upload, so a broken installer is still
+      # downloadable for inspection, and BEFORE the release attach, so a broken
+      # one can never reach a Release.
+      - name: Installer smoke test (install / upgrade / uninstall)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver  = "${{ env.VERSION }}"
+          $exe  = (Resolve-Path "dist/ConjureAlign-$ver-Windows-Setup.exe").Path
+          $vst3 = 'C:\Program Files\Common Files\VST3\ConjureAlign.vst3'
+          $clap = 'C:\Program Files\Common Files\CLAP\ConjureAlign.clap'
+          $dll  = "$vst3\Contents\x86_64-win\ConjureAlign.vst3"
+          # Same GUID as AppId in the .iss. Deliberately duplicated: changing one
+          # without the other fails here rather than silently breaking upgrades
+          # for every existing install.
+          $arp  = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{3447632D-7F44-44AD-9A1E-E4C24A33E998}_is1'
+          $userVst3 = "$env:LOCALAPPDATA\Programs\Common\VST3"
+
+          $id = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+          Write-Host "elevated: $($id.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
+
+          function Invoke-Setup($file, $arguments, $what) {
+            $p = Start-Process -FilePath $file -ArgumentList $arguments -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "$what exited $($p.ExitCode)" }
+          }
+
+          # --- phase 1: a loose-DLL mis-install present, then a clean install ---
+          New-Item -ItemType Directory -Force -Path (Split-Path $vst3) | Out-Null
+          # A FILE where the bundle directory belongs.
+          Copy-Item 'target/bundled/ConjureAlign.clap' $vst3
+          Invoke-Setup $exe @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG=install1.log') 'install #1'
+          if (-not (Get-Item $vst3).PSIsContainer) { throw 'loose ConjureAlign.vst3 file was not replaced by the bundle' }
+          if (-not (Test-Path $dll))  { throw 'VST3 payload missing after install' }
+          if (-not (Test-Path $clap)) { throw 'CLAP missing after install' }
+          $arpVer = (Get-ItemProperty $arp).DisplayVersion
+          if ($arpVer -ne $ver) { throw "Add/Remove DisplayVersion='$arpVer', expected '$ver'" }
+          if ((Get-Item $dll).VersionInfo.FileVersion -ne $ver) { throw 'the installed VST3 lost its version resource' }
+
+          # The installed copy is what users load, so validate that one, not the
+          # build tree.
+          $pv = (Get-ChildItem validators -Recurse -Filter 'pluginval*.exe' | Select-Object -First 1).FullName
+          & $pv --strictness-level 10 --skip-gui-tests --validate $vst3
+          if ($LASTEXITCODE -ne 0) { throw 'pluginval failed against the installed bundle' }
+
+          # --- phase 2: bad-extraction leftover + per-user copy, install over ---
+          $leftover = 'C:\Program Files\Common Files\VST3\ConjureAlign-1.2.0'
+          New-Item -ItemType Directory -Force -Path "$leftover\ConjureAlign.vst3\Contents\x86_64-win" | Out-Null
+          Copy-Item $dll "$leftover\ConjureAlign.vst3\Contents\x86_64-win\ConjureAlign.vst3"
+          New-Item -ItemType Directory -Force -Path $userVst3 | Out-Null
+          Copy-Item $dll "$userVst3\ConjureAlign.vst3"
+          # A decoy that must survive: the sweep is scoped to our own names.
+          Copy-Item $dll "$userVst3\SomeoneElse.vst3"
+          Invoke-Setup $exe @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG=install2.log') 'install #2'
+          if (Test-Path $leftover)                      { throw 'bad-extraction leftover survived the sweep' }
+          if (Test-Path "$userVst3\ConjureAlign.vst3") { throw 'per-user copy survived the sweep' }
+          if (-not (Test-Path "$userVst3\SomeoneElse.vst3")) { throw 'the sweep removed another vendor''s plugin' }
+          if (-not (Test-Path $dll))                    { throw 'reinstall over an existing install replaced nothing' }
+
+          # --- phase 3: uninstall ------------------------------------------------
+          $unins = (Get-ItemProperty $arp).UninstallString -replace '"',''
+          Invoke-Setup $unins @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART') 'uninstall'
+          if (Test-Path $vst3) { throw 'VST3 survived uninstall' }
+          if (Test-Path $clap) { throw 'CLAP survived uninstall' }
+          if (Test-Path $arp)  { throw 'Add/Remove entry survived uninstall' }
+          Write-Host 'installer smoke test passed'
 
       - name: Attach to release (tag builds)
         if: github.ref_type == 'tag'
@@ -211,5 +297,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "$GITHUB_REF_NAME" dist/*.zip --clobber \
-            || echo "::warning::no release exists for $GITHUB_REF_NAME yet — create it, then re-run this job to attach the zip"
+          gh release upload "$GITHUB_REF_NAME" dist/ConjureAlign-*-Windows-Setup.exe --clobber \
+            || echo "::warning::no release exists for $GITHUB_REF_NAME yet — create it, then re-run this job to attach the installer"
