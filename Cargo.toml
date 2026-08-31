@@ -90,6 +90,19 @@ windows-sys = { version = "0.61", features = [
 # why macOS reads sysctl instead).
 os_info = { version = "3", default-features = false }
 
+# Stamps the VS_VERSION_INFO resource into the cdylib (see build.rs), so an
+# installed ConjureAlign.vst3 / .clap can be asked which build it is. Build-time
+# only and never linked into the shipped binary; it shells out to the Windows
+# SDK's rc.exe. `default-features = false` drops its `toml` feature and that
+# whole toml/winnow tree — build.rs sets every field explicitly rather than
+# through a `[package.metadata.winresource]` table.
+#
+# Cargo evaluates `cfg()` on BUILD-dependencies against the host, which is the
+# right gate here: Windows is only ever built natively (macOS releases go
+# through `bundle-universal` on a Mac), so host and target agree.
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = { version = "0.1", default-features = false }
+
 # `tests/veh_windows.rs` only: the child half of that test suppresses the
 # Windows Error Reporting dialog before it faults, so a crashing CI job fails
 # instead of hanging on a message box.

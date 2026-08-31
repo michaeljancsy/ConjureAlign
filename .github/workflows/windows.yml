@@ -33,6 +33,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Hoisted out of the Package step so the pwsh verification below can use
+      # it too. $GITHUB_ENV reaches subsequent steps only, never this one.
+      - name: Resolve version
+        shell: bash
+        run: echo "VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_ENV"
+
       - name: Install stable Rust
         shell: bash
         run: |
@@ -48,6 +54,47 @@ jobs:
       - name: Bundle
         shell: bash
         run: cargo xtask bundle conjure_align --release
+
+      # build.rs stamps a VS_VERSION_INFO resource into the cdylib so an
+      # installed plugin can be asked which build it is. Nothing about
+      # `strip = "symbols"`, `lto = "thin"` or nih_plug_xtask's reflink copy
+      # should disturb it — but this is the only Windows machine the project
+      # has, so it is asserted rather than assumed.
+      #
+      # Asserted on the BUNDLED files, not just target/release: those are what
+      # users actually get, and checking them also proves the rename into the
+      # bundle preserved the resource.
+      #
+      # pwsh, not bash: Get-Item's .VersionInfo goes through the same
+      # GetFileVersionInfo call a support thread would use, and is
+      # extension-independent (Explorer's property sheet is not — it resolves
+      # per-extension, and .vst3/.clap have no registered handler, so
+      # right-click → Properties will NOT show a version).
+      - name: Verify the embedded version resource
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = "${{ env.VERSION }}"
+          $major = [int]$expected.Split('.')[0]
+          foreach ($f in @(
+              'target/bundled/ConjureAlign.vst3/Contents/x86_64-win/ConjureAlign.vst3',
+              'target/bundled/ConjureAlign.clap',
+              'target/release/conjure_align.dll')) {
+            if (-not (Test-Path $f)) { throw "missing build output: $f" }
+            $vi = (Get-Item $f).VersionInfo
+            Write-Host "$f"
+            Write-Host "  FileVersion='$($vi.FileVersion)' ProductVersion='$($vi.ProductVersion)'"
+            Write-Host "  ProductName='$($vi.ProductName)' CompanyName='$($vi.CompanyName)'"
+            # The string block, which is what the support one-liner reads.
+            if ($vi.FileVersion -ne $expected) {
+              throw "$f has FileVersion '$($vi.FileVersion)', expected '$expected' (resource missing or stale?)"
+            }
+            # The binary VS_FIXEDFILEINFO block, which is a separate field and
+            # can be wrong while the string one is right.
+            if ($vi.FileMajorPart -ne $major) {
+              throw "$f VS_FIXEDFILEINFO major is $($vi.FileMajorPart), expected $major"
+            }
+          }
 
       # Turns a shipped crash report into function names. [profile.release] keeps
       # `strip = "symbols"`, so the .dll carries none and the .pdb beside it holds
@@ -130,8 +177,6 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           STAGE="ConjureAlign-$VERSION"
           mkdir -p "$STAGE" dist
           cp -R target/bundled/ConjureAlign.vst3 target/bundled/ConjureAlign.clap "$STAGE/"

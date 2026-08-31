@@ -88,6 +88,16 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   the vendored tree must move in lockstep with the pinned rev. `atomic_float` in Cargo.toml
   must stay on the same version nih_plug uses, because its `AtomicF32` implements nih_plug's
   `PersistentField`.
+- `build.rs` exists for exactly one thing: on a Windows host it stamps a `VS_VERSION_INFO`
+  resource into the cdylib (via `winresource` → the Windows SDK's `rc.exe`), so an installed
+  `ConjureAlign.vst3` / `.clap` — both of which are this DLL renamed, with no other identity
+  on disk — can be asked which build it is. It is a no-op on every other target. Note the
+  two version shapes: the STRING `FileVersion` is `CARGO_PKG_VERSION` verbatim (three-part,
+  matching the release tag and the only shape `update::parse_version` accepts), while the
+  binary `VS_FIXEDFILEINFO` block is always `MAJOR.MINOR.PATCH.0`. Explorer will NOT display
+  either — its property sheet resolves per-extension and `.vst3`/`.clap` have no registered
+  handler — so the check is `(Get-Item '<path>').VersionInfo.FileVersion` in PowerShell, and
+  CI asserts both blocks on the bundled files after every build.
 - Debug builds enable nih_plug's `assert_process_allocs`: any allocation on the audio thread
   panics. Keep it that way; fix the code, not the feature flag.
 
