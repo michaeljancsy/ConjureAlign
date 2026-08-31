@@ -156,6 +156,39 @@ build_component ConjureAlign.vst3      VST3       vst3
 build_component ConjureAlign.clap      CLAP       clap
 build_component ConjureAlign.component Components au --scripts "$WORK/au-scripts"
 
+# The uninstaller. Not a checkbox and not optional: a plugin that installs into
+# /Library with installer receipts needs a way out that is not a support email
+# full of `sudo`.
+#
+# Deliberately NOT built through build_component(): the payload is a shell
+# script, not a bundle, so `pkgbuild --analyze` finds nothing and emits an empty
+# array — on which build_component's `PlistBuddy -c "Add :0:..."` fails and,
+# under `set -e`, takes the whole release with it. `--component-plist` is
+# optional (pkgbuild(1): "If you specify --root, you can use --component-plist"),
+# and with no bundles in the root there is nothing for it to configure.
+#
+# --install-location is the leaf /Applications/ConjureDSP, not /Applications:
+# pkgbuild puts a "." entry in the BOM carrying the root directory's own mode,
+# and "." maps to the install-location. Aiming it at /Applications would make
+# that entry describe /Applications itself (root:admin 0775 here), and packages
+# that reset it to root:wheel 0755 are a known class of bug. This way
+# /Applications never appears in the BOM at all.
+UNROOT="$WORK/root-uninstall"
+mkdir -p "$UNROOT"
+cp scripts/uninstall-macos.sh "$UNROOT/Uninstall ConjureAlign.command"
+# The execute bit is what makes Finder hand a .command to Terminal on
+# double-click, and pkgbuild archives the mode it finds on disk. mktemp -d is
+# 0700, so the root directory needs widening too or the installed directory
+# inherits it.
+chmod 755 "$UNROOT/Uninstall ConjureAlign.command"
+chmod 755 "$UNROOT"
+pkgbuild --root "$UNROOT" \
+    --identifier "$PKG_ID_BASE.uninstall.pkg" \
+    --version "$VERSION" \
+    --install-location "/Applications/ConjureDSP" \
+    "$WORK/uninstall.pkg" >/dev/null
+echo "  built uninstall.pkg → /Applications/ConjureDSP"
+
 echo "=== Building installer ==="
 RES="$WORK/resources"
 mkdir -p "$RES"
@@ -188,6 +221,8 @@ missing).</p>
 <p>If you previously installed ConjureAlign by hand into
 <tt>~/Library/Audio/Plug-Ins</tt>, delete those copies so your DAW does not load the old
 version.</p>
+<p>To remove ConjureAlign later, open <tt>/Applications/ConjureDSP</tt> and double-click
+<b>Uninstall ConjureAlign</b>.</p>
 <p>Usage guide: <a href="https://github.com/michaeljancsy/ConjureAlign#how-to-use-it">github.com/michaeljancsy/ConjureAlign</a></p>
 </body></html>
 EOF
@@ -205,6 +240,7 @@ cat > "$WORK/distribution.xml" <<EOF
         <line choice="au"/>
         <line choice="vst3"/>
         <line choice="clap"/>
+        <line choice="uninstaller"/>
     </choices-outline>
     <choice id="au" title="Audio Unit" description="For Logic Pro and GarageBand.">
         <pkg-ref id="$PKG_ID_BASE.au.pkg"/>
@@ -215,9 +251,23 @@ cat > "$WORK/distribution.xml" <<EOF
     <choice id="clap" title="CLAP" description="For Bitwig and REAPER.">
         <pkg-ref id="$PKG_ID_BASE.clap.pkg"/>
     </choice>
+    <!-- Hidden and always installed. Not a customer-facing option: an
+         uninstaller that only exists when someone remembered to tick it is an
+         uninstaller that is missing exactly when it is needed. `visible` is the
+         dynamic attribute (re-evaluated as choices change), so nothing
+         downstream can flip it back on; `start_enabled="false"` leaves no
+         checkbox state to toggle. It must still appear in choices-outline — a
+         choice the outline does not reference is inert, and the package would
+         silently never install. It carries no scripts, so its position there is
+         free. -->
+    <choice id="uninstaller" title="Uninstaller"
+            visible="false" start_selected="true" start_enabled="false">
+        <pkg-ref id="$PKG_ID_BASE.uninstall.pkg"/>
+    </choice>
     <pkg-ref id="$PKG_ID_BASE.au.pkg" version="$VERSION">au.pkg</pkg-ref>
     <pkg-ref id="$PKG_ID_BASE.vst3.pkg" version="$VERSION">vst3.pkg</pkg-ref>
     <pkg-ref id="$PKG_ID_BASE.clap.pkg" version="$VERSION">clap.pkg</pkg-ref>
+    <pkg-ref id="$PKG_ID_BASE.uninstall.pkg" version="$VERSION">uninstall.pkg</pkg-ref>
 </installer-gui-script>
 EOF
 

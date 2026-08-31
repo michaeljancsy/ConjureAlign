@@ -104,6 +104,33 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   target `/Library/Audio/Plug-Ins/{VST3,CLAP,Components}` (AU postinstall clears the
   AudioComponentRegistrar cache). Signing the pkg needs the "Developer ID **Installer**"
   cert — a different cert from the "Developer ID Application" one that signs the bundles.
+  `--no-notarize` builds without the multi-minute notarization step; it is checked as `$1`,
+  so it must be the FIRST argument.
+  - A fourth, hidden component installs `/Applications/ConjureDSP/Uninstall
+    ConjureAlign.command` (`scripts/uninstall-macos.sh`). It is `visible="false"
+    start_selected="true" start_enabled="false"` — always installed, never a checkbox,
+    because an uninstaller that exists only when someone ticked it is missing exactly when
+    it is needed. It still needs a `<line>` in `choices-outline` (an unreferenced choice is
+    inert) **and** both `<pkg-ref>`s: the inner one inside the choice and the outer one
+    naming `uninstall.pkg`, or `productbuild --package-path` cannot resolve it.
+  - That component deliberately does NOT go through `build_component()`. Its payload is a
+    shell script, not a bundle, so `pkgbuild --analyze` emits an empty array and the
+    helper's `PlistBuddy -c "Add :0:…"` fails — under `set -e` that kills the release.
+    `--component-plist` is optional and configures bundle-specific behaviour only, so it is
+    omitted. `--install-location` is the leaf `/Applications/ConjureDSP`, not
+    `/Applications`: pkgbuild puts a `.` entry in the BOM carrying the payload root's own
+    mode, and `.` maps to the install-location, so aiming at `/Applications` would have that
+    entry describe `/Applications` itself. Verified: the BOM contains only `.` and the
+    `.command` at `root:wheel 0755`, and `/Applications` never appears.
+  - The uninstaller re-execs itself under `sudo` for one privileged phase rather than using
+    `osascript … with administrator privileges`, which attributes the password dialog to
+    "osascript" — indistinguishable from malware — and fails with no window server. That is
+    safe only because the pkg installs the file `root:wheel 0755` inside a `root:wheel 0755`
+    directory; relocating it anywhere user-writable would make it a privilege escalation.
+    Its body is one `{ … }` group so the self-delete at the end cannot leave bash reading a
+    truncated file. `/Applications/ConjureDSP` is removed with `rmdir`, never `rm -rf` — it
+    is shared with the other ConjureDSP products — and only the `ConjureAlign` child of
+    `~/Library/Application Support/ConjureDSP` is ever deleted, for the same reason.
 - Toolchain: stable Rust. nih_plug is a git dependency (not on crates.io); Cargo.lock pins the
   rev — but the `nih_plug` crate itself is `[patch]`ed onto the vendored copy at
   `deps/nih-plug` (teardown fixes for the shared background worker; see Known upstream issues

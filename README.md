@@ -53,9 +53,20 @@ are genuinely useful, especially about the plugin window.
 
 ## Uninstalling
 
-**Windows:** Settings → Apps → Installed apps → ConjureAlign → Uninstall. It asks whether
-to also remove your settings (the privacy and update-check answers, in
-`%APPDATA%\ConjureDSP\ConjureAlign`); answering No keeps them for a future reinstall.
+Quit your DAWs first — a host that already has the plugin loaded keeps running it until
+you relaunch.
+
+**macOS:** open `/Applications/ConjureDSP` and double-click **Uninstall ConjureAlign**. It
+opens in Terminal, lists what it is about to remove, and asks before doing anything. It
+removes all three formats from both `/Library` and every user's `~/Library`, clears the
+Audio Unit cache, and forgets the installer receipts; it needs your password for the
+system-wide part.
+
+**Windows:** Settings → Apps → Installed apps → ConjureAlign → Uninstall.
+
+Both ask separately whether to also remove your settings — the privacy and update-check
+answers, in `~/Library/Application Support/ConjureDSP/ConjureAlign` or
+`%APPDATA%\ConjureDSP\ConjureAlign`. Answering No keeps them for a future reinstall.
 
 ## Which version am I running?
 
