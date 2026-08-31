@@ -472,20 +472,41 @@ fn parse_marker(text: &str, pid: u32) -> Option<StaleSession> {
 /// implementations therefore answer "alive" whenever they cannot tell.
 #[cfg(target_os = "windows")]
 fn process_is_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
-    // SAFETY: `OpenProcess` takes no pointers, and the handle it returns is
-    // closed on the one path where it is non-null. A null return means the
-    // process is gone or is one we may not query; the latter cannot happen for
-    // a process that was running this same plugin as this same user.
+    // SAFETY: `OpenProcess` takes no pointers; `GetExitCodeProcess` gets a
+    // valid out-parameter and a handle that is open for the whole call; and the
+    // handle is closed on every path where it was obtained.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
-            return false;
+            // Only "no such process id" means gone. Anything else — most
+            // plausibly ERROR_ACCESS_DENIED for a process belonging to another
+            // user — means it exists, and answering "alive" loses a report
+            // rather than inventing one. Mirrors the ESRCH/EPERM split below.
+            return GetLastError() != ERROR_INVALID_PARAMETER;
         }
+
+        // An open handle is NOT proof of life. A process object outlives the
+        // process itself for as long as anyone holds a handle to it — a parent,
+        // a debugger, Windows Error Reporting — so `OpenProcess` succeeds on a
+        // process that has already terminated. Without this second check a
+        // crashed DAW whose handle something still holds would read as running,
+        // and its marker would go unreported until the staleness cutoff deleted
+        // it unread, which is precisely the report most worth having.
+        let mut exit_code = 0u32;
+        let queried = GetExitCodeProcess(handle, &mut exit_code);
         CloseHandle(handle);
-        true
+
+        // A failed query tells us nothing, so it fails toward "alive". The one
+        // ambiguity in the other arm is a process that genuinely exited with
+        // 259, which reads as running — the same safe direction.
+        queried == 0 || exit_code == STILL_ACTIVE as u32
     }
 }
 
@@ -683,5 +704,27 @@ mod tests {
     #[test]
     fn liveness_recognizes_the_current_process() {
         assert!(process_is_alive(std::process::id()));
+    }
+
+    /// The converse — and on Windows specifically the case an
+    /// `OpenProcess`-only check gets wrong: `child` is deliberately still in
+    /// scope, so Rust still holds a handle to the terminated process and its
+    /// process object has not gone away. A handle is not a heartbeat.
+    #[test]
+    fn liveness_sees_through_a_reaped_child_whose_handle_is_still_open() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "__no_such_test__"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("could not re-exec the test binary");
+        let pid = child.id();
+        child.wait().expect("the child never exited");
+
+        assert!(
+            !process_is_alive(pid),
+            "a terminated process read as alive, so its marker would never be reported"
+        );
+        drop(child);
     }
 }

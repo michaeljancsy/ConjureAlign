@@ -369,7 +369,7 @@ impl Editor for StageStamped {
         let handle = self.inner.spawn(parent, context);
         self.markers.set_stage(Stage::EditorOpen);
         Box::new(OpenEditor {
-            _inner: handle,
+            inner: Some(handle),
             markers: self.markers.clone(),
         })
     }
@@ -399,14 +399,20 @@ impl Editor for StageStamped {
 /// move the stage back, so a crash after the window closed is not misreported
 /// as a crash while it was open.
 struct OpenEditor {
-    /// Dropped first, closing the real window; declaration order is what puts
-    /// the stage change after it.
-    _inner: Box<dyn Any + Send>,
+    /// `Option` so `Drop` can close the real window *before* moving the stage.
+    /// A struct's `Drop::drop` runs BEFORE its fields are dropped, so leaving
+    /// this to declaration order would stamp `editor_closed` while the window
+    /// was still tearing down — and window teardown is native code (baseview
+    /// destroying the OpenGL context), i.e. exactly where a fault the panic
+    /// hook cannot see is plausible. It would then be reported as though the
+    /// window had already gone.
+    inner: Option<Box<dyn Any + Send>>,
     markers: Arc<MarkerHandle>,
 }
 
 impl Drop for OpenEditor {
     fn drop(&mut self) {
+        drop(self.inner.take());
         self.markers.set_stage(Stage::EditorClosed);
     }
 }
