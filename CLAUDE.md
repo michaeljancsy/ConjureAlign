@@ -98,6 +98,8 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   `src/update.rs` — the opt-in update check; `src/net.rs` — the one HTTP client and the one
   background network thread both of them (and nothing else) go through; `src/config.rs` —
   the install-wide preferences file holding both consent answers;
+  `src/session_marker.rs` — the "did the last session end cleanly?" file, which is the only
+  thing that can report a crash that is not a Rust panic (see below);
 - `src/lib.rs` — Plugin impl and orchestration; `src/params.rs` — the whole state model;
   `src/capture.rs` — capture buffers + phase machine + the GUI-safe `CaptureHandle`;
   `src/analysis.rs` — offset estimation (background thread only); `src/shared.rs` — the
@@ -532,6 +534,81 @@ configured — and debug files match by build id, so a release shipped without t
 symbolicated afterwards without reproducing a byte-identical binary. Adding the
 dep cost ~1.8 MB per architecture slice (4.996 → 6.803 MB), i.e. ~10.8 MB on the macOS pkg (two
 architectures × three bundles) and ~3.6 MB on the Windows zip.
+
+### Crashes that are not panics (`src/session_marker.rs`, `src/crash/veh.rs`)
+
+`crash.rs` above is a **panic hook and nothing else** — `std::panic::set_hook` is the only
+handler in the tree. An access violation, a stack overflow, an `abort()`, or a fault inside
+linked C/C++ (clap-wrapper, the GL driver, SChannel) kills the host with nothing sent. On
+Windows that is most of what "crash" means, and it is how a 1.2.0 install could crash a DAW
+repeatedly while the Sentry project stayed completely empty (2026-08-30, LUNA/Windows).
+
+Release health does not fill the gap either, and the reason is not obvious: sentry-core
+enqueues a *healthy* session only from `Session::drop` (`Drop` → `close(Exited)` →
+`enqueue_session`; there is no periodic send). A host that dies never reports one. So **"no
+Sentry data for version X" is ambiguous** between "nobody runs X" and "everyone who runs X
+dies" — do not read an empty release as an unused release.
+
+The fix is to stop reporting *from* the dying process. `session_marker` writes one file per
+pid under `<config dir>/sessions/`, holding the environment and a `stage`; a clean teardown
+deletes it. Anything left behind by a process that no longer exists was an abnormal
+termination, and the next launch reports it. Four rules:
+
+1. **Consent gates the file, not just the report.** A declined user gets nothing on disk.
+   A fault record counts as evidence only when it is **non-empty**: `veh::install` opens
+   that file with `OPEN_ALWAYS`, so on Windows every consenting session has an empty one
+   from the moment reporting arms, and testing for existence kept every marker across every
+   clean exit — a false unclean-shutdown report on every launch (caught by CI, 2026-08-31).
+2. **Never from the audio thread, and never on the `initialize()` fast path.** The stages
+   are `initializing` / `initialized` (from `initialize()`), `editor_creating` /
+   `editor_open` (around `Editor::spawn`, via the delegating `StageStamped` wrapper in
+   `editor/mod.rs`) and `editor_closed` (that handle's `Drop`). None corresponds to
+   `process()`, and none may. Both `initialize()` stamps go through `set_stage_if`: the
+   entry one only on the slow path and only when the current stage is not an editor one
+   (a state load with a window open must neither write a file on the path that exists to
+   avoid dropouts, nor claim there was no window), and the exit one only if that entry
+   stamp actually landed.
+3. **A live pid is never reported** — that would turn pid reuse into an invented crash.
+   Skipping one can only *lose* a report, which is the safe direction.
+4. **The report is `Level::Warning`, and carries the dead session's own release.** Warning
+   because `Session::update_from_event` marks a session errored at `>= Error`, and the
+   session being captured into belongs to the *healthy* process doing the reporting — `Error`
+   would corrupt the very crash-free rate this exists to make trustworthy. The release
+   override (`conjure_align@<the version that died>`) is what makes a version whose every
+   session crashed visible at all. Its environment tags are `prev_`-prefixed because `scrub`
+   stamps `daw`/`daw_version`/`os_version` from the *current* process.
+
+The sweep runs once per process, dispatched onto the shared `net::Worker` (so `initialize()`
+never scans a directory) from the arming branch of `CrashHandle::sync_consent`. It deletes
+each marker as it reads it — a marker that somehow crashed the reporter must not be re-read
+forever — and caps itself at 32 files and 8 reports.
+
+Crash reporting also arms in **`Plugin::editor()`**, not just `initialize()`: hosts may build
+the view before activating, and opening a window is the heaviest native work this plugin
+does. It deliberately does NOT arm in `Plugin::default()` — that would start Sentry and make
+a network request during a plugin scan, for an instance nobody uses.
+
+`src/crash/veh.rs` (Windows only) adds a vectored exception handler for the hardware faults
+themselves. It cannot report — a crashing process is no place for an HTTPS request — so it
+writes a fixed-width record into `sessions/<pid>.fault` and the sweep folds it into the next
+launch's event. **It is process-global**, so it is written to be invisible to everyone else:
+`AddVectoredExceptionHandler` (chainable) never `SetUnhandledExceptionFilter` (a single
+global slot the host may own); a fatal-code allowlist that excludes `0xE06D7363` (C++
+`throw`) and the other codes hosts raise routinely; an "is the faulting address inside our
+own image" test; a re-entrancy guard; no allocation, no locks, no CRT; and it always returns
+`EXCEPTION_CONTINUE_SEARCH`. **`uninstall()` runs from `Reporter::drop`** — a handler left
+registered across a DLL unload means the OS calls into freed memory at the next exception
+anywhere in the process, which would be far worse than the bug it exists to find.
+
+Two things it deliberately cannot do: a fault *inside the GPU driver* called from our code
+has its address in the driver, so the ownership filter rejects it; and
+`EXCEPTION_STACK_OVERFLOW` leaves so little stack that the write may not complete. The
+marker's `stage` is the coarse answer in both cases.
+
+`tests/veh_windows.rs` is the only place the handler ever runs before a release (no Windows
+toolchain locally): it re-execs the test binary, arms through the real `sync_consent` path,
+and dereferences null. The child calls `SetErrorMode(SEM_NOGPFAULTERRORBOX)` first, or a WER
+dialog would hang CI instead of failing it.
 
 ### Update checks (opt-in, `src/update.rs`)
 

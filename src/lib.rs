@@ -15,6 +15,7 @@ pub mod editor;
 pub mod host;
 pub mod net;
 pub mod params;
+pub mod session_marker;
 pub mod shared;
 pub mod snapshot_persist;
 pub mod spectrum;
@@ -79,6 +80,11 @@ pub struct ConjureAlign {
     /// asks it to do anything — a plugin scan must not make network requests
     /// (see `update.rs`).
     updates: Arc<update::UpdateHandle>,
+    /// Records how far this process got, so that a death the panic hook cannot
+    /// see — an access violation, a stack overflow, the host being killed — is
+    /// still reported, by the *next* process. Same consent answer again; see
+    /// `session_marker.rs`.
+    markers: Arc<session_marker::MarkerHandle>,
 }
 
 pub enum Task {
@@ -120,6 +126,7 @@ impl Default for ConjureAlign {
             analytics: Arc::new(analytics::AnalyticsHandle::new()),
             crash: Arc::new(crash::CrashHandle::new()),
             updates: Arc::new(update::UpdateHandle::new()),
+            markers: Arc::new(session_marker::MarkerHandle::new()),
         }
     }
 }
@@ -389,12 +396,21 @@ impl Plugin for ConjureAlign {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        // Arm here as well as in `initialize()`. Hosts are free to build the
+        // view before activating the plugin, and opening a window is the
+        // heaviest native work this plugin does — a panic anywhere in
+        // baseview's or egui's setup would otherwise unwind out of the host's
+        // `extern "C"` frame with the hook not yet installed. Idempotent, and
+        // `set_host_context` deliberately does not follow: `plugin_api()` is
+        // not reachable from here, and `scrub` already copes with absent tags.
+        self.crash.sync_consent();
         editor::create(
             self.params.clone(),
             self.shared.clone(),
             self.capture.handle(),
             self.crash.clone(),
             self.updates.clone(),
+            self.markers.clone(),
         )
     }
 
@@ -475,6 +491,16 @@ impl Plugin for ConjureAlign {
         let fast = self.active_config == Some((self.sample_rate, channels));
 
         if !fast {
+            // Only on this path. The fast path exists so a host re-running
+            // `initialize()` on every state load cannot cause a dropout, and a
+            // file write would put I/O straight back onto it. `is_editor`
+            // guards the other direction: a state load with a window open must
+            // not report as though there were none.
+            self.markers.set_stage_if(
+                |current| !current.is_editor(),
+                session_marker::Stage::Initializing,
+            );
+
             // Size everything for the parameter maxima so no later change ever
             // allocates on the audio thread.
             let max_shift_max = (MAX_SHIFT_MAX_MS / 1000.0 * self.sample_rate).ceil() as usize;
@@ -614,6 +640,13 @@ impl Plugin for ConjureAlign {
         // made while the plugin is already running.
         self.crash.sync_consent();
         self.crash.set_host_context(plugin_format, self.sample_rate);
+        // Steady state for an instance with no editor. Paired with the stamp
+        // above and fires only if that one landed, so this cannot walk an
+        // editor stage backwards or write on the fast path either.
+        self.markers.set_stage_if(
+            |current| current == session_marker::Stage::Initializing,
+            session_marker::Stage::Initialized,
+        );
 
         true
     }

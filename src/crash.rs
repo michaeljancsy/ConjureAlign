@@ -94,6 +94,12 @@ pub fn in_plugin_code() -> bool {
     DEPTH.with(|d| d.get()) > 0
 }
 
+/// The vectored exception handler (Windows only) — the hardware faults the
+/// panic hook above structurally cannot see. Declared out here rather than
+/// inside `imp` so its `super::` reaches `in_plugin_code`.
+#[cfg(target_os = "windows")]
+mod veh;
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod imp {
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -108,6 +114,8 @@ mod imp {
 
     use super::{in_plugin_code, DSN_ENV, SENTRY_DSN};
     use crate::analytics;
+    use crate::net;
+    use crate::session_marker;
 
     /// How long a panic report may hold the panicking thread while it goes over
     /// the wire. A plugin panic usually precedes the host aborting, so a
@@ -192,6 +200,11 @@ mod imp {
 
     impl Drop for Reporter {
         fn drop(&mut self) {
+            // Before anything else: an exception handler that outlives the
+            // image is a guaranteed crash for the whole host at the next
+            // exception, from anywhere in the process.
+            #[cfg(target_os = "windows")]
+            super::veh::uninstall();
             // The session lives on the process hub (see `reporter()`), but
             // the guard's own drop ends sessions on the *dropping* thread's
             // hub — for a decline, the editor thread, which does not hold
@@ -399,25 +412,48 @@ mod imp {
                     // may hold the config lock on this thread, and a blocking
                     // or poisoned `lock().unwrap()` here is a deadlock or a
                     // panic-inside-the-hook abort.
-                    if !is_sentry_internal_thread() && analytics::enabled_in_hook() {
-                        let mut event = integration.event_from_panic_info(info);
-                        // Attribution, not a gate (rule 3): every panic
-                        // reaching this hook was raised inside our dylib.
-                        event
-                            .tags
-                            .insert("in_scope".into(), in_plugin_code().to_string());
-                        // `Hub::main()`, not `Hub::current()`: a thread's own
-                        // hub is a snapshot taken the first time that thread
-                        // touched Sentry, and after a consent decline →
-                        // re-grant it can still point at the closed client.
-                        // The process hub is re-bound on every init (see
-                        // `reporter()`), so it is the one place a capture is
-                        // never stale.
-                        let hub = sentry::Hub::main();
-                        hub.capture_event(event);
-                        if let Some(client) = hub.client() {
-                            client.flush(Some(FLUSH_TIMEOUT));
-                        }
+                    if !analytics::enabled_in_hook() {
+                        return;
+                    }
+                    if is_sentry_internal_thread() {
+                        // Capturing here would report into the very machinery
+                        // that is failing, and `flush` on the transport thread
+                        // queues a barrier behind itself and waits out the
+                        // whole timeout. But this path is not harmless — it is
+                        // the one upstream turns into a host abort at unload,
+                        // via `TransportThread::drop`'s `join().unwrap()` — so
+                        // leave a record on disk for the next process to
+                        // report instead of dropping it on the floor.
+                        // `record_fault` takes none of our locks.
+                        session_marker::record_fault(
+                            "sentry_thread_panic",
+                            &format!(
+                                "thread={} at {}",
+                                std::thread::current().name().unwrap_or("<unnamed>"),
+                                info.location()
+                                    .map(|l| format!("{}:{}", l.file(), l.line()))
+                                    .unwrap_or_else(|| "<unknown>".into()),
+                            ),
+                        );
+                        return;
+                    }
+                    let mut event = integration.event_from_panic_info(info);
+                    // Attribution, not a gate (rule 3): every panic
+                    // reaching this hook was raised inside our dylib.
+                    event
+                        .tags
+                        .insert("in_scope".into(), in_plugin_code().to_string());
+                    // `Hub::main()`, not `Hub::current()`: a thread's own
+                    // hub is a snapshot taken the first time that thread
+                    // touched Sentry, and after a consent decline →
+                    // re-grant it can still point at the closed client.
+                    // The process hub is re-bound on every init (see
+                    // `reporter()`), so it is the one place a capture is
+                    // never stale.
+                    let hub = sentry::Hub::main();
+                    hub.capture_event(event);
+                    if let Some(client) = hub.client() {
+                        client.flush(Some(FLUSH_TIMEOUT));
                     }
                 });
                 // Always — nih-plug's hook logs the panic to stderr and to
@@ -496,6 +532,13 @@ mod imp {
         // Only after a successful init — a failed attempt must leave the
         // process exactly as it found it, panic hook included.
         install_hook();
+        // Same gate, same lifetime: registered here and removed in
+        // `Reporter::drop`, which runs while plugin instances still exist and
+        // so is comfortably before the DLL can be unmapped.
+        #[cfg(target_os = "windows")]
+        if let Some(path) = session_marker::current_fault_path() {
+            super::veh::install(&path);
+        }
         // `sentry::init` binds the client to the *calling* thread's hub only,
         // and every other thread's hub snapshots the process hub the first
         // time that thread touches Sentry — and never re-syncs. On the first
@@ -526,6 +569,12 @@ mod imp {
     pub struct CrashHandle {
         /// Holds the process-wide client alive for this instance's lifetime.
         reporter: Mutex<Option<Arc<Reporter>>>,
+        /// The shared network worker, used for exactly one thing: running the
+        /// stale-session sweep off the host's thread. Held per instance (never
+        /// grabbed transiently) because a transient `net::worker()` would drop
+        /// the last strong reference right after queueing, and `Worker::drop`
+        /// drains the queue *unrun*.
+        worker: net::WorkerHandle,
     }
 
     impl CrashHandle {
@@ -561,6 +610,13 @@ mod imp {
                 // Arc it already holds.
                 (true, false) => {
                     if let Some(fresh) = reporter() {
+                        // Once per process, and only with a live client to
+                        // capture into. Off-thread: the sweep reads a
+                        // directory, and this can be `initialize()`.
+                        static SWEPT: Once = Once::new();
+                        SWEPT.call_once(|| {
+                            self.worker.spawn_job(sweep_stale_sessions);
+                        });
                         // Re-checked under the re-lock: a decline can land
                         // while `reporter()` was building (two thread spawns
                         // plus TLS agent construction), and an editor-less
@@ -616,6 +672,66 @@ mod imp {
             *host_context()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tags);
+        }
+    }
+
+    /// Reports every marker left behind by a process that no longer exists —
+    /// the crashes the panic hook structurally cannot see. Runs once per
+    /// process, on the shared network worker (see `sync_consent`), because it
+    /// reads a directory and `initialize()` has no business doing that.
+    ///
+    /// `Level::Warning`, not `Error`, and the reason is load-bearing:
+    /// `Session::update_from_event` marks a session errored at `>= Error`, and
+    /// the session this event is captured *into* belongs to the healthy process
+    /// doing the reporting. Using `Error` would corrupt the crash-free rate
+    /// this whole mechanism exists to make trustworthy.
+    ///
+    /// The event carries the release the crash actually happened in rather than
+    /// the running one, so a version whose every session died still shows up in
+    /// Sentry — which is exactly the hole that hid the LUNA report.
+    fn sweep_stale_sessions() {
+        for stale in session_marker::take_stale() {
+            let mut event = Event {
+                level: Level::Warning,
+                message: Some(format!(
+                    "Unclean shutdown at stage: {}",
+                    stale.stage.as_str()
+                )),
+                release: Some(format!("conjure_align@{}", stale.plugin_version).into()),
+                ..Default::default()
+            };
+            // Deliberately `prev_`-prefixed: `scrub` stamps `daw`,
+            // `daw_version` and `os_version` from the *current* process, and
+            // silently overwriting them with the dead session's would make both
+            // sets untrustworthy.
+            let tags = &mut event.tags;
+            tags.insert("stage".into(), stale.stage.as_str().into());
+            tags.insert("prev_daw".into(), stale.daw.clone());
+            tags.insert("prev_plugin_version".into(), stale.plugin_version.clone());
+            if let Some(v) = &stale.daw_version {
+                tags.insert("prev_daw_version".into(), v.clone());
+            }
+            if let Some(v) = &stale.os_version {
+                tags.insert("prev_os_version".into(), v.clone());
+            }
+            // A fault record means the exception handler or the panic hook saw
+            // *what* went wrong, not just that something did.
+            tags.insert(
+                "has_fault_record".into(),
+                (!stale.faults.is_empty()).to_string(),
+            );
+            if !stale.faults.is_empty() {
+                event.extra.insert(
+                    "faults".into(),
+                    serde_json::Value::from(stale.faults.clone()),
+                );
+            }
+            event
+                .extra
+                .insert("prev_started_at".into(), stale.started_at.into());
+            event.extra.insert("prev_pid".into(), stale.pid.into());
+
+            sentry::Hub::main().capture_event(event);
         }
     }
 

@@ -75,12 +75,26 @@ core-foundation-sys = "0.8"
 [target.'cfg(target_os = "windows")'.dependencies]
 # The host executable's VS_FIXEDFILEINFO block (src/host.rs). `version.dll` has
 # no crates.io-free alternative, and windows-sys is bindings only.
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
 # The running Windows version, via RtlGetVersion — which, unlike GetVersionEx,
 # does not lie to a process with no compatibility manifest. Already in the graph
 # here: sentry-contexts uses os_info on Windows (and `uname` elsewhere, which is
 # why macOS reads sysctl instead).
 os_info = { version = "3", default-features = false }
+
+# `tests/veh_windows.rs` only: the child half of that test suppresses the
+# Windows Error Reporting dialog before it faults, so a crashing CI job fails
+# instead of hanging on a message box.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug"] }
 
 # Networking for the two opt-in reporters, on the two platforms that ship binaries.
 # native-tls is a thin binding to the OS stack — Security.framework on macOS,

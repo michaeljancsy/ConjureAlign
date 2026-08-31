@@ -16,11 +16,14 @@ pub mod spectrum_view;
 pub mod view_math;
 pub mod waveform_view;
 
+use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use nih_plug::prelude::{BoolParam, Editor, EnumParam, ParamSetter};
+use nih_plug::prelude::{
+    BoolParam, Editor, EnumParam, GuiContext, ParamSetter, ParentWindowHandle,
+};
 use nih_plug_egui::{
     create_egui_editor, egui, resizable_window::ResizableWindow, widgets, EguiState,
 };
@@ -34,6 +37,7 @@ use crate::capture::{
 use crate::config;
 use crate::crash;
 use crate::params::{ConjureAlignParams, PolarityMode, TRIM_RANGE_MS};
+use crate::session_marker::{MarkerHandle, Stage};
 use crate::shared::{AnalysisSnapshot, GuiShared};
 use crate::update;
 
@@ -218,10 +222,11 @@ pub fn create(
     capture: CaptureHandle,
     crash: Arc<crash::CrashHandle>,
     updates: Arc<update::UpdateHandle>,
+    markers: Arc<MarkerHandle>,
 ) -> Option<Box<dyn Editor>> {
     let egui_state: Arc<EguiState> = params.editor_state.clone();
     let build_updates = updates.clone();
-    create_egui_editor(
+    let inner = create_egui_editor(
         egui_state.clone(),
         EditorState::default(),
         move |ctx, state| {
@@ -334,7 +339,82 @@ pub fn create(
                 ctx.request_repaint();
             }
         },
-    )
+    )?;
+    Some(Box::new(StageStamped { inner, markers }))
+}
+
+/// Wraps the egui editor so the session marker records that a window is being
+/// created *before* the attempt starts.
+///
+/// That window is the one place the panic hook is least useful: `spawn` hands
+/// the parent window to baseview, which on Windows creates an OpenGL context
+/// through the graphics driver. A fault in there is not a Rust panic, so
+/// nothing reports it — but the marker left on disk says `editor_creating`,
+/// and the next launch reports that. See `session_marker`.
+///
+/// Six delegating methods and nothing else; the wrapper deliberately holds no
+/// state of its own beyond the handle.
+struct StageStamped {
+    inner: Box<dyn Editor>,
+    markers: Arc<MarkerHandle>,
+}
+
+impl Editor for StageStamped {
+    fn spawn(
+        &self,
+        parent: ParentWindowHandle,
+        context: Arc<dyn GuiContext>,
+    ) -> Box<dyn Any + Send> {
+        self.markers.set_stage(Stage::EditorCreating);
+        let handle = self.inner.spawn(parent, context);
+        self.markers.set_stage(Stage::EditorOpen);
+        Box::new(OpenEditor {
+            inner: Some(handle),
+            markers: self.markers.clone(),
+        })
+    }
+
+    fn size(&self) -> (u32, u32) {
+        self.inner.size()
+    }
+
+    fn set_scale_factor(&self, factor: f32) -> bool {
+        self.inner.set_scale_factor(factor)
+    }
+
+    fn param_value_changed(&self, id: &str, normalized_value: f32) {
+        self.inner.param_value_changed(id, normalized_value)
+    }
+
+    fn param_modulation_changed(&self, id: &str, modulation_offset: f32) {
+        self.inner.param_modulation_changed(id, modulation_offset)
+    }
+
+    fn param_values_changed(&self) {
+        self.inner.param_values_changed()
+    }
+}
+
+/// The handle nih-plug drops when the editor window closes. Its only job is to
+/// move the stage back, so a crash after the window closed is not misreported
+/// as a crash while it was open.
+struct OpenEditor {
+    /// `Option` so `Drop` can close the real window *before* moving the stage.
+    /// A struct's `Drop::drop` runs BEFORE its fields are dropped, so leaving
+    /// this to declaration order would stamp `editor_closed` while the window
+    /// was still tearing down — and window teardown is native code (baseview
+    /// destroying the OpenGL context), i.e. exactly where a fault the panic
+    /// hook cannot see is plausible. It would then be reported as though the
+    /// window had already gone.
+    inner: Option<Box<dyn Any + Send>>,
+    markers: Arc<MarkerHandle>,
+}
+
+impl Drop for OpenEditor {
+    fn drop(&mut self) {
+        drop(self.inner.take());
+        self.markers.set_stage(Stage::EditorClosed);
+    }
 }
 
 /// Runs one editor frame with an unwind boundary around it, so that a panic
