@@ -57,6 +57,14 @@ pub struct Config {
     /// A version the user asked not to be reminded about. Anything newer than
     /// this still notifies.
     pub update_skipped: Option<String>,
+    /// The plugin version that ran on this install last time, so a launch can
+    /// tell that it is an *upgrade* rather than a first run. Bookkeeping, not
+    /// an answer: see [`note_running_version`].
+    ///
+    /// Written only for an install that has granted analytics consent — a
+    /// declined install has nothing to report it to, and storing state nobody
+    /// will ever read is not what "declined" should mean.
+    pub last_version: Option<String>,
 }
 
 /// `~/Library/Application Support/ConjureDSP/ConjureAlign/` on macOS,
@@ -134,7 +142,21 @@ impl Config {
                 .unwrap_or(false),
             update_latest_seen: non_empty_str(&v, "update_latest_seen"),
             update_skipped: non_empty_str(&v, "update_skipped"),
+            last_version: non_empty_str(&v, "last_version"),
         }
+    }
+
+    /// The decision behind [`note_running_version`], split out so it can be
+    /// tested without the process-wide config or a real `HOME`.
+    ///
+    /// `None` means the stored version already matches, so there is nothing to
+    /// report and nothing to write. `Some(previous)` means it changed, with
+    /// `previous` being what ran before — itself `None` on a first run.
+    fn apply_running_version(&mut self, version: &str) -> Option<Option<String>> {
+        if self.last_version.as_deref() == Some(version) {
+            return None;
+        }
+        Some(self.last_version.replace(version.to_owned()))
     }
 
     pub fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
@@ -167,6 +189,9 @@ impl Config {
         }
         if let Some(v) = &self.update_skipped {
             obj.insert("update_skipped".into(), serde_json::Value::from(v.clone()));
+        }
+        if let Some(v) = &self.last_version {
+            obj.insert("last_version".into(), serde_json::Value::from(v.clone()));
         }
         let text = serde_json::Value::Object(obj).to_string();
 
@@ -205,6 +230,14 @@ fn with_config<T>(f: impl FnOnce(&mut Config) -> T) -> T {
     f(&mut cfg)
 }
 
+fn save_now(cfg: &Config) {
+    if let Some(path) = config_path() {
+        if let Err(e) = cfg.save_to(&path) {
+            nih_plug::nih_log!("ConjureAlign: could not save preferences: {e}");
+        }
+    }
+}
+
 /// Applies `f` and writes the result back to disk.
 fn mutate(f: impl FnOnce(&mut Config)) {
     if !SUPPORTED {
@@ -212,11 +245,7 @@ fn mutate(f: impl FnOnce(&mut Config)) {
     }
     with_config(|cfg| {
         f(cfg);
-        if let Some(path) = config_path() {
-            if let Err(e) = cfg.save_to(&path) {
-                nih_plug::nih_log!("ConjureAlign: could not save preferences: {e}");
-            }
-        }
+        save_now(cfg);
     });
 }
 
@@ -357,6 +386,39 @@ pub fn device_id() -> Option<String> {
     with_config(|cfg| cfg.device_id.clone())
 }
 
+/// Records that `version` is running now, and returns the version that ran
+/// before it — but only when the two differ.
+///
+/// This is what backs the `upgraded_from` property on `Plugin Loaded`. The
+/// cohort-level question it replaces ("has any install ever been seen on two
+/// versions?") is the wrong instrument: it cannot separate "nobody upgraded"
+/// from "nobody was told there was one", and anything that resets the device
+/// id — a clean reinstall, an uninstaller — silently degrades it. A per-device
+/// before/after is unambiguous, and the first non-`None` answer is the first
+/// proven in-place upgrade.
+///
+/// `None` on a first run, and also `None` for an install arriving from a
+/// version that predates this bookkeeping: those two cannot be told apart, and
+/// claiming an upgrade that cannot be proven is the wrong way to be wrong.
+///
+/// **Call only from a consent-gated path.** Nothing here checks the answer, and
+/// a declined install must not accumulate state it will never report.
+///
+/// Writes only when the version actually changed, so every launch after the
+/// first at a given version touches no disk. The config is process-cached, so
+/// several instances in one host still produce at most one write and at most
+/// one non-`None` answer.
+pub fn note_running_version(version: &str) -> Option<String> {
+    if !SUPPORTED {
+        return None;
+    }
+    with_config(|cfg| {
+        let previous = cfg.apply_running_version(version)?;
+        save_now(cfg);
+        previous
+    })
+}
+
 /// Seconds since the Unix epoch, saturating at 0 on a clock before 1970.
 pub fn now_secs() -> u64 {
     SystemTime::now()
@@ -461,9 +523,55 @@ mod tests {
             update_last_ok: true,
             update_latest_seen: Some("1.2.0".into()),
             update_skipped: Some("1.2.0".into()),
+            last_version: Some("1.1.0".into()),
         };
         cfg.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path), cfg);
+    }
+
+    /// The upgrade signal. A change is reported exactly once, and an unchanged
+    /// version reports nothing — which is also what keeps an ordinary launch
+    /// from touching the disk at all.
+    #[test]
+    fn running_version_reports_each_change_once() {
+        let mut cfg = Config::default();
+
+        // First run: the version is recorded, but there is no upgrade to
+        // report. An install arriving from a build that predates this field
+        // looks identical, and deliberately so — claiming an upgrade that
+        // cannot be proven is the wrong way to be wrong.
+        assert_eq!(cfg.apply_running_version("1.3.0"), Some(None));
+        assert_eq!(cfg.last_version.as_deref(), Some("1.3.0"));
+
+        // Same version again: nothing changed, so nothing to report or write.
+        assert_eq!(cfg.apply_running_version("1.3.0"), None);
+
+        // An upgrade — reported once, then quiet.
+        assert_eq!(
+            cfg.apply_running_version("1.4.0"),
+            Some(Some("1.3.0".into()))
+        );
+        assert_eq!(cfg.apply_running_version("1.4.0"), None);
+        assert_eq!(cfg.last_version.as_deref(), Some("1.4.0"));
+
+        // A downgrade is a change too. Someone rolling back is exactly the
+        // case worth being able to see.
+        assert_eq!(
+            cfg.apply_running_version("1.3.0"),
+            Some(Some("1.4.0".into()))
+        );
+    }
+
+    /// An older install's file has no `last_version`, which must read as
+    /// "never recorded" rather than as an upgrade from nothing.
+    #[test]
+    fn a_config_without_last_version_reports_no_upgrade() {
+        let path = temp_dir("no-last-version").join("analytics.json");
+        std::fs::write(&path, r#"{"consent":"granted","device_id":"d"}"#).unwrap();
+
+        let mut cfg = Config::load_from(&path);
+        assert_eq!(cfg.last_version, None);
+        assert_eq!(cfg.apply_running_version("1.3.0"), Some(None));
     }
 
     #[test]

@@ -344,6 +344,27 @@ picker. Check `Get-Events` before naming anything new. Verify ingestion with
 with the REAL host context, so a newly added `daw` or `os_version` value gets seen once in
 the project before it arrives from a user.
 
+`Plugin Loaded` also carries **`upgraded_from`** — the version that ran on this install
+before this one — backed by `config::note_running_version` and the `last_version` key in
+`analytics.json`. It is present only on the launch that first observes a version change, so
+one upgrade produces one marked event however many instances the host loads; absent means
+"first run, or an upgrade we cannot prove", and the two are deliberately indistinguishable
+(an install arriving from a build that predates the field looks like a first run). The
+write happens behind the `enabled()` check in `flush_session`, so a declined install stores
+nothing, and only when the version actually changed, so an ordinary launch touches no disk.
+
+It exists because **the cohort-level version breakdown is the wrong instrument.** Asking
+Mixpanel "has any device been seen on two versions?" cannot separate "nobody upgraded" from
+"nobody was told there was an upgrade" — and on 2026-08-31 the answer was the latter: the
+update check itself first shipped in 1.2.0 (`src/update.rs` landed in `c14c06e`, after the
+v1.1.0 tag), so the 24 installs then on 1.1.0 had no in-plugin way to learn 1.2.0 existed.
+That breakdown is also silently degraded by anything resetting the device id, including the
+`/reinstall` skill and the uninstallers. A per-device before/after has none of those
+problems. Do not re-derive upgrade rates from disjoint version buckets; read
+`upgraded_from`. (Disclosure: a previously-running version is strictly less revealing than
+`plugin_version`, already on every event, so this needed no change to the prompt or README —
+which is exactly why it has to be written down here.)
+
 UI: the first-run prompt (`editor::consent_modal`) and the ⚙ popover (`settings_menu`) are both
 drawn OUTSIDE `draw_ui` / from the control bar respectively, and both are `pub` so
 `examples/gui_preview.rs` can render them headless (`_consent.png`, `_settings.png`,
