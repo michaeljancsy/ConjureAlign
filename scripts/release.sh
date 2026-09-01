@@ -144,17 +144,157 @@ build_component() { # $1 bundle  $2 dest subdir  $3 pkg suffix  $4... extra pkgb
 # Logic caches AU registrations; a stale cache is the #1 "where is the plugin?" support
 # question, so the AU package clears it itself. AudioComponentRegistrar is an on-demand
 # daemon — killall failing because it is not running is success, hence the || true.
-mkdir -p "$WORK/au-scripts"
-cat > "$WORK/au-scripts/postinstall" <<'EOF'
+# Stale hand-installed copies are why DAWs keep loading old builds. The .pkg
+# writes to /Library; a copy in ~/Library shadows it; and BundleIsRelocatable
+# =false (above) only stops Installer from silently *redirecting* the install
+# onto that copy — it does not remove it. So each format's package sweeps
+# ITSELF out of /Library and out of every user's ~/Library before its own
+# payload lands.
+#
+# Per-format rather than one global sweep package. A component's own preinstall
+# is guaranteed to run before that component's own payload — definitional,
+# needing no assumption. A separate sweep package would instead have to run
+# before the *other* packages, which rests on components being installed in
+# choices-outline order: undocumented, and not something to put in front of an
+# `rm -rf` of the thing you just installed.
+#
+# The usual objection to per-format is that a preinstall on a DESELECTED choice
+# never runs, leaving that format's stale copy behind. That cannot happen here:
+# distribution.xml sets customize="never", so all three components always
+# install and all three preinstalls always run. Together they cover every
+# format, which is what makes this equivalent to a global sweep with none of
+# the ordering risk. If per-format choice is ever reintroduced, this stops
+# being complete — see the comment on <options> in distribution.xml.
+make_scripts() { # $1 pkg suffix  $2 plug-in subdir  $3 bundle name  $4 1 = clear AU cache
+    local dir="$WORK/scripts-$1"
+    mkdir -p "$dir"
+    {
+        printf '#!/bin/sh\n'
+        printf 'SUBDIR=%s\n' "$2"
+        printf 'BUNDLE=%s\n' "$3"
+        printf 'CLEAR_AU_CACHE=%s\n' "${4:-0}"
+        cat <<'SWEEP'
+# ConjureAlign preinstall — remove stale copies of THIS format, then let the
+# payload install. Runs as root, out of installd.
+#
+# No `set -e` and an unconditional `exit 0`: a non-zero preinstall aborts the
+# whole installation, and nothing in a best-effort sweep is worth failing an
+# install over. No `set -u` either, for the same reason — but that means the
+# guards in sweep() below are load-bearing rather than decorative, since an
+# empty $SUBDIR/$BUNDLE would turn the rm into one that takes every plug-in on
+# the machine with it.
+#
+# $3 is the destination volume ("/" for the boot disk). enable_localSystem does
+# not pin the install to the boot volume — the user can still pick another under
+# Change Install Location — so every path is built from it.
+VOL=${3:-/}
+[ "$VOL" = "/" ] && VOL=""
+
+sweep() { # $1 = a Plug-Ins root
+    # Never construct a path from an empty component...
+    [ -n "$SUBDIR" ] && [ -n "$BUNDLE" ] || return 0
+    # ...and never delete anything that is not ours by name.
+    case "$BUNDLE" in ConjureAlign.*) ;; *) return 0 ;; esac
+    t="$1/$SUBDIR/$BUNDLE"
+    if [ -e "$t" ] || [ -L "$t" ]; then
+        # Goes to /var/log/install.log: silent to the user, greppable in support.
+        echo "ConjureAlign: removing stale $t"
+        rm -rf "$t" 2>/dev/null
+    fi
+}
+
+sweep "$VOL/Library/Audio/Plug-Ins"
+
+# Every real user's home. As root $HOME is /var/root and ~ is useless, so ask
+# the directory service. `_`-prefixed accounts are macOS service accounts; a
+# home outside /Users is a network or mobile account that is not ours to reach
+# into. `read -r u h` rather than `awk '{print $2}'` keeps a home directory
+# containing a space in one piece. Note dscl reads the BOOTED system's
+# directory, not $3's — correct for a normal install, wrong for one onto a
+# non-boot volume, which is a tradeoff rather than a bug worth code.
+#
+# KEEP IN SYNC with user_homes() in scripts/uninstall-macos.sh.
+dscl . -list /Users NFSHomeDirectory 2>/dev/null | while read -r u h; do
+    case "$u" in _*|"") continue ;; esac
+    case "$h" in /Users/*) ;; *) continue ;; esac
+    sweep "$VOL$h/Library/Audio/Plug-Ins"
+    # AU package only: a cache entry surviving a component we just deleted is
+    # exactly how Logic keeps listing a plug-in that is gone. It is a cache —
+    # the cost of clearing it is one slower plug-in scan.
+    [ "$CLEAR_AU_CACHE" = 1 ] && rm -rf "$VOL$h/Library/Caches/AudioUnitCache"
+done
+
+exit 0
+SWEEP
+    } > "$dir/preinstall"
+    chmod +x "$dir/preinstall"
+}
+
+make_scripts vst3 VST3       ConjureAlign.vst3
+make_scripts clap CLAP       ConjureAlign.clap
+make_scripts au   Components ConjureAlign.component 1
+
+# Logic caches AU registrations; a stale cache is the #1 "where is the plugin?"
+# support question, so the AU package clears it itself. AudioComponentRegistrar
+# is an on-demand daemon — killall failing because it is not running is success,
+# hence the || true. (make_scripts au created this directory.)
+cat > "$WORK/scripts-au/postinstall" <<'EOF'
 #!/bin/sh
 killall -9 AudioComponentRegistrar 2>/dev/null || true
 exit 0
 EOF
-chmod +x "$WORK/au-scripts/postinstall"
+chmod +x "$WORK/scripts-au/postinstall"
 
-build_component ConjureAlign.vst3      VST3       vst3
-build_component ConjureAlign.clap      CLAP       clap
-build_component ConjureAlign.component Components au --scripts "$WORK/au-scripts"
+build_component ConjureAlign.vst3      VST3       vst3 --scripts "$WORK/scripts-vst3"
+build_component ConjureAlign.clap      CLAP       clap --scripts "$WORK/scripts-clap"
+build_component ConjureAlign.component Components au   --scripts "$WORK/scripts-au"
+
+# The uninstaller. Not a checkbox and not optional: a plugin that installs into
+# /Library with installer receipts needs a way out that is not a support email
+# full of `sudo`.
+#
+# Deliberately NOT built through build_component(): the payload is a shell
+# script, not a bundle, so `pkgbuild --analyze` finds nothing and emits an empty
+# array — on which build_component's `PlistBuddy -c "Add :0:..."` fails and,
+# under `set -e`, takes the whole release with it. `--component-plist` is
+# optional (pkgbuild(1): "If you specify --root, you can use --component-plist"),
+# and with no bundles in the root there is nothing for it to configure.
+#
+# --install-location is the leaf /Applications/ConjureDSP, not /Applications:
+# pkgbuild puts a "." entry in the BOM carrying the root directory's own mode,
+# and "." maps to the install-location. Aiming it at /Applications would make
+# that entry describe /Applications itself (root:admin 0775 here), and packages
+# that reset it to root:wheel 0755 are a known class of bug. This way
+# /Applications never appears in the BOM at all.
+UNROOT="$WORK/root-uninstall"
+mkdir -p "$UNROOT"
+cp scripts/uninstall-macos.sh "$UNROOT/Uninstall ConjureAlign.command"
+# The execute bit is what makes Finder hand a .command to Terminal on
+# double-click, and pkgbuild archives the mode it finds on disk. mktemp -d is
+# 0700, so the root directory needs widening too or the installed directory
+# inherits it.
+chmod 755 "$UNROOT/Uninstall ConjureAlign.command"
+chmod 755 "$UNROOT"
+# The uninstaller ships standalone and cannot read this script, so it repeats
+# the four receipt ids literally. Nothing else ties the two together: change
+# $PKG_ID_BASE and the release would still build, the uninstaller would still
+# remove bundles, and `pkgutil --forget` would silently match nothing, leaving
+# a stale receipt on every machine forever. Fail the release instead. (The
+# Windows side guards the same class of drift by hard-coding AppId in the CI
+# smoke test.)
+for suffix in vst3 clap au uninstall; do
+    grep -qF "$PKG_ID_BASE.$suffix.pkg" "$UNROOT/Uninstall ConjureAlign.command" || {
+        echo "ERROR: scripts/uninstall-macos.sh does not list $PKG_ID_BASE.$suffix.pkg"
+        echo "PKG_ID_BASE and the uninstaller's PKG_IDS have drifted apart."
+        exit 1
+    }
+done
+pkgbuild --root "$UNROOT" \
+    --identifier "$PKG_ID_BASE.uninstall.pkg" \
+    --version "$VERSION" \
+    --install-location "/Applications/ConjureDSP" \
+    "$WORK/uninstall.pkg" >/dev/null
+echo "  built uninstall.pkg → /Applications/ConjureDSP"
 
 echo "=== Building installer ==="
 RES="$WORK/resources"
@@ -169,8 +309,9 @@ cat > "$RES/welcome.html" <<EOF
 <p><b>ConjureAlign $VERSION</b> time-aligns a mic signal to a reference mic with sub-sample
 precision and automatic polarity detection.</p>
 <p>This installer places the plugin into the system plug-in folders
-(<tt>/Library/Audio/Plug-Ins</tt>) for all users. All three formats are installed by
-default; click Customize to pick specific ones.</p>
+(<tt>/Library/Audio/Plug-Ins</tt>) for all users. All three formats are installed, and any
+older copies of them are removed &mdash; so every format on this Mac is the same
+version.</p>
 <ul>
 <li><b>Audio Unit</b> &mdash; Logic Pro, GarageBand</li>
 <li><b>VST3</b> &mdash; REAPER, Ableton Live, Cubase, Studio One</li>
@@ -178,16 +319,23 @@ default; click Customize to pick specific ones.</p>
 </ul>
 </body></html>
 EOF
-cat > "$RES/conclusion.html" <<'EOF'
+# Unquoted heredoc: $VERSION interpolates. The body carries no backticks or
+# backslashes, so nothing else here is shell-significant.
+cat > "$RES/conclusion.html" <<EOF
 <html><head><meta charset="utf-8"></head>
 <body style="font-family: -apple-system, sans-serif; font-size: 13px;">
 <p><b>ConjureAlign is installed.</b> Restart your DAW to pick it up.</p>
 <p>In Logic Pro it appears under Audio FX &rarr; ConjureDSP &rarr; ConjureAlign
 (first launch may revalidate plugins; check Settings &rarr; Plug-in Manager if it is
 missing).</p>
-<p>If you previously installed ConjureAlign by hand into
-<tt>~/Library/Audio/Plug-Ins</tt>, delete those copies so your DAW does not load the old
-version.</p>
+<p><b>Quit and reopen your DAW.</b> A host that already had ConjureAlign loaded keeps
+running the old code until it is relaunched.</p>
+<p>Older copies of all three formats were removed from the system and per-user plug-in
+folders (<tt>/Library/Audio/Plug-Ins</tt> and <tt>~/Library/Audio/Plug-Ins</tt>), including
+any you had copied there by hand &mdash; so no DAW can keep loading an old build alongside
+this one, and every format on this Mac is now $VERSION.</p>
+<p>To remove ConjureAlign later, open <tt>/Applications/ConjureDSP</tt> and double-click
+<b>Uninstall ConjureAlign</b>.</p>
 <p>Usage guide: <a href="https://github.com/michaeljancsy/ConjureAlign#how-to-use-it">github.com/michaeljancsy/ConjureAlign</a></p>
 </body></html>
 EOF
@@ -199,12 +347,24 @@ cat > "$WORK/distribution.xml" <<EOF
     <welcome file="welcome.html" mime-type="text/html"/>
     <license file="license.txt" mime-type="text/plain"/>
     <conclusion file="conclusion.html" mime-type="text/html"/>
-    <options customize="allow" require-scripts="false" hostArchitectures="arm64,x86_64"/>
+    <!-- customize="never": all three formats, always, with no checkboxes. This
+         is load-bearing, not a simplification. Per-format deselection is the
+         one way a machine can end up with formats at DIFFERENT versions — keep
+         1.3.0's VST3 while updating to 1.4.0's AU and "it works in Logic but
+         not REAPER" becomes a version mismatch nobody can see. It is also what
+         lets each format's own preinstall be a complete sweep: every component
+         always installs, so every component's preinstall always runs, so the
+         three of them together cover every format WITHOUT needing a separate
+         sweep package that would have to assume components install in
+         choices-outline order. Matches the Windows installer, which has no
+         [Components] section and always writes both formats. -->
+    <options customize="never" require-scripts="false" hostArchitectures="arm64,x86_64"/>
     <domains enable_localSystem="true"/>
     <choices-outline>
         <line choice="au"/>
         <line choice="vst3"/>
         <line choice="clap"/>
+        <line choice="uninstaller"/>
     </choices-outline>
     <choice id="au" title="Audio Unit" description="For Logic Pro and GarageBand.">
         <pkg-ref id="$PKG_ID_BASE.au.pkg"/>
@@ -215,9 +375,23 @@ cat > "$WORK/distribution.xml" <<EOF
     <choice id="clap" title="CLAP" description="For Bitwig and REAPER.">
         <pkg-ref id="$PKG_ID_BASE.clap.pkg"/>
     </choice>
+    <!-- Hidden and always installed. Not a customer-facing option: an
+         uninstaller that only exists when someone remembered to tick it is an
+         uninstaller that is missing exactly when it is needed. `visible` is the
+         dynamic attribute (re-evaluated as choices change), so nothing
+         downstream can flip it back on; `start_enabled="false"` leaves no
+         checkbox state to toggle. It must still appear in choices-outline — a
+         choice the outline does not reference is inert, and the package would
+         silently never install. It carries no scripts, so its position there is
+         free. -->
+    <choice id="uninstaller" title="Uninstaller"
+            visible="false" start_selected="true" start_enabled="false">
+        <pkg-ref id="$PKG_ID_BASE.uninstall.pkg"/>
+    </choice>
     <pkg-ref id="$PKG_ID_BASE.au.pkg" version="$VERSION">au.pkg</pkg-ref>
     <pkg-ref id="$PKG_ID_BASE.vst3.pkg" version="$VERSION">vst3.pkg</pkg-ref>
     <pkg-ref id="$PKG_ID_BASE.clap.pkg" version="$VERSION">clap.pkg</pkg-ref>
+    <pkg-ref id="$PKG_ID_BASE.uninstall.pkg" version="$VERSION">uninstall.pkg</pkg-ref>
 </installer-gui-script>
 EOF
 

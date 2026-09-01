@@ -1,11 +1,14 @@
 //! Opt-in update checking: "is there a newer release than the one running?"
 //!
 //! It **notifies and nothing else**. No download, no install, no self-update.
-//! The bundle is mapped into a running host, the install location is
-//! `/Library/Audio/Plug-Ins` (admin rights), and the shipped installer is
-//! signed, notarized and stapled — re-implementing any part of that inside a
-//! plugin would be a security surface with no upside. The user runs the `.pkg`
-//! themselves, exactly as they did the first time.
+//! The bundle is mapped into a running host, the install locations need admin
+//! rights on both platforms (`/Library/Audio/Plug-Ins`,
+//! `C:\Program Files\Common Files`), and both shipped installers already do
+//! the work — the macOS `.pkg` is signed, notarized and stapled, and the
+//! Windows `.exe` sweeps out stale copies before it writes. Re-implementing
+//! any part of that inside a plugin would be a security surface with no
+//! upside. The user runs the installer themselves, exactly as they did the
+//! first time.
 //!
 //! Four rules, each load-bearing:
 //!

@@ -20,6 +20,14 @@
 //! The payload is deliberately thin: a random device id, the plugin version,
 //! the OS, the sample rate, and *bucketed* capture outcomes. No audio, no file
 //! names, no host name, no raw measurements.
+//!
+//! `Plugin Loaded` additionally carries `upgraded_from` — the version that ran
+//! on this install before this one — on the one launch that first sees a
+//! version change. It is strictly less revealing than `plugin_version`, which
+//! every event already carries, so it needed no new disclosure; it is recorded
+//! here because this module doc and CLAUDE.md are the only account of what
+//! leaves the machine. It exists because the cohort-level version breakdown
+//! cannot tell "nobody upgraded" from "nobody was told there was an upgrade".
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -46,6 +54,12 @@ pub use crate::config::{
 /// access, and it ships in every binary regardless of what we do here.
 pub const MIXPANEL_TOKEN: &str = "33c5c2d1578f3275ec2985bf4c92ad22";
 
+/// Set by the first `Plugin Loaded` in the process, which thereby claims the
+/// right to report — and to commit — this install's version change. Process-wide
+/// rather than per-instance because an upgrade belongs to the install: six
+/// instances in one project are one upgrade, not six.
+static UPGRADE_CLAIMED: AtomicBool = AtomicBool::new(false);
+
 const DEFAULT_ENDPOINT: &str = "https://api.mixpanel.com/track";
 /// Points the sender at a local sink for tests and manual QA.
 const ENDPOINT_ENV: &str = "CONJURE_ALIGN_ANALYTICS_URL";
@@ -54,13 +68,21 @@ const ENDPOINT_ENV: &str = "CONJURE_ALIGN_ANALYTICS_URL";
 // Events
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+// Not `Copy`: `PluginLoaded` carries an owned version string.
+#[derive(Debug, Clone, PartialEq)]
 pub enum AnalyticsEvent {
     /// Once per plugin instance. Goes over the wire as "Plugin Loaded", NOT
     /// "Session Start" — Mixpanel ships a built-in virtual event,
     /// `$session_start`, whose display name is exactly "Session Start", and
     /// two identically labelled entries in the event picker is a trap.
-    PluginLoaded { sample_rate: f32 },
+    PluginLoaded {
+        sample_rate: f32,
+        /// The version that ran on this install before this one, when this
+        /// launch is an upgrade. `None` on a first run and on every launch
+        /// after the first at a given version, so at most one event per
+        /// upgrade carries it. See [`crate::config::pending_upgrade_from`].
+        upgraded_from: Option<String>,
+    },
     CaptureCompleted {
         confidence: f32,
         offset_ms: f32,
@@ -184,8 +206,17 @@ pub fn build_payload(event: &AnalyticsEvent, ctx: &EventContext) -> serde_json::
     }
 
     let name = match event {
-        AnalyticsEvent::PluginLoaded { sample_rate } => {
+        AnalyticsEvent::PluginLoaded {
+            sample_rate,
+            upgraded_from,
+        } => {
             props.insert("sample_rate".into(), (*sample_rate as u64).into());
+            // Omitted rather than nulled, like every other optional property:
+            // a null becomes a real value in Mixpanel's lexicon. Its absence
+            // already means "not an upgrade, or not one we can prove".
+            if let Some(previous) = upgraded_from {
+                props.insert("upgraded_from".into(), previous.as_str().into());
+            }
             "Plugin Loaded"
         }
         AnalyticsEvent::CaptureCompleted {
@@ -280,7 +311,7 @@ impl AnalyticsHandle {
         // when the editor first opens — so the session event is emitted here
         // rather than being lost.
         self.flush_session();
-        self.send(event);
+        self.send(event, false);
     }
 
     fn flush_session(&self) {
@@ -296,11 +327,40 @@ impl AnalyticsHandle {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            self.send(AnalyticsEvent::PluginLoaded { sample_rate });
+            // `session_sent` is per-instance, so this runs once per *instance*.
+            // The upgrade is a property of the install, not of an instance, so
+            // exactly one instance may claim it: without this gate, reopening a
+            // project with six instances after an upgrade sends six events all
+            // carrying the same `upgraded_from`, because none of them has
+            // committed yet (the commit waits on delivery, below).
+            //
+            // The claim, not the answer, is what authorises the commit. A
+            // non-claiming instance must not commit either, or it would advance
+            // `last_version` past an upgrade nobody actually reported.
+            let claimed = !UPGRADE_CLAIMED.swap(true, Ordering::Relaxed);
+            // Behind the `enabled()` check above, so a declined install never
+            // records anything. This only READS the pending answer; `send`
+            // commits it after the request has actually gone out, so a report
+            // that never leaves the machine does not consume the upgrade.
+            let upgraded_from = if claimed {
+                crate::config::pending_upgrade_from(env!("CARGO_PKG_VERSION"))
+            } else {
+                None
+            };
+            self.send(
+                AnalyticsEvent::PluginLoaded {
+                    sample_rate,
+                    upgraded_from,
+                },
+                claimed,
+            );
         }
     }
 
-    fn send(&self, event: AnalyticsEvent) {
+    /// `commit_version` is set only by the one `Plugin Loaded` that claimed the
+    /// upgrade report (see [`AnalyticsHandle::flush_session`]); everything else
+    /// passes `false` and never touches the stored version.
+    fn send(&self, event: AnalyticsEvent, commit_version: bool) {
         let Some(device_id) = device_id() else {
             return;
         };
@@ -321,12 +381,24 @@ impl AnalyticsHandle {
         };
         let batch = serde_json::Value::Array(vec![build_payload(&event, &ctx)]);
         let body = batch.to_string();
-
-        // The return value is deliberately ignored: a dropped analytics event
-        // is the designed behaviour when the queue is backed up, and there is
-        // nothing to tell the user about it.
+        // The claiming `Plugin Loaded` is what closes out the upgrade, and only
+        // once its request has actually gone: anything that stops it — a full
+        // queue, a shutdown draining jobs unrun, a host that dies first —
+        // leaves the pending answer on disk for the next launch to report
+        // instead of consuming it here. Committing on success even when there
+        // was no upgrade to report is deliberate: that is how a first run
+        // records its version, so the *next* upgrade has something to differ
+        // from.
+        //
+        // A dropped analytics event is the designed behaviour when the queue is
+        // backed up, and there is nothing to tell the user about it — but the
+        // outcome is no longer discarded outright, because that bookkeeping
+        // depends on whether the request actually went.
         self.worker.spawn_job(move || {
-            let _ = net::post(endpoint, &body);
+            let sent = net::post(endpoint, &body).is_ok();
+            if sent && commit_version {
+                crate::config::commit_running_version(env!("CARGO_PKG_VERSION"));
+            }
         });
     }
 }
@@ -455,6 +527,7 @@ mod tests {
         let v = build_payload(
             &AnalyticsEvent::PluginLoaded {
                 sample_rate: 48_000.0,
+                upgraded_from: None,
             },
             &ctx("d", 1, &host),
         );
@@ -466,6 +539,36 @@ mod tests {
         // The build target stays alongside the running version, not replaced
         // by it: they answer different questions.
         assert_eq!(props["os"], std::env::consts::OS);
+    }
+
+    /// The upgrade marker rides on `Plugin Loaded`, and only when there is an
+    /// upgrade to mark. Its absence is what "first run, or not an upgrade we
+    /// can prove" looks like on the wire.
+    #[test]
+    fn upgraded_from_is_present_only_on_an_upgrade() {
+        let host = test_host();
+
+        let v = build_payload(
+            &AnalyticsEvent::PluginLoaded {
+                sample_rate: 48_000.0,
+                upgraded_from: Some("1.2.0".into()),
+            },
+            &ctx("d", 1, &host),
+        );
+        assert_eq!(v["properties"]["upgraded_from"], "1.2.0");
+        // The running version is still reported alongside it: the pair is what
+        // names the edge, and one half is useless without the other.
+        assert_eq!(v["properties"]["plugin_version"], env!("CARGO_PKG_VERSION"));
+
+        let v = build_payload(
+            &AnalyticsEvent::PluginLoaded {
+                sample_rate: 48_000.0,
+                upgraded_from: None,
+            },
+            &ctx("d", 1, &host),
+        );
+        let props = v["properties"].as_object().unwrap();
+        assert!(!props.contains_key("upgraded_from"), "{props:?}");
     }
 
     /// Absent values are left OUT of the payload rather than sent as null —
@@ -481,6 +584,7 @@ mod tests {
         let v = build_payload(
             &AnalyticsEvent::PluginLoaded {
                 sample_rate: 48_000.0,
+                upgraded_from: None,
             },
             &EventContext {
                 device_id: "d",
@@ -551,6 +655,7 @@ mod tests {
         let v = build_payload(
             &AnalyticsEvent::PluginLoaded {
                 sample_rate: 48_000.0,
+                upgraded_from: None,
             },
             &ctx("d", 1, &host),
         );
@@ -591,6 +696,7 @@ mod tests {
         let body = serde_json::Value::Array(vec![build_payload(
             &AnalyticsEvent::PluginLoaded {
                 sample_rate: 48_000.0,
+                upgraded_from: None,
             },
             &EventContext {
                 device_id: "smoke-test",

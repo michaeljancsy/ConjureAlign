@@ -62,10 +62,33 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
 - VST3 validation: `pluginval --strictness-level 10 target/bundled/ConjureAlign.vst3`
 - Windows: no local toolchain — `.github/workflows/windows.yml` builds, tests, bundles and
   validates (pluginval `--skip-gui-tests`; clap-validator tolerating exactly the 4 known
-  upstream failures) on `windows-latest`, uploads `ConjureAlign-<v>-Windows.zip` as an
-  artifact, and attaches it to the GitHub Release on `v*` tag pushes (warns if the release
-  doesn't exist yet — create it and re-run the job). The editor is untestable in CI (no
-  GPU); GUI checks need a real Windows machine.
+  upstream failures) on `windows-latest`, packages `ConjureAlign-<v>-Windows-Setup.exe` with
+  Inno Setup (`packaging/windows/ConjureAlign.iss`; Inno 6 is preinstalled on the runner, so
+  no install step), uploads it as an artifact, and attaches it to the GitHub Release on `v*`
+  tag pushes (warns if the release doesn't exist yet — create it and re-run the job). The
+  editor is untestable in CI (no GPU); GUI checks need a real Windows machine.
+  - The runner IS a real Windows machine and the workflow uses it as one: the installer is
+    **smoke-tested end to end** (install over a planted loose-DLL mis-install → install again
+    over a planted `ConjureAlign-1.2.0\` leftover and a per-user copy, with a decoy that must
+    survive → uninstall), and pluginval is re-run against the *installed* bundle. That is not
+    belt-and-braces: an Inno 6 installer cannot be inspected offline — 7-Zip does not read the
+    format and `innoextract` lags Inno releases by years — so running it is the only
+    verification that exists.
+  - `AppId` in the `.iss` is a permanent identity, exactly like the AU `subtype`. Change it
+    and a later installer stops recognising existing installs: two Add/Remove entries, two
+    uninstallers, no upgrade path. The smoke test hard-codes the same GUID on purpose, so
+    changing one without the other fails CI instead of shipping.
+  - Two Inno settings are load-bearing and silently no-op if wrong.
+    `CloseApplicationsFilter` defaults to `*.exe,*.dll,*.chm`, which matches neither `.vst3`
+    nor `.clap` — without the override, `CloseApplications=yes` checks nothing and an install
+    against a running DAW half-fails. And `ignoreversion` on `[Files]` is mandatory now that
+    the DLL carries a version resource, or Inno skips a file whose installed copy is
+    equal-or-newer and a same-version reinstall installs nothing.
+  - Passing the version: `#define AppVersion GetEnv("CONJUREALIGN_VERSION")`, **not**
+    `ISCC /DAppVersion=…`. The step is `shell: bash`, i.e. Git Bash, whose MSYS layer rewrites
+    a leading-slash argument into a Windows path — `/DAppVersion=1.3.0` arrives as
+    `D:\AppVersion=1.3.0`. The same hazard is why the installer itself is driven from `pwsh`
+    (`/VERYSILENT` would be mangled too).
 - AU validation: install the `.component`, then
   `killall -9 AudioComponentRegistrar; auval -v aufx ALGN CONJ` (add `-strict` for the
   pedantic pass). The `;` is deliberate — `AudioComponentRegistrar` is an on-demand daemon,
@@ -81,6 +104,62 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   target `/Library/Audio/Plug-Ins/{VST3,CLAP,Components}` (AU postinstall clears the
   AudioComponentRegistrar cache). Signing the pkg needs the "Developer ID **Installer**"
   cert — a different cert from the "Developer ID Application" one that signs the bundles.
+  `--no-notarize` builds without the multi-minute notarization step; it is checked as `$1`,
+  so it must be the FIRST argument.
+  - Each format package carries a **`preinstall` that sweeps its own format** out of
+    `/Library` and every real user's `~/Library` before its payload lands (generated once by
+    `make_scripts`, which stamps `SUBDIR`/`BUNDLE`/`CLEAR_AU_CACHE` onto one shared body).
+    `BundleIsRelocatable=false` stops Installer *redirecting* onto a hand-installed
+    `~/Library` copy but cannot remove it, and that shadow copy is the classic "my update
+    didn't take" bug. Per-format, not one global sweep package: a component's own preinstall
+    is guaranteed to run before its own payload — definitional — whereas a separate sweep
+    package would depend on components installing in `choices-outline` order, which Apple
+    does not document and which is not something to put in front of an `rm -rf` of what you
+    just installed.
+  - What makes the per-format sweep *complete* is **`customize="never"`**. All three
+    components always install, so all three preinstalls always run, so between them they
+    cover every format — a global sweep's coverage with none of its ordering risk. Removing
+    the format checkboxes is a product decision first (2026-08-31): per-format deselection
+    is the only way a Mac can end up with formats at DIFFERENT versions, and "works in Logic
+    but not REAPER" is then a version mismatch nobody can see. It also matches the Windows
+    installer, which has no `[Components]` section and always writes both formats.
+    **Reintroducing per-format choice silently breaks the sweep**, because a preinstall on a
+    deselected component never runs; the `<options>` element carries that warning inline.
+  - That script must never fail an install (a non-zero preinstall aborts the whole
+    installation), so it runs with neither `set -e` nor `set -u` and always `exit 0`. That
+    makes its two guards load-bearing rather than decorative: it refuses an empty
+    `$SUBDIR`/`$BUNDLE` (which would turn the `rm -rf` into one that takes every plug-in on
+    the machine) and refuses any `BUNDLE` not named `ConjureAlign.*`. Test it without
+    installing anything: build a plug-in tree under a scratch directory, pass that directory
+    as `$3`, and check that only the matching format disappears while the other two formats,
+    another vendor's bundle, and (for non-AU packages) the AU cache all survive. Honouring
+    `$3` is what makes that possible — and it is also required for real, since
+    `enable_localSystem` still lets the user pick a non-boot volume.
+  - A fourth, hidden component installs `/Applications/ConjureDSP/Uninstall
+    ConjureAlign.command` (`scripts/uninstall-macos.sh`). It is `visible="false"
+    start_selected="true" start_enabled="false"` — always installed, never a checkbox,
+    because an uninstaller that exists only when someone ticked it is missing exactly when
+    it is needed. It still needs a `<line>` in `choices-outline` (an unreferenced choice is
+    inert) **and** both `<pkg-ref>`s: the inner one inside the choice and the outer one
+    naming `uninstall.pkg`, or `productbuild --package-path` cannot resolve it.
+  - That component deliberately does NOT go through `build_component()`. Its payload is a
+    shell script, not a bundle, so `pkgbuild --analyze` emits an empty array and the
+    helper's `PlistBuddy -c "Add :0:…"` fails — under `set -e` that kills the release.
+    `--component-plist` is optional and configures bundle-specific behaviour only, so it is
+    omitted. `--install-location` is the leaf `/Applications/ConjureDSP`, not
+    `/Applications`: pkgbuild puts a `.` entry in the BOM carrying the payload root's own
+    mode, and `.` maps to the install-location, so aiming at `/Applications` would have that
+    entry describe `/Applications` itself. Verified: the BOM contains only `.` and the
+    `.command` at `root:wheel 0755`, and `/Applications` never appears.
+  - The uninstaller re-execs itself under `sudo` for one privileged phase rather than using
+    `osascript … with administrator privileges`, which attributes the password dialog to
+    "osascript" — indistinguishable from malware — and fails with no window server. That is
+    safe only because the pkg installs the file `root:wheel 0755` inside a `root:wheel 0755`
+    directory; relocating it anywhere user-writable would make it a privilege escalation.
+    Its body is one `{ … }` group so the self-delete at the end cannot leave bash reading a
+    truncated file. `/Applications/ConjureDSP` is removed with `rmdir`, never `rm -rf` — it
+    is shared with the other ConjureDSP products — and only the `ConjureAlign` child of
+    `~/Library/Application Support/ConjureDSP` is ever deleted, for the same reason.
 - Toolchain: stable Rust. nih_plug is a git dependency (not on crates.io); Cargo.lock pins the
   rev — but the `nih_plug` crate itself is `[patch]`ed onto the vendored copy at
   `deps/nih-plug` (teardown fixes for the shared background worker; see Known upstream issues
@@ -88,6 +167,16 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   the vendored tree must move in lockstep with the pinned rev. `atomic_float` in Cargo.toml
   must stay on the same version nih_plug uses, because its `AtomicF32` implements nih_plug's
   `PersistentField`.
+- `build.rs` exists for exactly one thing: on a Windows host it stamps a `VS_VERSION_INFO`
+  resource into the cdylib (via `winresource` → the Windows SDK's `rc.exe`), so an installed
+  `ConjureAlign.vst3` / `.clap` — both of which are this DLL renamed, with no other identity
+  on disk — can be asked which build it is. It is a no-op on every other target. Note the
+  two version shapes: the STRING `FileVersion` is `CARGO_PKG_VERSION` verbatim (three-part,
+  matching the release tag and the only shape `update::parse_version` accepts), while the
+  binary `VS_FIXEDFILEINFO` block is always `MAJOR.MINOR.PATCH.0`. Explorer will NOT display
+  either — its property sheet resolves per-extension and `.vst3`/`.clap` have no registered
+  handler — so the check is `(Get-Item '<path>').VersionInfo.FileVersion` in PowerShell, and
+  CI asserts both blocks on the bundled files after every build.
 - Debug builds enable nih_plug's `assert_process_allocs`: any allocation on the audio thread
   panics. Keep it that way; fix the code, not the feature flag.
 
@@ -343,6 +432,27 @@ picker. Check `Get-Events` before naming anything new. Verify ingestion with
 **It writes one real event to the live project**, tagged `smoke-test` — and deliberately
 with the REAL host context, so a newly added `daw` or `os_version` value gets seen once in
 the project before it arrives from a user.
+
+`Plugin Loaded` also carries **`upgraded_from`** — the version that ran on this install
+before this one — backed by `config::pending_upgrade_from` and the `last_version` key in
+`analytics.json`. It is present only on the launch that first observes a version change, so
+one upgrade produces one marked event however many instances the host loads; absent means
+"first run, or an upgrade we cannot prove", and the two are deliberately indistinguishable
+(an install arriving from a build that predates the field looks like a first run). The
+write happens behind the `enabled()` check in `flush_session`, so a declined install stores
+nothing, and only when the version actually changed, so an ordinary launch touches no disk.
+
+It exists because **the cohort-level version breakdown is the wrong instrument.** Asking
+Mixpanel "has any device been seen on two versions?" cannot separate "nobody upgraded" from
+"nobody was told there was an upgrade" — and on 2026-08-31 the answer was the latter: the
+update check itself first shipped in 1.2.0 (`src/update.rs` landed in `c14c06e`, after the
+v1.1.0 tag), so the 24 installs then on 1.1.0 had no in-plugin way to learn 1.2.0 existed.
+That breakdown is also silently degraded by anything resetting the device id, including the
+`/reinstall` skill and the uninstallers. A per-device before/after has none of those
+problems. Do not re-derive upgrade rates from disjoint version buckets; read
+`upgraded_from`. (Disclosure: a previously-running version is strictly less revealing than
+`plugin_version`, already on every event, so this needed no change to the prompt or README —
+which is exactly why it has to be written down here.)
 
 UI: the first-run prompt (`editor::consent_modal`) and the ⚙ popover (`settings_menu`) are both
 drawn OUTSIDE `draw_ui` / from the control bar respectively, and both are `pub` so

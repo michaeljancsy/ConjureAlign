@@ -45,7 +45,21 @@ pkgutil --pkgs | grep -i conjure
 ```
 
 If anything is listed, do **not** try to remove it yourself — you cannot supply a password.
-Hand the user this block and wait for them to confirm they ran it:
+
+Since 1.4.0 the .pkg ships its own uninstaller, which does all of this (both domains, the
+receipts, and the AU cache) in one step. Prefer it when it is present — hand the user this
+and wait for them to confirm, since it will prompt for their password:
+
+```bash
+"/Applications/ConjureDSP/Uninstall ConjureAlign.command" --yes --keep-settings
+```
+
+`--keep-settings` is deliberate here: this is an iteration cycle, not a clean-install test,
+so the consent answers and device id should survive (step 1d is where that decision is
+actually made). Note it also deletes itself when it finishes, which is expected.
+
+If that file does not exist — an install from 1.3.0 or earlier — fall back to the manual
+block and wait for the user to confirm they ran it:
 
 ```bash
 sudo rm -rf /Library/Audio/Plug-Ins/CLAP/ConjureAlign.clap /Library/Audio/Plug-Ins/VST3/ConjureAlign.vst3 /Library/Audio/Plug-Ins/Components/ConjureAlign.component

@@ -27,6 +27,8 @@ distributed.
 | `findshlibs`, `debugid`, `uuid`, `hostname`, `os_info`, `uname` | MIT OR Apache-2.0 (`debugid`: Apache-2.0; `hostname`, `os_info`: MIT) | Crash-report metadata (loaded images, build ids, OS name) |
 | `rand`, `rand_chacha`, `rand_core`, `ppv-lite86`, `hex`, `httpdate`, `http`, `httparse`, `base64`, `base64ct`, `der`, `pem-rfc7468`, `rustls-pki-types`, `zeroize`, `utf8-zero` | MIT OR Apache-2.0 | Transitively required by the two above |
 | [webpki-root-certs](https://github.com/rustls/webpki-roots) | CDLA-Permissive-2.0 | Pulled in unavoidably by `ureq`'s `native-tls` feature. Linked but never consulted: the agent is configured with `RootCerts::PlatformVerifier`, so TLS uses the OS trust store |
+| [winresource](https://github.com/BenjaminRi/winresource) (with `version_check`) | MIT (`version_check`: MIT OR Apache-2.0) | Build-time only, on a Windows host: embeds the `VS_VERSION_INFO` resource into the DLL (see `build.rs`) via the Windows SDK's `rc.exe`. Not linked into the shipped binary. Windows only |
+| [Inno Setup](https://jrsoftware.org/isinfo.php) | Inno Setup License (modified BSD) | Builds `ConjureAlign-<version>-Windows-Setup.exe` from `packaging/windows/ConjureAlign.iss`. Its setup loader and `unins000.exe` stub are distributed inside that installer, aggregated with — not linked into — the GPL plugin. Windows only |
 
 Where a component is dual-licensed MIT OR Apache-2.0, it is used under the MIT license.
 The full MIT/ISC license texts require reproduction of the copyright notice, which the

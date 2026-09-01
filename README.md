@@ -23,24 +23,77 @@ Download `ConjureAlign-<version>-macOS.pkg` from the
 double-click it. The installer is signed and notarized; it offers all three formats —
 **Audio Unit** (Logic Pro, GarageBand), **VST3** (REAPER, Ableton Live, Cubase, Studio
 One), **CLAP** (Bitwig, REAPER) — and puts them in the system plug-in folders
-(`/Library/Audio/Plug-Ins`). Click Customize to install only some of them. Restart your
+(`/Library/Audio/Plug-Ins`). All three are always installed, so every format on the machine
+is the same version. Restart your
 DAW afterwards; in Logic the plugin appears under Audio FX → ConjureDSP → ConjureAlign.
 
-If you previously copied the bundles into `~/Library/Audio/Plug-Ins` by hand, delete
-those copies so your DAW doesn't keep loading the old version.
+Installing removes older copies of all three formats from both `/Library/Audio/Plug-Ins`
+and every user's `~/Library/Audio/Plug-Ins`, including any you copied there by hand, so an
+old build can't keep loading alongside the new one.
 
 ## Installation (Windows — beta)
 
-Download `ConjureAlign-<version>-Windows.zip` from the
-[latest release](https://github.com/michaeljancsy/ConjureAlign/releases/latest), unzip it,
-and copy `ConjureAlign.vst3` to `C:\Program Files\Common Files\VST3\` and
-`ConjureAlign.clap` to `C:\Program Files\Common Files\CLAP\` (there is no Audio Unit build —
-that format is macOS-only). Restart your DAW and rescan plugins if it doesn't appear.
+Download `ConjureAlign-<version>-Windows-Setup.exe` from the
+[latest release](https://github.com/michaeljancsy/ConjureAlign/releases/latest) and run it.
+It installs **VST3** and **CLAP** into the standard folders for all users
+(`C:\Program Files\Common Files\VST3` and `...\CLAP`); there is no Audio Unit build, as
+that format is macOS-only. Restart your DAW afterwards, and rescan plugins if it doesn't
+appear — some hosts cache their plugin list.
+
+The installer is not code-signed, so Windows SmartScreen will warn you the first time:
+click **More info → Run anyway**. Installing to Common Files needs administrator rights.
+
+Running the installer again over an existing install replaces it, and clears out older
+copies it finds in the standard and per-user plugin folders, so an old build can't keep
+loading alongside the new one.
 
 The Windows build passes the full DSP test suite, pluginval at strictness 10, and CLAP
-validation automatically on every release, but it has had far less real-DAW testing than
-the macOS build — [reports of anything odd](https://github.com/michaeljancsy/ConjureAlign/issues)
+validation automatically on every release, and the installer itself is install/upgrade/
+uninstall tested on every build. It has still had far less real-DAW testing than the macOS
+build — [reports of anything odd](https://github.com/michaeljancsy/ConjureAlign/issues)
 are genuinely useful, especially about the plugin window.
+
+## Uninstalling
+
+Quit your DAWs first — a host that already has the plugin loaded keeps running it until
+you relaunch.
+
+**macOS:** open `/Applications/ConjureDSP` and double-click **Uninstall ConjureAlign**. It
+opens in Terminal, lists what it is about to remove, and asks before doing anything. It
+removes all three formats from both `/Library` and every user's `~/Library`, clears the
+Audio Unit cache, and forgets the installer receipts; it needs your password for the
+system-wide part.
+
+**Windows:** Settings → Apps → Installed apps → ConjureAlign → Uninstall.
+
+Both ask separately whether to also remove your settings — the privacy and update-check
+answers, in `~/Library/Application Support/ConjureDSP/ConjureAlign` or
+`%APPDATA%\ConjureDSP\ConjureAlign`. Answering No keeps them for a future reinstall.
+
+Settings are per-user and uninstalling needs administrator rights, so that question only
+covers the account it was answered in. On Windows in particular, a standard user who
+entered a separate administrator's password is never asked and keeps their own copy —
+delete the folder above by hand if you want it gone. The plugin files themselves are
+machine-wide and are always removed in full.
+
+## Which version am I running?
+
+Open the plugin and click the **⚙** button — it shows the version of the build that is
+actually loaded, which is the one that matters.
+
+If the plugin won't load at all, ask the operating system about the files. On Windows,
+paste this into PowerShell to list every copy it can find and the version of each:
+
+```powershell
+Get-ChildItem 'C:\Program Files\Common Files', "$env:LOCALAPPDATA\Programs\Common" `
+  -Recurse -Include ConjureAlign.vst3,ConjureAlign.clap -ErrorAction SilentlyContinue |
+  Where-Object { -not $_.PSIsContainer } |
+  Select-Object FullName, @{n='Version';e={$_.VersionInfo.FileVersion}}
+```
+
+(Right-click → Properties won't show it: Windows resolves file versions per extension and
+has no handler for `.vst3` or `.clap`.) On macOS, `mdls -name kMDItemVersion` on an
+installed bundle does the same job.
 
 ## Updates
 
