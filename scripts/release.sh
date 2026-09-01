@@ -275,6 +275,20 @@ cp scripts/uninstall-macos.sh "$UNROOT/Uninstall ConjureAlign.command"
 # inherits it.
 chmod 755 "$UNROOT/Uninstall ConjureAlign.command"
 chmod 755 "$UNROOT"
+# The uninstaller ships standalone and cannot read this script, so it repeats
+# the four receipt ids literally. Nothing else ties the two together: change
+# $PKG_ID_BASE and the release would still build, the uninstaller would still
+# remove bundles, and `pkgutil --forget` would silently match nothing, leaving
+# a stale receipt on every machine forever. Fail the release instead. (The
+# Windows side guards the same class of drift by hard-coding AppId in the CI
+# smoke test.)
+for suffix in vst3 clap au uninstall; do
+    grep -qF "$PKG_ID_BASE.$suffix.pkg" "$UNROOT/Uninstall ConjureAlign.command" || {
+        echo "ERROR: scripts/uninstall-macos.sh does not list $PKG_ID_BASE.$suffix.pkg"
+        echo "PKG_ID_BASE and the uninstaller's PKG_IDS have drifted apart."
+        exit 1
+    }
+done
 pkgbuild --root "$UNROOT" \
     --identifier "$PKG_ID_BASE.uninstall.pkg" \
     --version "$VERSION" \

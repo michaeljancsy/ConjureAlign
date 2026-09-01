@@ -164,6 +164,12 @@ else
     [ -n "$RECEIPTS" ] && printf '%s\n' "$RECEIPTS" | sed 's/^/  receipt /'
     printf '  the Audio Unit cache (rebuilt automatically on the next scan)\n'
 fi
+# This list is built as you, and ~/Library is mode 0700, so it cannot see into
+# another account. The privileged phase runs as root and DOES remove their
+# copies too — say so rather than quietly under-reporting what is about to go.
+# The removals are echoed there, so the full set ends up on screen either way.
+printf '  the same files in every other user account on this Mac\n'
+printf '    (not listed above: only root can look inside another user Library)\n'
 printf '  %s\n\n' "$SELF"
 
 confirm() { # $1 = prompt
@@ -200,15 +206,13 @@ if [ -e "$SETTINGS" ]; then
             SETTINGS_ANSWER=n
         fi
     fi
+    # The answer is only RECORDED here. Removing settings is irreversible and
+    # the sudo below can still fail — a cancelled password prompt used to leave
+    # the plug-in installed with the consent answers and install id already
+    # destroyed, which silently re-asks the privacy prompt and mints a new
+    # device id. Ask early, act only once the rest has actually succeeded.
     case "$SETTINGS_ANSWER" in
-        [yY]|[yY][eE][sS])
-            # ONLY the ConjureAlign child. The parent
-            # ~/Library/Application Support/ConjureDSP/ is shared with the
-            # ConjureDSP app and every other ConjureDSP plug-in — exports,
-            # caches, a vendored Python runtime. Never rm -rf the parent.
-            rm -rf "$SETTINGS"
-            printf 'Settings removed.\n'
-            ;;
+        [yY]|[yY][eE][sS]) printf 'Settings will be removed at the end.\n' ;;
         *) printf 'Settings kept.\n' ;;
     esac
 fi
@@ -217,14 +221,33 @@ printf '\nThe rest needs administrator rights: /Library, the installer receipts\
 printf 'and this file itself are root-owned. You will be asked for your password.\n\n'
 
 if sudo "$SELF" --privileged-phase; then
+    # Now, and as you rather than as root, so $HOME is the right home.
+    if [ -e "$SETTINGS" ]; then
+        case "$SETTINGS_ANSWER" in
+            [yY]|[yY][eE][sS])
+                # ONLY the ConjureAlign child. The parent
+                # ~/Library/Application Support/ConjureDSP/ is shared with the
+                # ConjureDSP app and every other ConjureDSP plug-in — exports,
+                # caches, a vendored Python runtime. Never rm -rf the parent.
+                rm -rf "$SETTINGS"
+                printf '  removed %s\n' "$SETTINGS"
+                ;;
+        esac
+    fi
     printf '\nConjureAlign has been removed. Restart your DAW.\n\n'
     exit 0
 fi
 
-printf '\nCould not get administrator rights, so the system-wide files are still\n'
-printf 'in place. Run these in Terminal as an admin user:\n\n'
+printf '\nCould not get administrator rights, so nothing was removed — including\n'
+printf 'your settings, which are still at:\n  %s\n\n' "$SETTINGS"
+printf 'Either re-run this as an admin user, or run these in Terminal:\n\n'
 [ -n "$BUNDLES" ]  && printf '%s\n' "$BUNDLES"  | sed 's|.*|  sudo rm -rf "&"|'
 [ -n "$RECEIPTS" ] && printf '%s\n' "$RECEIPTS" | sed 's|.*|  sudo pkgutil --forget &|'
-printf '  sudo rm -rf "%s"\n\n' "$INSTALL_DIR"
+printf '  sudo rm -rf "%s"\n' "$INSTALL_DIR"
+# Same blind spot as the preview above: this list was built as you, so it names
+# no other account's copies. Re-running the uninstaller as an admin is the only
+# route that reaches those.
+printf '\nThose paths cover this account only. Copies belonging to other users on\n'
+printf 'this Mac need the uninstaller itself, run by an administrator.\n\n'
 exit 1
 }

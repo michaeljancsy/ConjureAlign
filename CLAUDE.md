@@ -434,7 +434,7 @@ with the REAL host context, so a newly added `daw` or `os_version` value gets se
 the project before it arrives from a user.
 
 `Plugin Loaded` also carries **`upgraded_from`** — the version that ran on this install
-before this one — backed by `config::note_running_version` and the `last_version` key in
+before this one — backed by `config::pending_upgrade_from` and the `last_version` key in
 `analytics.json`. It is present only on the launch that first observes a version change, so
 one upgrade produces one marked event however many instances the host loads; absent means
 "first run, or an upgrade we cannot prove", and the two are deliberately indistinguishable

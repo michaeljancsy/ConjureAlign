@@ -303,6 +303,13 @@ jobs:
           # --- phase 3: uninstall ------------------------------------------------
           $unins = (Get-ItemProperty $arp).UninstallString -replace '"',''
           Invoke-Setup $unins @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART') 'uninstall'
+          # unins000.exe re-execs a copy of itself out of %TEMP% so it can
+          # delete its own directory, and the process just waited on can exit
+          # before that copy has finished. Waiting on it is therefore not proof
+          # the uninstall is done — poll the Add/Remove key, which the real
+          # uninstaller removes at the end, and only then assert.
+          $deadline = (Get-Date).AddSeconds(120)
+          while ((Test-Path $arp) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
           if (Test-Path $vst3) { throw 'VST3 survived uninstall' }
           if (Test-Path $clap) { throw 'CLAP survived uninstall' }
           if (Test-Path $arp)  { throw 'Add/Remove entry survived uninstall' }

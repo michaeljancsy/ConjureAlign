@@ -59,7 +59,7 @@ pub struct Config {
     pub update_skipped: Option<String>,
     /// The plugin version that ran on this install last time, so a launch can
     /// tell that it is an *upgrade* rather than a first run. Bookkeeping, not
-    /// an answer: see [`note_running_version`].
+    /// an answer: see [`pending_upgrade_from`] and [`commit_running_version`].
     ///
     /// Written only for an install that has granted analytics consent — a
     /// declined install has nothing to report it to, and storing state nobody
@@ -146,7 +146,7 @@ impl Config {
         }
     }
 
-    /// The decision behind [`note_running_version`], split out so it can be
+    /// The decision behind [`commit_running_version`], split out so it can be
     /// tested without the process-wide config or a real `HOME`.
     ///
     /// `None` means the stored version already matches, so there is nothing to
@@ -386,16 +386,17 @@ pub fn device_id() -> Option<String> {
     with_config(|cfg| cfg.device_id.clone())
 }
 
-/// Records that `version` is running now, and returns the version that ran
-/// before it — but only when the two differ.
+/// The version that ran before `version`, if this launch is an observable
+/// upgrade — **without recording anything**. [`commit_running_version`] is what
+/// records it, and only once the report has actually left the machine.
 ///
-/// This is what backs the `upgraded_from` property on `Plugin Loaded`. The
-/// cohort-level question it replaces ("has any install ever been seen on two
-/// versions?") is the wrong instrument: it cannot separate "nobody upgraded"
-/// from "nobody was told there was one", and anything that resets the device
-/// id — a clean reinstall, an uninstaller — silently degrades it. A per-device
-/// before/after is unambiguous, and the first non-`None` answer is the first
-/// proven in-place upgrade.
+/// This backs the `upgraded_from` property on `Plugin Loaded`. The cohort-level
+/// question it replaces ("has any install ever been seen on two versions?") is
+/// the wrong instrument: it cannot separate "nobody upgraded" from "nobody was
+/// told there was one", and anything that resets the device id — a clean
+/// reinstall, an uninstaller — silently degrades it. A per-device before/after
+/// is unambiguous, and the first non-`None` answer is the first proven in-place
+/// upgrade.
 ///
 /// `None` on a first run, and also `None` for an install arriving from a
 /// version that predates this bookkeeping: those two cannot be told apart, and
@@ -403,20 +404,42 @@ pub fn device_id() -> Option<String> {
 ///
 /// **Call only from a consent-gated path.** Nothing here checks the answer, and
 /// a declined install must not accumulate state it will never report.
-///
-/// Writes only when the version actually changed, so every launch after the
-/// first at a given version touches no disk. The config is process-cached, so
-/// several instances in one host still produce at most one write and at most
-/// one non-`None` answer.
-pub fn note_running_version(version: &str) -> Option<String> {
+pub fn pending_upgrade_from(version: &str) -> Option<String> {
     if !SUPPORTED {
         return None;
     }
     with_config(|cfg| {
-        let previous = cfg.apply_running_version(version)?;
-        save_now(cfg);
-        previous
+        if cfg.last_version.as_deref() == Some(version) {
+            return None;
+        }
+        cfg.last_version.clone()
     })
+}
+
+/// Records `version` as the one that ran, closing out the upgrade that
+/// [`pending_upgrade_from`] reported.
+///
+/// Split from the read on purpose. Recording at the moment the event was
+/// *queued* meant a report that never left — a full send queue, a shutdown that
+/// drains jobs unrun, or a host that dies before the request completes — still
+/// consumed the marker, and no later launch could ever report that upgrade
+/// again. The population most likely to lose the report that way is a host
+/// crashing on insert, which is exactly the population worth measuring. So this
+/// runs from the sender, after the request has actually gone out; until then
+/// the pending answer survives and the next launch reports it instead.
+///
+/// Writes only when the version actually changed, so the ordinary case touches
+/// no disk. Runs on the shared network worker thread — it takes the config lock
+/// and writes a file, neither of which any caller holds across a worker join.
+pub fn commit_running_version(version: &str) {
+    if !SUPPORTED {
+        return;
+    }
+    with_config(|cfg| {
+        if cfg.apply_running_version(version).is_some() {
+            save_now(cfg);
+        }
+    });
 }
 
 /// Seconds since the Unix epoch, saturating at 0 on a clock before 1970.

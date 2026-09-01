@@ -74,7 +74,7 @@ pub enum AnalyticsEvent {
         /// The version that ran on this install before this one, when this
         /// launch is an upgrade. `None` on a first run and on every launch
         /// after the first at a given version, so at most one event per
-        /// upgrade carries it. See [`crate::config::note_running_version`].
+        /// upgrade carries it. See [`crate::config::pending_upgrade_from`].
         upgraded_from: Option<String>,
     },
     CaptureCompleted {
@@ -322,16 +322,10 @@ impl AnalyticsHandle {
             .is_ok()
         {
             // Behind the `enabled()` check above, so a declined install never
-            // writes it. The CAS makes this once per *instance*; the write and
-            // the non-`None` answer are once per *process*, because the config
-            // is process-cached and the second caller sees the version already
-            // stored. So a host with four instances still reports one upgrade.
-            //
-            // Like `set_analytics_consent`, this holds the config lock across
-            // file I/O — fine on the main and background-task threads, which
-            // are the only two that reach here, and already accounted for by
-            // the `try_lock` in the panic-hook accessors.
-            let upgraded_from = crate::config::note_running_version(env!("CARGO_PKG_VERSION"));
+            // records anything. This only READS the pending answer; `send`
+            // commits it after the request has actually gone out, so a report
+            // that never leaves the machine does not consume the upgrade.
+            let upgraded_from = crate::config::pending_upgrade_from(env!("CARGO_PKG_VERSION"));
             self.send(AnalyticsEvent::PluginLoaded {
                 sample_rate,
                 upgraded_from,
@@ -360,12 +354,22 @@ impl AnalyticsHandle {
         };
         let batch = serde_json::Value::Array(vec![build_payload(&event, &ctx)]);
         let body = batch.to_string();
+        // `Plugin Loaded` is the event that carries `upgraded_from`, so it is
+        // the one whose delivery closes out the upgrade. Anything that stops
+        // the request — a full queue, a shutdown draining jobs unrun, a host
+        // that dies first — leaves the pending answer on disk for the next
+        // launch to report instead of consuming it here.
+        let record_version = matches!(event, AnalyticsEvent::PluginLoaded { .. });
 
-        // The return value is deliberately ignored: a dropped analytics event
-        // is the designed behaviour when the queue is backed up, and there is
-        // nothing to tell the user about it.
+        // A dropped analytics event is the designed behaviour when the queue is
+        // backed up, and there is nothing to tell the user about it — but the
+        // outcome is no longer discarded outright, because the version
+        // bookkeeping above depends on whether the request actually went.
         self.worker.spawn_job(move || {
-            let _ = net::post(endpoint, &body);
+            let sent = net::post(endpoint, &body).is_ok();
+            if sent && record_version {
+                crate::config::commit_running_version(env!("CARGO_PKG_VERSION"));
+            }
         });
     }
 }
