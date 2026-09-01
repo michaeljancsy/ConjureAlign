@@ -254,7 +254,12 @@ FinishedLabelNoIcons=Setup has finished installing [name].%n%nRestart your DAW a
   password. In that case DirExists is false below, no prompt appears, and that
   user's own settings survive untouched. An admin-mode installer cannot reach
   another profile, so the honest fix is to say so rather than silently
-  under-report: README.txt names the path so it can be removed by hand. }
+  under-report: README.txt names the path so it can be removed by hand.
+
+  Formatting trap when editing the message below: ISPP reads any line whose
+  first non-blank character is '#' as a preprocessor directive, so a wrapped
+  continuation starting with #13#10 fails the compile with "Unknown
+  preprocessor directive". Keep those character codes mid-line. }
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   DataDir, ParentDir: String;
@@ -269,8 +274,7 @@ begin
            'Also remove ConjureAlign''s settings?' + #13#10#13#10 +
            DataDir + #13#10#13#10 +
            'This holds your privacy and update-check answers and the crash-report ' +
-           'bookkeeping. Choose No to keep them for a future reinstall.' +
-           #13#10#13#10 +
+           'bookkeeping. Choose No to keep them for a future reinstall.' + #13#10#13#10 +
            'Settings are per-user, and this covers only the account running ' +
            'this uninstaller. Other Windows accounts keep their own copy under ' +
            '%APPDATA%\ConjureDSP\ConjureAlign.',
