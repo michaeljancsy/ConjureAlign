@@ -273,8 +273,14 @@ jobs:
           # matters for its own sake: phase 2 must not start sweeping while
           # pluginval still has the DLL open.
           $pv = (Get-ChildItem validators -Recurse -Filter 'pluginval*.exe' | Select-Object -First 1).FullName
+          # $vst3 carries its own quotes: -ArgumentList joins array elements with
+          # spaces and does NOT quote them individually (a long-standing
+          # Start-Process wart), so the bare path arrived as "C:\Program" plus
+          # three stray arguments and pluginval reported the bundle as damaged.
+          # -FilePath needs no such care, which is why the uninstaller's own
+          # spacey path works untouched below.
           $p = Start-Process -FilePath $pv -Wait -PassThru -NoNewWindow `
-                 -ArgumentList @('--strictness-level','10','--skip-gui-tests','--validate',$vst3) `
+                 -ArgumentList @('--strictness-level','10','--skip-gui-tests','--validate',"`"$vst3`"") `
                  -RedirectStandardOutput 'pluginval-installed.log' `
                  -RedirectStandardError  'pluginval-installed.err'
           Get-Content 'pluginval-installed.log','pluginval-installed.err' -ErrorAction SilentlyContinue | Write-Host
