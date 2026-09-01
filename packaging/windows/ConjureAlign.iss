@@ -97,7 +97,14 @@ OutputBaseFilename={#AppName}-{#AppVersion}-Windows-Setup
 ; {app} is NOT where the plugin goes — the plugin goes into the Common Files
 ; scan folders below. {app} holds the licence texts, the readme and the
 ; uninstaller, and is what Add/Remove Programs points at.
-DefaultDirName={commonpf64}\{#AppPublisher}\{#AppName}
+;
+; Deliberately NOT nested under a {#AppPublisher} folder. Inno removes {app}
+; itself once it is empty, but never retries its parent, and no [Code] hook
+; runs late enough to do it by hand: at usPostUninstall — the last step there
+; is — {app} still holds unins000.exe and unins000.dat, which are deleted
+; afterwards. A publisher folder would therefore be left behind empty on every
+; uninstall, which reads as "the uninstaller did not finish".
+DefaultDirName={commonpf64}\{#AppName}
 DisableDirPage=yes
 DisableProgramGroupPage=yes
 UninstallFilesDir={app}
@@ -216,9 +223,10 @@ Type: filesandordirs; Name: "{commoncf32}\CLAP\ConjureAlign-*"
 ; takes the bundle's directory shell if anything unexpected is left inside.
 Type: filesandordirs; Name: "{commoncf64}\VST3\ConjureAlign.vst3"
 Type: filesandordirs; Name: "{commoncf64}\CLAP\ConjureAlign.clap"
-; Only if empty, so a sibling ConjureDSP product's folder survives.
+; Belt and braces only: Inno removes {app} itself at the end. This entry runs
+; while unins000.* are still in there, so it cannot fire — and that is exactly
+; why there is no publisher folder above {app} for it to leave behind.
 Type: dirifempty;     Name: "{app}"
-Type: dirifempty;     Name: "{commonpf64}\{#AppPublisher}"
 
 [Messages]
 FinishedLabelNoIcons=Setup has finished installing [name].%n%nRestart your DAW and rescan plug-ins if ConjureAlign does not appear. Some hosts cache their plug-in list and need it cleared.
@@ -237,7 +245,16 @@ FinishedLabelNoIcons=Setup has finished installing [name].%n%nRestart your DAW a
 
   Only the ConjureAlign child is touched. The parent ConjureDSP\ folder is
   shared with the other ConjureDSP products, so it is removed with RemoveDir,
-  which succeeds only when it is already empty. }
+  which succeeds only when it is already empty.
+
+  LIMITATION, and the reason the message says "for the account running this
+  uninstaller": settings are per-user, but this runs elevated. {userappdata}
+  is therefore the profile of whoever's credentials Windows accepted, which is
+  NOT the invoking user when a standard user typed a separate administrator's
+  password. In that case DirExists is false below, no prompt appears, and that
+  user's own settings survive untouched. An admin-mode installer cannot reach
+  another profile, so the honest fix is to say so rather than silently
+  under-report: README.txt names the path so it can be removed by hand. }
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   DataDir, ParentDir: String;
@@ -252,7 +269,11 @@ begin
            'Also remove ConjureAlign''s settings?' + #13#10#13#10 +
            DataDir + #13#10#13#10 +
            'This holds your privacy and update-check answers and the crash-report ' +
-           'bookkeeping. Choose No to keep them for a future reinstall.',
+           'bookkeeping. Choose No to keep them for a future reinstall.' +
+           #13#10#13#10 +
+           'Settings are per-user, and this covers only the account running ' +
+           'this uninstaller. Other Windows accounts keep their own copy under ' +
+           '%APPDATA%\ConjureDSP\ConjureAlign.',
            mbConfirmation, MB_YESNO, IDNO) = IDYES then
       begin
         DelTree(DataDir, True, True, True);

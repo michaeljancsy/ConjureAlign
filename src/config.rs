@@ -404,6 +404,14 @@ pub fn device_id() -> Option<String> {
 ///
 /// **Call only from a consent-gated path.** Nothing here checks the answer, and
 /// a declined install must not accumulate state it will never report.
+///
+/// **And call it at most once per process.** Because it records nothing, every
+/// caller before the first delivery gets the same answer — six plugin instances
+/// opening together would otherwise report one upgrade six times. The caller
+/// owns that gate (`analytics::UPGRADE_CLAIMED`), and the same claim is what
+/// authorises the matching [`commit_running_version`]: an instance that did not
+/// claim must not commit either, or it would advance the stored version past an
+/// upgrade nobody reported.
 pub fn pending_upgrade_from(version: &str) -> Option<String> {
     if !SUPPORTED {
         return None;

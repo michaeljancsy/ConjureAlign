@@ -52,6 +52,16 @@ The uninstaller asks whether to also remove your settings — the privacy and
 update-check answers, kept in %APPDATA%\ConjureDSP\ConjureAlign. Answering No
 keeps them for a future reinstall.
 
+Those settings are per-user, and uninstalling needs administrator rights, so
+the question covers only the account whose credentials Windows accepted. If
+you are a standard user who entered someone else's administrator password,
+no question appears and your own settings are left in place. Delete this
+folder by hand if you want them gone:
+
+  %APPDATA%\ConjureDSP\ConjureAlign
+
+The plug-in files themselves are machine-wide and are always fully removed.
+
 
 Beta note
 ---------

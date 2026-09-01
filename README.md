@@ -70,6 +70,12 @@ Both ask separately whether to also remove your settings — the privacy and upd
 answers, in `~/Library/Application Support/ConjureDSP/ConjureAlign` or
 `%APPDATA%\ConjureDSP\ConjureAlign`. Answering No keeps them for a future reinstall.
 
+Settings are per-user and uninstalling needs administrator rights, so that question only
+covers the account it was answered in. On Windows in particular, a standard user who
+entered a separate administrator's password is never asked and keeps their own copy —
+delete the folder above by hand if you want it gone. The plugin files themselves are
+machine-wide and are always removed in full.
+
 ## Which version am I running?
 
 Open the plugin and click the **⚙** button — it shows the version of the build that is

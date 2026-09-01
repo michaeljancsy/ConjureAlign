@@ -54,6 +54,12 @@ pub use crate::config::{
 /// access, and it ships in every binary regardless of what we do here.
 pub const MIXPANEL_TOKEN: &str = "33c5c2d1578f3275ec2985bf4c92ad22";
 
+/// Set by the first `Plugin Loaded` in the process, which thereby claims the
+/// right to report — and to commit — this install's version change. Process-wide
+/// rather than per-instance because an upgrade belongs to the install: six
+/// instances in one project are one upgrade, not six.
+static UPGRADE_CLAIMED: AtomicBool = AtomicBool::new(false);
+
 const DEFAULT_ENDPOINT: &str = "https://api.mixpanel.com/track";
 /// Points the sender at a local sink for tests and manual QA.
 const ENDPOINT_ENV: &str = "CONJURE_ALIGN_ANALYTICS_URL";
@@ -305,7 +311,7 @@ impl AnalyticsHandle {
         // when the editor first opens — so the session event is emitted here
         // rather than being lost.
         self.flush_session();
-        self.send(event);
+        self.send(event, false);
     }
 
     fn flush_session(&self) {
@@ -321,19 +327,40 @@ impl AnalyticsHandle {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            // `session_sent` is per-instance, so this runs once per *instance*.
+            // The upgrade is a property of the install, not of an instance, so
+            // exactly one instance may claim it: without this gate, reopening a
+            // project with six instances after an upgrade sends six events all
+            // carrying the same `upgraded_from`, because none of them has
+            // committed yet (the commit waits on delivery, below).
+            //
+            // The claim, not the answer, is what authorises the commit. A
+            // non-claiming instance must not commit either, or it would advance
+            // `last_version` past an upgrade nobody actually reported.
+            let claimed = !UPGRADE_CLAIMED.swap(true, Ordering::Relaxed);
             // Behind the `enabled()` check above, so a declined install never
             // records anything. This only READS the pending answer; `send`
             // commits it after the request has actually gone out, so a report
             // that never leaves the machine does not consume the upgrade.
-            let upgraded_from = crate::config::pending_upgrade_from(env!("CARGO_PKG_VERSION"));
-            self.send(AnalyticsEvent::PluginLoaded {
-                sample_rate,
-                upgraded_from,
-            });
+            let upgraded_from = if claimed {
+                crate::config::pending_upgrade_from(env!("CARGO_PKG_VERSION"))
+            } else {
+                None
+            };
+            self.send(
+                AnalyticsEvent::PluginLoaded {
+                    sample_rate,
+                    upgraded_from,
+                },
+                claimed,
+            );
         }
     }
 
-    fn send(&self, event: AnalyticsEvent) {
+    /// `commit_version` is set only by the one `Plugin Loaded` that claimed the
+    /// upgrade report (see [`AnalyticsHandle::flush_session`]); everything else
+    /// passes `false` and never touches the stored version.
+    fn send(&self, event: AnalyticsEvent, commit_version: bool) {
         let Some(device_id) = device_id() else {
             return;
         };
@@ -354,20 +381,22 @@ impl AnalyticsHandle {
         };
         let batch = serde_json::Value::Array(vec![build_payload(&event, &ctx)]);
         let body = batch.to_string();
-        // `Plugin Loaded` is the event that carries `upgraded_from`, so it is
-        // the one whose delivery closes out the upgrade. Anything that stops
-        // the request — a full queue, a shutdown draining jobs unrun, a host
-        // that dies first — leaves the pending answer on disk for the next
-        // launch to report instead of consuming it here.
-        let record_version = matches!(event, AnalyticsEvent::PluginLoaded { .. });
-
+        // The claiming `Plugin Loaded` is what closes out the upgrade, and only
+        // once its request has actually gone: anything that stops it — a full
+        // queue, a shutdown draining jobs unrun, a host that dies first —
+        // leaves the pending answer on disk for the next launch to report
+        // instead of consuming it here. Committing on success even when there
+        // was no upgrade to report is deliberate: that is how a first run
+        // records its version, so the *next* upgrade has something to differ
+        // from.
+        //
         // A dropped analytics event is the designed behaviour when the queue is
         // backed up, and there is nothing to tell the user about it — but the
-        // outcome is no longer discarded outright, because the version
-        // bookkeeping above depends on whether the request actually went.
+        // outcome is no longer discarded outright, because that bookkeeping
+        // depends on whether the request actually went.
         self.worker.spawn_job(move || {
             let sent = net::post(endpoint, &body).is_ok();
-            if sent && record_version {
+            if sent && commit_version {
                 crate::config::commit_running_version(env!("CARGO_PKG_VERSION"));
             }
         });
