@@ -248,18 +248,21 @@ FinishedLabelNoIcons=Setup has finished installing [name].%n%nRestart your DAW a
   which succeeds only when it is already empty.
 
   LIMITATION, and the reason the message says "for the account running this
-  uninstaller": settings are per-user, but this runs elevated. {userappdata}
-  is therefore the profile of whoever's credentials Windows accepted, which is
+  uninstaller": settings are per-user, but this runs elevated. The userappdata
+  constant is therefore the profile of whoever's credentials Windows accepted,
   NOT the invoking user when a standard user typed a separate administrator's
   password. In that case DirExists is false below, no prompt appears, and that
   user's own settings survive untouched. An admin-mode installer cannot reach
   another profile, so the honest fix is to say so rather than silently
   under-report: README.txt names the path so it can be removed by hand.
 
-  Formatting trap when editing the message below: ISPP reads any line whose
-  first non-blank character is '#' as a preprocessor directive, so a wrapped
-  continuation starting with #13#10 fails the compile with "Unknown
-  preprocessor directive". Keep those character codes mid-line. }
+  Two formatting traps when editing this block, both of which cost a CI round
+  trip because there is no offline ISCC here. First: Pascal comments do NOT
+  nest, so naming a constant in braces inside one closes it early and the next
+  line is parsed as code ("'BEGIN' expected"). Write such names bare, as above.
+  Second: ISPP reads any line whose first non-blank character is '#' as a
+  preprocessor directive, so a wrapped continuation starting with #13#10 fails
+  with "Unknown preprocessor directive" — keep those codes mid-line. }
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   DataDir, ParentDir: String;
