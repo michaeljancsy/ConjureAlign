@@ -36,6 +36,14 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 NOTARIZE=1
 [ "${1:-}" = "--no-notarize" ] && NOTARIZE=0
 
+# Same reason as the cert check below: make_scripts is not reached until after the build,
+# so without this a missing template costs the whole build before failing.
+PREINSTALL_IN=packaging/macos/preinstall.in
+if [ ! -f "$PREINSTALL_IN" ]; then
+    echo "ERROR: $PREINSTALL_IN is missing — it is the body of every component's preinstall."
+    exit 1
+fi
+
 # Fail on missing certs BEFORE the multi-minute build. Notarization requires a signed pkg,
 # so the Installer cert is a hard requirement unless --no-notarize.
 SIGN_PKG=1
@@ -173,59 +181,12 @@ make_scripts() { # $1 pkg suffix  $2 plug-in subdir  $3 bundle name  $4 1 = clea
         printf 'SUBDIR=%s\n' "$2"
         printf 'BUNDLE=%s\n' "$3"
         printf 'CLEAR_AU_CACHE=%s\n' "${4:-0}"
-        cat <<'SWEEP'
-# ConjureAlign preinstall — remove stale copies of THIS format, then let the
-# payload install. Runs as root, out of installd.
-#
-# No `set -e` and an unconditional `exit 0`: a non-zero preinstall aborts the
-# whole installation, and nothing in a best-effort sweep is worth failing an
-# install over. No `set -u` either, for the same reason — but that means the
-# guards in sweep() below are load-bearing rather than decorative, since an
-# empty $SUBDIR/$BUNDLE would turn the rm into one that takes every plug-in on
-# the machine with it.
-#
-# $3 is the destination volume ("/" for the boot disk). enable_localSystem does
-# not pin the install to the boot volume — the user can still pick another under
-# Change Install Location — so every path is built from it.
-VOL=${3:-/}
-[ "$VOL" = "/" ] && VOL=""
-
-sweep() { # $1 = a Plug-Ins root
-    # Never construct a path from an empty component...
-    [ -n "$SUBDIR" ] && [ -n "$BUNDLE" ] || return 0
-    # ...and never delete anything that is not ours by name.
-    case "$BUNDLE" in ConjureAlign.*) ;; *) return 0 ;; esac
-    t="$1/$SUBDIR/$BUNDLE"
-    if [ -e "$t" ] || [ -L "$t" ]; then
-        # Goes to /var/log/install.log: silent to the user, greppable in support.
-        echo "ConjureAlign: removing stale $t"
-        rm -rf "$t" 2>/dev/null
-    fi
-}
-
-sweep "$VOL/Library/Audio/Plug-Ins"
-
-# Every real user's home. As root $HOME is /var/root and ~ is useless, so ask
-# the directory service. `_`-prefixed accounts are macOS service accounts; a
-# home outside /Users is a network or mobile account that is not ours to reach
-# into. `read -r u h` rather than `awk '{print $2}'` keeps a home directory
-# containing a space in one piece. Note dscl reads the BOOTED system's
-# directory, not $3's — correct for a normal install, wrong for one onto a
-# non-boot volume, which is a tradeoff rather than a bug worth code.
-#
-# KEEP IN SYNC with user_homes() in scripts/uninstall-macos.sh.
-dscl . -list /Users NFSHomeDirectory 2>/dev/null | while read -r u h; do
-    case "$u" in _*|"") continue ;; esac
-    case "$h" in /Users/*) ;; *) continue ;; esac
-    sweep "$VOL$h/Library/Audio/Plug-Ins"
-    # AU package only: a cache entry surviving a component we just deleted is
-    # exactly how Logic keeps listing a plug-in that is gone. It is a cache —
-    # the cost of clearing it is one slower plug-in scan.
-    [ "$CLEAR_AU_CACHE" = 1 ] && rm -rf "$VOL$h/Library/Caches/AudioUnitCache"
-done
-
-exit 0
-SWEEP
+        # The body lives in packaging/macos/preinstall.in rather than in a
+        # heredoc here so it can be exercised without running this script —
+        # which refuses to run from a worktree, and which signs and notarizes.
+        # tests/macos_packaging.rs stamps the same three variables onto the same
+        # file, so what the test drives is what ships.
+        cat "$PREINSTALL_IN"
     } > "$dir/preinstall"
     chmod +x "$dir/preinstall"
 }
