@@ -37,7 +37,8 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
 - Install locally (macOS): copy bundles to `~/Library/Audio/Plug-Ins/CLAP/`,
   `~/Library/Audio/Plug-Ins/VST3/` and `~/Library/Audio/Plug-Ins/Components/`
   (the AU must live in one of the two `Components` directories; nowhere else works)
-- Unit + integration tests (pure DSP + GUI decimation, no plugin host involved):
+- Unit + integration tests (pure DSP + GUI decimation + the macOS packaging scripts, no
+  plugin host involved):
   `cargo test --release` (release mode: the analysis tests run multi-second captures)
 - Lint: `cargo clippy --all-targets` (and `--features gui-preview,standalone` to cover the
   dev-only targets)
@@ -108,7 +109,11 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   so it must be the FIRST argument.
   - Each format package carries a **`preinstall` that sweeps its own format** out of
     `/Library` and every real user's `~/Library` before its payload lands (generated once by
-    `make_scripts`, which stamps `SUBDIR`/`BUNDLE`/`CLEAR_AU_CACHE` onto one shared body).
+    `make_scripts`, which stamps `SUBDIR`/`BUNDLE`/`CLEAR_AU_CACHE` onto one shared body,
+    `packaging/macos/preinstall.in`). That body lives in a file rather than a heredoc so
+    `tests/macos_packaging.rs` can stamp the same three variables onto the same template —
+    `release.sh` refuses to run from a worktree and signs and notarizes, so a test could not
+    otherwise drive what actually ships.
     `BundleIsRelocatable=false` stops Installer *redirecting* onto a hand-installed
     `~/Library` copy but cannot remove it, and that shadow copy is the classic "my update
     didn't take" bug. Per-format, not one global sweep package: a component's own preinstall
@@ -129,12 +134,20 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
     installation), so it runs with neither `set -e` nor `set -u` and always `exit 0`. That
     makes its two guards load-bearing rather than decorative: it refuses an empty
     `$SUBDIR`/`$BUNDLE` (which would turn the `rm -rf` into one that takes every plug-in on
-    the machine) and refuses any `BUNDLE` not named `ConjureAlign.*`. Test it without
-    installing anything: build a plug-in tree under a scratch directory, pass that directory
-    as `$3`, and check that only the matching format disappears while the other two formats,
+    the machine) and refuses any `BUNDLE` not named `ConjureAlign.*`. **`tests/macos_packaging.rs`
+    covers all of this** — it builds a plug-in tree under a scratch directory, passes it as
+    `$3`, and checks that only the matching format disappears while the other two formats,
     another vendor's bundle, and (for non-AU packages) the AU cache all survive. Honouring
     `$3` is what makes that possible — and it is also required for real, since
     `enable_localSystem` still lets the user pick a non-boot volume.
+    Two things that test knows and a reader should not have to rediscover. The emptiness
+    guard is only *independently* observable through `$SUBDIR`: an empty `$BUNDLE` is also
+    rejected by the `ConjureAlign.*` name guard below it, so that half only bites when both
+    are gone — which is the point of having two. And an empty `$SUBDIR` collapses
+    `"$1/$SUBDIR/$BUNDLE"` to `"$1//ConjureAlign.vst3"`, whose doubled slash resolves, so
+    the guard is what stands between a mis-stamp and deleting a bundle sitting directly
+    under `Plug-Ins`. Every guard in both scripts was verified by mutation (2026-09-02):
+    break it, and exactly one test goes red.
   - A fourth, hidden component installs `/Applications/ConjureDSP/Uninstall
     ConjureAlign.command` (`scripts/uninstall-macos.sh`). It is `visible="false"
     start_selected="true" start_enabled="false"` — always installed, never a checkbox,
@@ -160,6 +173,19 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
     truncated file. `/Applications/ConjureDSP` is removed with `rmdir`, never `rm -rf` — it
     is shared with the other ConjureDSP products — and only the `ConjureAlign` child of
     `~/Library/Application Support/ConjureDSP` is ever deleted, for the same reason.
+    `tests/macos_packaging.rs` pins those three, plus the `case "$SELF" in "$INSTALL_DIR"/*)`
+    guard that stops a source-checkout run deleting the checkout's own copy. Unlike the
+    sweep, this script takes no destination volume — every path is an absolute constant — so
+    the test drives a copy with those roots rebased onto a scratch tree, behind `PATH` stubs
+    for `sudo`/`dscl`/`pkgutil`/`killall`. A rebased copy only tests something while the
+    rebase still matches, so each replacement asserts it found exactly one occurrence:
+    rename a constant and the test fails loudly instead of testing a script nobody ships.
+  - The user-home enumeration is duplicated between the preinstall sweep and the
+    uninstaller's `user_homes()`, and both carry a `KEEP IN SYNC` comment. That is now
+    mechanical: the two are not textually identical (one falls through to a sweep, the other
+    prints), so the test asserts the thing that must actually match — given identical `dscl`
+    output, both select the same set of homes. Same idea as the receipt-id guard in
+    `release.sh` and the uninstall GUID duplicated into `windows.yml`.
 - Toolchain: stable Rust. nih_plug is a git dependency (not on crates.io); Cargo.lock pins the
   rev — but the `nih_plug` crate itself is `[patch]`ed onto the vendored copy at
   `deps/nih-plug` (teardown fixes for the shared background worker; see Known upstream issues
