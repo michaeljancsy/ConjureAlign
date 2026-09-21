@@ -933,6 +933,17 @@ all verified against the vendored sources, none worth patching for us:
   reached later, through `select()` + `setupAudioBusses()`, which sets every element's channel
   count explicitly — that is what stops the missing re-apply from biting. It would bite if
   layout 0 were ever mono or >2 channels.
+- `auval` warns `Can Initialize Unit to un-supported num channels:InputChan:1, OutputChan:2`
+  — it found the unit will also initialize to a 1-in/2-out configuration, which is not one of
+  the declared `[2, 2]`/`[1, 1]` rows of our `AUChannelInfo` matrix. Harmless: it stems from
+  clap-wrapper's `ValidFormat` not rejecting an input/output channel-count *mismatch* that the
+  declared `AUChannelInfo` does not cover — the local patch enumerates every config into the
+  matrix and accepts their formats (see the AudioUnit v2 section and `deps/PATCHES.md`), but
+  does not reject an unlisted in/out pairing. Logic only ever instantiates matching in/out —
+  mono→1-1, stereo→2-2 — so the un-declared config is never reached in practice. A known
+  clap-wrapper validation gap, not a local bug; the deeper fix would tighten `ValidFormat` in
+  `deps/clap-wrapper-rs` to reject in/out channel-count mismatches, but that touches the
+  load-bearing AU validation path and buys nothing for a config no host ever requests.
 - `SaveState`/`RestoreState` both early-return `kAudioUnitErr_Uninitialized` when
   `!IsInitialized()` (upstream issue #490; the guards are still present on every branch).
   If a Logic project ever fails to restore the detected offset, this is the first suspect —
@@ -940,6 +951,11 @@ all verified against the vendored sources, none worth patching for us:
   dependency, so an edit there rebuilds. (Upstream's `CLAP_WRAPPER_CPP_DIR` hook would be the
   tidier route, but it landed after 0.3.1 and the vendored `build.rs` ignores the variable —
   see `deps/PATCHES.md`.)
+- `auval` warns `Preset name is not retained in retrieved class data` — the AU's
+  current-preset *name* does not survive a `SaveState`/`RestoreState` round trip, part of the
+  same clap-wrapper AUv2 state handling as the issue-#490 guard above. Cosmetic here:
+  ConjureAlign ships no factory presets, and the detected offset (the only state that matters)
+  rides nih-plug's own persisted state, so no user-visible preset name is ever lost.
 - `auval` warns `AU implements MusicDeviceMIDIEvent but is of type 'aufx'`. Cosmetic:
   clap-wrapper registers every AU type through `AUSDK_COMPONENT_ENTRY(AUMusicDeviceFactory,
   …)`. Validation still succeeds.
