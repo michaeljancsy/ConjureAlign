@@ -52,8 +52,19 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config = bundler_config()?;
     let auv2_packages = auv2_packages(&args, &config);
+    // Computed before the call below, which takes `args` by value.
+    let bundled_packages = bundled_packages(&args);
 
     nih_plug_xtask::main_with_args("cargo xtask", args)?;
+
+    // nih_plug_xtask hardcodes `CFBundleShortVersionString`/`CFBundleVersion` to "1.0.0" in
+    // the CLAP and VST3 bundles' Info.plist (it never reads the crate version), so the shipped
+    // macOS CLAP/VST3 bundles all reported 1.0.0 while only the AU — whose plist we write
+    // ourselves below — was correct. Rewrite those two fields to the crate version. A no-op on
+    // any build that produced no such Info.plist (a non-macOS compilation target writes none).
+    for package in &bundled_packages {
+        set_bundle_versions(package, &config)?;
+    }
 
     for package in &auv2_packages {
         bundle_auv2(package, &config[package])?;
@@ -98,6 +109,22 @@ fn auv2_packages(args: &[String], config: &HashMap<String, PackageConfig>) -> Ve
                 .unwrap_or(false)
         })
         .collect()
+}
+
+/// The packages nih_plug_xtask just bundled, whose CLAP/VST3 Info.plist version we then
+/// correct. Only for the bundling commands, but — unlike the AU step — every selected package,
+/// since the version fix applies whether or not a package declares an `auv2` table. Not host-
+/// or target-gated: `set_bundle_versions` skips any format that produced no Info.plist, so this
+/// is a clean no-op on non-macOS builds (and on a macOS→Windows cross-compile) without a `cfg`.
+fn bundled_packages(args: &[String]) -> Vec<String> {
+    if !matches!(
+        args.first().map(String::as_str),
+        Some("bundle") | Some("bundle-universal")
+    ) {
+        return Vec::new();
+    }
+
+    selected_packages(args)
 }
 
 fn cross_compile_target(args: &[String]) -> Option<&str> {
@@ -192,6 +219,90 @@ fn bundle_auv2(package: &str, config: &PackageConfig) -> Result<()> {
     eprintln!("Created an AUv2 bundle at '{}'", home.display());
 
     Ok(())
+}
+
+/// Rewrite `CFBundleShortVersionString` and `CFBundleVersion` in the CLAP and VST3 bundles'
+/// Info.plist to the crate version, since nih_plug_xtask writes both as a hardcoded "1.0.0".
+/// `version` is built from the same `major.minor.patch` `bundle_auv2` uses, so all three macOS
+/// bundles report an identical short version. `CFBundleIdentifier` (`com.nih-plug.<package>`)
+/// is deliberately NOT touched — a host keys on it, so it must stay stable across versions.
+fn set_bundle_versions(package: &str, config: &HashMap<String, PackageConfig>) -> Result<()> {
+    let bundle_name = config
+        .get(package)
+        .and_then(|c| c.name.clone())
+        .unwrap_or_else(|| package.to_owned());
+
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path("./Cargo.toml")
+        .no_deps()
+        .exec()
+        .context("Could not parse `cargo-metadata`")?;
+    let version = &metadata
+        .packages
+        .iter()
+        .find(|p| p.name == package)
+        .with_context(|| format!("No package named '{package}' in this workspace"))?
+        .version;
+    let version = format!("{}.{}.{}", version.major, version.minor, version.patch);
+    let bundled = metadata.target_directory.as_std_path().join("bundled");
+
+    for ext in ["clap", "vst3"] {
+        let plist = bundled
+            .join(format!("{bundle_name}.{ext}"))
+            .join("Contents/Info.plist");
+        // This build may not have produced this format's macOS bundle at all — a non-macOS
+        // compilation target writes no Info.plist. Skip it rather than fail.
+        if !plist.is_file() {
+            continue;
+        }
+
+        let original = fs::read_to_string(&plist)
+            .with_context(|| format!("Could not read '{}'", plist.display()))?;
+        let rewritten = set_plist_version(&original, &version);
+        if rewritten != original {
+            fs::write(&plist, &rewritten)
+                .with_context(|| format!("Could not write '{}'", plist.display()))?;
+            eprintln!(
+                "Set the {ext} bundle version to {version} in '{}'",
+                plist.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Set both version keys in a plist to `version`. Split out from IO so it is unit-testable.
+fn set_plist_version(plist: &str, version: &str) -> String {
+    let out = replace_plist_string(plist, "CFBundleShortVersionString", version);
+    replace_plist_string(&out, "CFBundleVersion", version)
+}
+
+/// Replace the `<string>…</string>` value that immediately follows `<key>NAME</key>`, leaving
+/// everything else — including any identical-looking value elsewhere in the document, and the
+/// surrounding whitespace — byte-for-byte untouched. Returns the text unchanged if the key, or
+/// a `<string>` after it, is absent. The `</key>` in the search tag makes the key match exact,
+/// so `CFBundleVersion` never matches a longer `CFBundleVersion…` key.
+fn replace_plist_string(plist: &str, key: &str, value: &str) -> String {
+    let key_tag = format!("<key>{key}</key>");
+    let Some(key_pos) = plist.find(&key_tag) else {
+        return plist.to_owned();
+    };
+    let after_key = key_pos + key_tag.len();
+    let Some(rel_open) = plist[after_key..].find("<string>") else {
+        return plist.to_owned();
+    };
+    let open = after_key + rel_open + "<string>".len();
+    let Some(rel_close) = plist[open..].find("</string>") else {
+        return plist.to_owned();
+    };
+    let close = open + rel_close;
+
+    let mut out = String::with_capacity(plist.len() + value.len());
+    out.push_str(&plist[..open]);
+    out.push_str(value);
+    out.push_str(&plist[close..]);
+    out
 }
 
 /// The Info.plist below names `GetPluginFactoryAUV2` as the AU entry point, and nothing else
@@ -394,4 +505,61 @@ fn info_plist(
 </plist>
 "#
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A representative slice of the Info.plist nih_plug_xtask writes: both version keys at the
+    /// hardcoded "1.0.0", the `com.nih-plug.*` identifier that must NOT change, and an unrelated
+    /// "1.0.0" (`CFBundleInfoDictionaryVersion`) that must survive.
+    const SAMPLE: &str = "\
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.nih-plug.conjure_align</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>1.0.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+</dict>";
+
+    #[test]
+    fn set_plist_version_rewrites_only_the_two_version_values() {
+        let out = set_plist_version(SAMPLE, "1.3.0");
+
+        // Both version fields are updated, with their surrounding whitespace preserved.
+        assert!(out.contains("<key>CFBundleShortVersionString</key>\n    <string>1.3.0</string>"));
+        assert!(out.contains("<key>CFBundleVersion</key>\n    <string>1.3.0</string>"));
+        // The identifier is byte-for-byte untouched — a host keys on it across versions.
+        assert!(out.contains("<string>com.nih-plug.conjure_align</string>"));
+        // The unrelated 1.0.0 (an InfoDictionary version, not a plugin version) survives; it is
+        // now the only "1.0.0" left in the document.
+        assert!(out.contains("<key>CFBundleInfoDictionaryVersion</key>\n    <string>1.0.0</string>"));
+        assert_eq!(out.matches("1.0.0").count(), 1);
+    }
+
+    #[test]
+    fn replace_plist_string_is_a_noop_when_the_key_is_absent() {
+        // A build that produced a plist without one of the keys must be left exactly as-is
+        // rather than corrupted or panicked on.
+        let input = "<key>Other</key>\n<string>x</string>";
+        assert_eq!(
+            replace_plist_string(input, "CFBundleVersion", "9.9.9"),
+            input
+        );
+    }
+
+    #[test]
+    fn replace_plist_string_does_not_match_a_longer_key_name() {
+        // `<key>CFBundleVersion</key>` must not be found inside `CFBundleVersionExtra`; the
+        // closing `</key>` in the search tag is what makes the match exact.
+        let input = "<key>CFBundleVersionExtra</key>\n<string>keep</string>";
+        assert_eq!(
+            replace_plist_string(input, "CFBundleVersion", "9.9.9"),
+            input
+        );
+    }
 }
