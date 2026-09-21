@@ -903,7 +903,7 @@ THE HOST when the editor window opens: AppKit now attaches the view before it ha
 and `msg_send![nil, isKeyWindow]` trips rustc's inserted null check. Fixed upstream one
 commit after `9a0b42c` (RustAudio/baseview#204, rev `3e12973`); Cargo.toml carries a
 `[patch."https://github.com/RustAudio/baseview.git"]` pointing at the
-`michaeljancsy/baseview` fork's `magnify-as-ctrl-scroll` branch, which is that fix PLUS TWO
+`michaeljancsy/baseview` fork's `magnify-as-ctrl-scroll` branch, which is that fix PLUS THREE
 LOCAL COMMITS. (1) Stock baseview registers no `magnifyWithEvent:` handler, so macOS
 trackpad pinches produce no events at all in the editor — the commit re-encodes them
 as ctrl-scroll `WheelScrolled` events (K = 200 calibrates to egui's default scroll-zoom
@@ -913,10 +913,16 @@ makes pinch-zoom work in every host. (2) The view claims first responder on `mou
 delivers every key but hands all of them EXCEPT ←/→ up the responder chain as well —
 egui-baseview answers every event `Captured`, so without that the host would lose its own
 key commands — and never delivers Cmd at all, which is what pins zoom to Ctrl/pinch.
+(3) `mouseDown:` emits a `CursorMoved` from the click location before the `ButtonPressed`:
+egui-baseview latches the pointer position solely from `CursorMoved` and drops a click
+outright while it has never seen one, so the FIRST click on a freshly opened, unfocused
+editor (Logic again — it never volunteers focus, and `mouseEntered:` alone does not set the
+position) was silently swallowed until the mouse moved — the "Capture needs two clicks" bug.
 See deps/PATCHES.md. Do NOT remove the patch when
-nih-plug/egui-baseview advance past the #204 fix — REBASE both commits onto the new
+nih-plug/egui-baseview advance past the #204 fix — REBASE all three commits onto the new
 rev instead (without #204 the editor crashes every host on current macOS; without the
-magnify commit pinch silently dies; without the focus commit ←/→ are dead in Logic). Beware when pushing to the fork: its GitHub refs
+magnify commit pinch silently dies; without the focus commit ←/→ are dead in Logic; without
+the click-position commit the first click on the editor is dropped in Logic). Beware when pushing to the fork: its GitHub refs
 predate the pinned revs (objects resolve via the fork network), so pushing a branch uploads
 upstream history that touches `.github/workflows/` and needs a gh token with the `workflow`
 scope. The AU path is the likeliest of the three to trip the null-deref: clap-wrapper's

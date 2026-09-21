@@ -164,7 +164,7 @@ element format is stereo and matches our layout-0 ports).
 `[patch."https://github.com/RustAudio/baseview.git"]` points at
 `michaeljancsy/baseview`, branch `magnify-as-ctrl-scroll`. That branch is
 upstream's RustAudio/baseview#204 null-deref fix (`3e12973`, the rev the fork originally
-pinned unmodified) **plus two commits**:
+pinned unmodified) **plus three commits**:
 
 ## The patch: deliver macOS trackpad pinches at all
 
@@ -217,7 +217,30 @@ the symptom is host-dependent and modifier-dependent at once.
 Both 2 and 3 are policy this plugin gets to set because it owns the fork; neither belongs
 upstream as an unconditional default.
 
-**Maintenance.** When nih-plug/egui-baseview move past `3e12973`, rebase both commits
+## The third patch: land the first click on the editor
+
+**Problem.** `MouseEvent::ButtonPressed` carries no cursor position; egui-baseview latches
+the pointer position solely from `MouseEvent::CursorMoved` (`pointer_pos_in_points`,
+window.rs) and **drops a pointer button event entirely while that position is still `None`**
+(`if let Some(pos) = self.pointer_pos_in_points`). A freshly opened view starts at `None`,
+and `mouseEntered:` (which baseview maps to `CursorEntered`) does not set it — egui-baseview
+ignores `CursorEntered`. So the first click that lands on a control *without the mouse first
+moving inside the view* is silently swallowed. It bites hardest in Logic Pro, which keeps key
+focus on its own windows, so the plugin editor is unfocused and users click a control (the
+Capture button, most visibly) with no prior move: the click does nothing until they nudge the
+mouse and click again — the "Capture needs two clicks" report. It is not focus-specific; the
+missing position is the whole cause, and it affects every control on first interaction.
+
+**Fix.** One added block at the top of `mouse_down` in `src/macos/view.rs`: compute the click
+location the same way `mouse_moved` does (`NSEvent::locationInWindow` +
+`convertPoint:fromView:nil`) and emit a `CursorMoved` **before** the `ButtonPressed`, so
+egui-baseview always has a fresh position for the press and no click is ever dropped. An extra
+`CursorMoved` at the exact click point is what a real move would have produced anyway, so it
+is inert for consumers that already track the pointer. Left-button `mouse_down` is the handler
+users hit; the macro-generated right/other button handlers are left as-is (egui reuses the
+last position for those, and no control depends on a right/middle first-click).
+
+**Maintenance.** When nih-plug/egui-baseview move past `3e12973`, rebase all three commits
 onto the new upstream rev and update the `[patch]` rev — do not drop the fork. Note the
 fork's GitHub refs are years older than the pinned revs (the objects resolve via GitHub's
 fork network), so pushing any branch based on modern upstream uploads history touching
