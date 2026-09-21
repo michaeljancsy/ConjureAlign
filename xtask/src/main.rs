@@ -281,19 +281,27 @@ fn set_plist_version(plist: &str, version: &str) -> String {
 /// Replace the `<string>…</string>` value that immediately follows `<key>NAME</key>`, leaving
 /// everything else — including any identical-looking value elsewhere in the document, and the
 /// surrounding whitespace — byte-for-byte untouched. Returns the text unchanged if the key, or
-/// a `<string>` after it, is absent. The `</key>` in the search tag makes the key match exact,
-/// so `CFBundleVersion` never matches a longer `CFBundleVersion…` key.
+/// a `<string>` value belonging to it, is absent. The `</key>` in the search tag makes the key
+/// match exact, so `CFBundleVersion` never matches a longer `CFBundleVersion…` key.
+///
+/// The `<string>` search is bounded to before the *next* `<key>`, so a key whose value is not a
+/// string (e.g. `<key>CFBundleVersion</key><true/>`), or with no value at all, can never reach
+/// forward and rewrite a different key's value.
 fn replace_plist_string(plist: &str, key: &str, value: &str) -> String {
     let key_tag = format!("<key>{key}</key>");
     let Some(key_pos) = plist.find(&key_tag) else {
         return plist.to_owned();
     };
     let after_key = key_pos + key_tag.len();
-    let Some(rel_open) = plist[after_key..].find("<string>") else {
+    // This key's own value ends where the next key begins (or at the end of the document).
+    let value_end = plist[after_key..]
+        .find("<key>")
+        .map_or(plist.len(), |rel| after_key + rel);
+    let Some(rel_open) = plist[after_key..value_end].find("<string>") else {
         return plist.to_owned();
     };
     let open = after_key + rel_open + "<string>".len();
-    let Some(rel_close) = plist[open..].find("</string>") else {
+    let Some(rel_close) = plist[open..value_end].find("</string>") else {
         return plist.to_owned();
     };
     let close = open + rel_close;
@@ -557,6 +565,18 @@ mod tests {
         // `<key>CFBundleVersion</key>` must not be found inside `CFBundleVersionExtra`; the
         // closing `</key>` in the search tag is what makes the match exact.
         let input = "<key>CFBundleVersionExtra</key>\n<string>keep</string>";
+        assert_eq!(
+            replace_plist_string(input, "CFBundleVersion", "9.9.9"),
+            input
+        );
+    }
+
+    #[test]
+    fn replace_plist_string_does_not_reach_past_the_next_key() {
+        // The target key exists but has no `<string>` value of its own (here a boolean); a
+        // *later* key does. The search is bounded to before the next `<key>`, so the later
+        // key's value must be left untouched rather than rewritten.
+        let input = "<key>CFBundleVersion</key>\n<true/>\n<key>Other</key>\n<string>keep</string>";
         assert_eq!(
             replace_plist_string(input, "CFBundleVersion", "9.9.9"),
             input
