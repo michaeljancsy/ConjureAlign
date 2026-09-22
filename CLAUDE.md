@@ -27,6 +27,14 @@ a bottom panel (control bar, sizes itself) plus a central panel (the graphs, tak
 what is left); panels are handed a TOTAL height and subtract their own measured header
 row, so nothing budgets a guessed height and no dead space collects at the window bottom.
 
+Every glyph in an editor string literal must exist in egui's bundled fonts — Ubuntu-Light,
+Noto Emoji and emoji-icon-font, consulted in that order — because egui paints a missing one
+as the ◻ replacement box and says nothing: the status strip's "●" phase marker and Cancel's
+"✕" shipped as boxes in 1.3.0. They are now "⏺" and "✖", drawn from the same two fonts as
+the ⏺/⏹ button icons, so they match those in weight. The unit test
+`editor::tests::label_glyphs_exist_in_egui_default_fonts` scans `src/editor/*.rs` (comments
+stripped) for exactly that, so a glyph the fonts lack fails `cargo test`, not a screenshot.
+
 ## Commands
 
 - Build + bundle (debug): `cargo xtask bundle conjure_align`
@@ -247,7 +255,7 @@ edge, when 4 s of accumulated signal fills the buffer, or automatically once sig
 recorded and the gate has stayed closed for `CAPTURE_AUTO_FINISH_SECONDS` (2 s; ≈2.8 s of
 real silence including the gate's release+hold) — so playing a short clip once analyzes by
 itself instead of pausing forever. Armed never times out (an off-edge after any auto-stop is
-a no-op). The editor renders an unconsumed `request` exactly like Armed (`● Armed — waiting
+a no-op). The editor renders an unconsumed `request` exactly like Armed (`⏺ Armed — waiting
 for playback`, Stop/Cancel up): `CaptureHandle::display_phase` folds it in as the
 display-only `PHASE_PENDING`, read ONCE per frame in `draw_ui` and threaded to the strip,
 the button and the overlay so no frame can show them disagreeing. Arming happens on the
@@ -1018,7 +1026,7 @@ main checkout, plain `cargo xtask bundle` is fine.
   Logic does not run a stopped audio track's `process()` until it has played once
   (input-monitoring — the `I` button — or record-enabled tracks always process; after one
   playback it kept processing for at least a minute), so a Capture click made before Play
-  shows `● Armed — waiting for playback` and arms for real on Play — expected, not a
+  shows `⏺ Armed — waiting for playback` and arms for real on Play — expected, not a
   dropped click (and the reason the phase machine can freeze mid-capture when Logic is
   stopped; Cancel is the escape hatch).
 - Null test recipe: duplicate a track, nudge the copy by a known amount (track delay or clip
