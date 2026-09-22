@@ -258,8 +258,8 @@ impl Overlay {
 #[derive(Clone, Copy)]
 enum CaptureScene {
     Idle,
-    /// A Capture click the audio thread has not consumed yet (the host is not
-    /// processing): the strip must read as armed, not idle.
+    /// A Capture click the audio thread has not consumed yet (see
+    /// `CaptureState::request`): the strip must read as armed, not idle.
     Pending,
     /// Gate open, 2.3 s of 4 s recorded.
     Capturing,
@@ -309,23 +309,27 @@ fn render_full(
     shared.set_window(960, snapshot.sample_rate);
     shared.snapshot.store(Some(snapshot.clone()));
     let capture_state = Arc::new(CaptureState::new());
-    if matches!(scene, CaptureScene::Pending) {
-        capture_state
-            .request
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    } else if !matches!(scene, CaptureScene::Idle) {
+    {
         use std::sync::atomic::Ordering::Relaxed;
         let sr = snapshot.sample_rate;
-        capture_state.phase.store(PHASE_CAPTURING, Relaxed);
-        capture_state.progress.store((2.3 * sr) as u32, Relaxed);
-        capture_state.target.store((4.0 * sr) as u32, Relaxed);
-        capture_state.gate_state.store(
-            match scene {
-                CaptureScene::CapturingPaused => GATE_REF_QUIET,
-                _ => GATE_OPEN,
-            },
-            Relaxed,
-        );
+        match scene {
+            CaptureScene::Idle => {}
+            // The real click path: the request set, the phase untouched.
+            CaptureScene::Pending => capture_state.handle().request_capture(),
+            CaptureScene::Capturing | CaptureScene::CapturingPaused => {
+                capture_state.phase.store(PHASE_CAPTURING, Relaxed);
+                capture_state.progress.store((2.3 * sr) as u32, Relaxed);
+                capture_state.target.store((4.0 * sr) as u32, Relaxed);
+                capture_state.gate_state.store(
+                    if matches!(scene, CaptureScene::CapturingPaused) {
+                        GATE_REF_QUIET
+                    } else {
+                        GATE_OPEN
+                    },
+                    Relaxed,
+                );
+            }
+        }
     }
     let capture = capture_state.handle();
     let updates = Arc::new(conjure_align::update::UpdateHandle::new());

@@ -23,8 +23,8 @@ use crate::shared::AnalysisSnapshot;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CaptureOverlay {
     Idle,
-    /// A GUI capture request the audio thread has not consumed yet: the host
-    /// is not processing (Logic on a stopped track), so arming waits for Play.
+    /// A capture request the audio thread has not consumed yet (see
+    /// `CaptureState::request`): armed, waiting for the host to process.
     Pending,
     Armed {
         main_quiet: bool,
@@ -424,32 +424,21 @@ fn draw_time_grid(painter: &egui::Painter, rect: egui::Rect, view: &TimeView) {
 }
 
 fn draw_capture_overlay(painter: &egui::Painter, rect: egui::Rect, overlay: &CaptureOverlay) {
-    match *overlay {
-        CaptureOverlay::Idle => {}
-        CaptureOverlay::Pending => {
-            painter.text(
-                rect.center_top() + Vec2::new(0.0, 10.0),
-                Align2::CENTER_CENTER,
-                "Armed — waiting for playback",
-                FontId::proportional(12.0),
-                ACCENT_LIVE,
-            );
-        }
+    // One paint call fed by the match, so every state shares the anchor,
+    // font and size — Pending must be indistinguishable from Armed.
+    let (label, color) = match *overlay {
+        CaptureOverlay::Idle => return,
+        CaptureOverlay::Pending => (PENDING_LABEL.to_owned(), ACCENT_LIVE),
         CaptureOverlay::Armed {
             main_quiet,
             ref_quiet,
-        } => {
-            painter.text(
-                rect.center_top() + Vec2::new(0.0, 10.0),
-                Align2::CENTER_CENTER,
-                format!(
-                    "Armed — waiting for signal ({})",
-                    quiet_label(main_quiet, ref_quiet)
-                ),
-                FontId::proportional(12.0),
-                ACCENT_LIVE,
-            );
-        }
+        } => (
+            format!(
+                "Armed — waiting for signal ({})",
+                quiet_label(main_quiet, ref_quiet)
+            ),
+            ACCENT_LIVE,
+        ),
         CaptureOverlay::Capturing {
             frac,
             secs,
@@ -464,16 +453,22 @@ fn draw_capture_overlay(painter: &egui::Painter, rect: egui::Rect, overlay: &Cap
                 Some(reason) => format!("Capturing… {secs:.1} s (paused — {reason})"),
                 None => format!("Capturing… {secs:.1} s"),
             };
-            painter.text(
-                rect.center_top() + Vec2::new(0.0, 10.0),
-                Align2::CENTER_CENTER,
-                label,
-                FontId::proportional(12.0),
-                ACCENT_MAIN,
-            );
+            (label, ACCENT_MAIN)
         }
-    }
+    };
+    painter.text(
+        rect.center_top() + Vec2::new(0.0, 10.0),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(12.0),
+        color,
+    );
 }
+
+/// The overlay/strip text for a capture request the audio thread has not
+/// consumed yet (see `CaptureState::request`) — one definition, so the two
+/// surfaces cannot drift apart.
+pub(crate) const PENDING_LABEL: &str = "Armed — waiting for playback";
 
 /// Which input(s) are holding the gate shut, as display text.
 pub(crate) fn quiet_label(main_quiet: bool, ref_quiet: bool) -> &'static str {
