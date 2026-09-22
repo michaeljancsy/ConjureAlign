@@ -730,8 +730,11 @@ fn capture_button(ui: &mut egui::Ui, capture: &CaptureHandle, phase: u8) {
             {
                 capture.request_stop();
             }
+            // "✖" rather than "✕": the plain multiplication X has no glyph in
+            // egui's bundled fonts and paints as the ◻ replacement box (see
+            // `tests::label_glyphs_exist_in_egui_default_fonts`).
             if ui
-                .button("✕ Cancel")
+                .button("✖ Cancel")
                 .on_hover_text("Discard the capture in progress")
                 .clicked()
             {
@@ -1085,13 +1088,16 @@ fn status_strip(
                 // "…" stub of a later label) lands past the row's right
                 // edge, where the buttons already sit — clip it away.
                 ui.shrink_clip_rect(egui::Rect::everything_left_of(ui.max_rect().right()));
+                // The phase marker is "⏺" (a filled circle from egui's icon font),
+                // not "●", which no bundled font carries — it shipped as a ◻ box
+                // in 1.3.0. Pinned by `tests::label_glyphs_exist_in_egui_default_fonts`.
                 match capture.phase() {
                     PHASE_ARMED => {
                         let gate = capture.gate_state();
                         status_label(
                             ui,
                             egui::RichText::new(format!(
-                                "● Armed — waiting for signal ({})",
+                                "⏺ Armed — waiting for signal ({})",
                                 quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)
                             ))
                             .color(ACCENT_LIVE),
@@ -1106,7 +1112,7 @@ fn status_strip(
                             status_label(
                                 ui,
                                 egui::RichText::new(format!(
-                                    "● Capturing {secs:.1} s (paused — {}; analyzes after ~2 s of silence)",
+                                    "⏺ Capturing {secs:.1} s (paused — {}; analyzes after ~2 s of silence)",
                                     quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)
                                 ))
                                 .color(ACCENT_MAIN),
@@ -1114,17 +1120,17 @@ fn status_strip(
                         } else {
                             status_label(
                                 ui,
-                                egui::RichText::new(format!("● Capturing {secs:.1} s"))
+                                egui::RichText::new(format!("⏺ Capturing {secs:.1} s"))
                                     .color(ACCENT_MAIN),
                             );
                         }
                     }
                     PHASE_ANALYZING => {
-                        status_label(ui, egui::RichText::new("● Analyzing…").color(ACCENT_LIVE));
+                        status_label(ui, egui::RichText::new("⏺ Analyzing…").color(ACCENT_LIVE));
                         ui.spinner();
                     }
                     _ => {
-                        status_label(ui, egui::RichText::new("● Idle").color(TEXT_DIM));
+                        status_label(ui, egui::RichText::new("⏺ Idle").color(TEXT_DIM));
                     }
                 }
                 ui.separator();
@@ -1327,4 +1333,53 @@ fn snap_trim(ms: f64) -> f32 {
     }
     let clamped = ms.clamp(-TRIM_RANGE_MS as f64, TRIM_RANGE_MS as f64);
     ((clamped / 0.01).round() * 0.01) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every non-ASCII character in an editor string literal must have a
+    /// glyph in egui's bundled fonts — Ubuntu-Light, then Noto Emoji, then
+    /// emoji-icon-font, consulted in that order, which is all a plugin
+    /// editor ever gets. egui neither errors nor warns on a missing one: it
+    /// paints the ◻ replacement box, which is how the status strip's "●"
+    /// phase marker and the "✕" on Cancel shipped as boxes in 1.3.0.
+    /// Comments are skipped, since they name glyphs the fonts lack on
+    /// purpose (`gesture_legend`'s doc, this one). Every label here is
+    /// proportional, so that family is the one checked; monospace would
+    /// only add Hack in front of the same three.
+    #[test]
+    fn label_glyphs_exist_in_egui_default_fonts() {
+        let fonts = egui::text::Fonts::new(1.0, 2048, egui::FontDefinitions::default());
+        let font_id = egui::FontId::proportional(14.0);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/editor");
+        let mut files = 0;
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            files += 1;
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let source = std::fs::read_to_string(&path).unwrap();
+            for (i, line) in source.lines().enumerate() {
+                // Cutting at the first `//` also truncates a URL inside a
+                // literal, which can only skip a character, never flag one.
+                let code = line.split("//").next().unwrap_or_default();
+                for c in code.chars().filter(|c| !c.is_ascii()) {
+                    if !fonts.has_glyph(&font_id, c) {
+                        missing.push(format!("{name}:{}: {c:?} (U+{:04X})", i + 1, c as u32));
+                    }
+                }
+            }
+        }
+        assert!(files > 1, "no editor sources found under {}", dir.display());
+        assert!(
+            missing.is_empty(),
+            "characters that egui's bundled fonts render as a box:\n{}",
+            missing.join("\n")
+        );
+    }
 }

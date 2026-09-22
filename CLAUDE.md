@@ -27,6 +27,14 @@ a bottom panel (control bar, sizes itself) plus a central panel (the graphs, tak
 what is left); panels are handed a TOTAL height and subtract their own measured header
 row, so nothing budgets a guessed height and no dead space collects at the window bottom.
 
+Every glyph in an editor string literal must exist in egui's bundled fonts — Ubuntu-Light,
+Noto Emoji and emoji-icon-font, consulted in that order — because egui paints a missing one
+as the ◻ replacement box and says nothing: the status strip's "●" phase marker and Cancel's
+"✕" shipped as boxes in 1.3.0. They are now "⏺" and "✖", drawn from the same two fonts as
+the ⏺/⏹ button icons, so they match those in weight. The unit test
+`editor::tests::label_glyphs_exist_in_egui_default_fonts` scans `src/editor/*.rs` (comments
+stripped) for exactly that, so a glyph the fonts lack fails `cargo test`, not a screenshot.
+
 ## Commands
 
 - Build + bundle (debug): `cargo xtask bundle conjure_align`
