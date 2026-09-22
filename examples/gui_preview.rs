@@ -140,6 +140,16 @@ fn main() {
         Overlay::None,
         CaptureScene::Idle,
     );
+    // Scene 5a: a Capture click the audio thread has not consumed yet — what
+    // Logic shows with the transport stopped. Must read as armed (Stop/Cancel
+    // up, "waiting for playback"), never as idle.
+    render_full(
+        &out.replace(".png", "_pending.png"),
+        &snapshot,
+        detected_ms,
+        Overlay::None,
+        CaptureScene::Pending,
+    );
     // Scenes 5b/5c: the strip mid-capture, at the width where it is tightest —
     // the Stop/Cancel pair is wider than the idle Capture button, the phase
     // message is at its longest (the paused variant especially), and every
@@ -248,6 +258,9 @@ impl Overlay {
 #[derive(Clone, Copy)]
 enum CaptureScene {
     Idle,
+    /// A Capture click the audio thread has not consumed yet (the host is not
+    /// processing): the strip must read as armed, not idle.
+    Pending,
     /// Gate open, 2.3 s of 4 s recorded.
     Capturing,
     /// Gate closed on the reference: the longest message the strip ever shows.
@@ -296,7 +309,11 @@ fn render_full(
     shared.set_window(960, snapshot.sample_rate);
     shared.snapshot.store(Some(snapshot.clone()));
     let capture_state = Arc::new(CaptureState::new());
-    if !matches!(scene, CaptureScene::Idle) {
+    if matches!(scene, CaptureScene::Pending) {
+        capture_state
+            .request
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    } else if !matches!(scene, CaptureScene::Idle) {
         use std::sync::atomic::Ordering::Relaxed;
         let sr = snapshot.sample_rate;
         capture_state.phase.store(PHASE_CAPTURING, Relaxed);

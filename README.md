@@ -126,6 +126,9 @@ If you say no, or never open the plugin window, no check ever happens.
    signals, measures the offset by cross-correlation, and glides click-free onto the
    corrected alignment. The waveforms, correlation curve, detected offset, polarity, and
    confidence appear in the window, and the result is stored with your session.
+   Clicking Capture *before* pressing Play works too: the window shows **Armed — waiting
+   for playback** (some hosts, Logic Pro among them, don't run plugins on a stopped track)
+   and the capture starts as soon as playback does.
 5. To re-analyze, click Capture again (or toggle the parameter off and on).
 
 ### Parameters

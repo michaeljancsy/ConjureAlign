@@ -23,6 +23,9 @@ use crate::shared::AnalysisSnapshot;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CaptureOverlay {
     Idle,
+    /// A GUI capture request the audio thread has not consumed yet: the host
+    /// is not processing (Logic on a stopped track), so arming waits for Play.
+    Pending,
     Armed {
         main_quiet: bool,
         ref_quiet: bool,
@@ -423,6 +426,15 @@ fn draw_time_grid(painter: &egui::Painter, rect: egui::Rect, view: &TimeView) {
 fn draw_capture_overlay(painter: &egui::Painter, rect: egui::Rect, overlay: &CaptureOverlay) {
     match *overlay {
         CaptureOverlay::Idle => {}
+        CaptureOverlay::Pending => {
+            painter.text(
+                rect.center_top() + Vec2::new(0.0, 10.0),
+                Align2::CENTER_CENTER,
+                "Armed — waiting for playback",
+                FontId::proportional(12.0),
+                ACCENT_LIVE,
+            );
+        }
         CaptureOverlay::Armed {
             main_quiet,
             ref_quiet,

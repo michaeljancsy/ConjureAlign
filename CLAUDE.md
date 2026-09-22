@@ -47,7 +47,8 @@ row, so nothing budgets a guessed height and no dead space collects at the windo
   renderer: the panels alone (`gui_preview.png`, `_zoom`, `_spectrum`, `_spectrum_trim`)
   and — via a stub `GuiContext` behind a `ParamSetter` — the WHOLE editor at its 600×460
   minimum window (`_full.png`), which is the only scene that shows the vertical budget
-  (dead space under the control bar, a clipped bar); the same window mid-capture
+  (dead space under the control bar, a clipped bar); the same window with a Capture click
+  the audio thread has not consumed yet (`_pending.png`) and mid-capture
   (`_capturing.png`, `_capturing_paused.png`), which is the status strip at its tightest —
   Stop+Cancel up and the longest messages, where every label must elide at the button edge
   rather than paint through it; plus the floating surfaces that
@@ -246,7 +247,15 @@ edge, when 4 s of accumulated signal fills the buffer, or automatically once sig
 recorded and the gate has stayed closed for `CAPTURE_AUTO_FINISH_SECONDS` (2 s; ≈2.8 s of
 real silence including the gate's release+hold) — so playing a short clip once analyzes by
 itself instead of pausing forever. Armed never times out (an off-edge after any auto-stop is
-a no-op). Phase machine: Idle → Armed → Capturing → Analyzing → Idle, an `AtomicU8`; Armed
+a no-op). The editor renders an unconsumed `request` exactly like Armed (`● Armed — waiting
+for playback`, Stop/Cancel up, via `CaptureHandle::request_pending`): arming happens on the
+audio thread, and **Logic does not call `process()` on a stopped audio track** unless it is
+input-monitoring or record-enabled, so a Capture click made with the transport stopped
+showed nothing at all until Play — which users read as "Capture needs two clicks" (issue
+#42, diagnosed with a real trackpad 2026-09-21; synthetic clicks kept arming because that
+Logic session happened to be processing). Stop while pending cancels outright — a
+`stop_request` would be consumed only AFTER the `request` it was meant to stop, since
+`process()` resolves stops before starts. Phase machine: Idle → Armed → Capturing → Analyzing → Idle, an `AtomicU8`; Armed
 means nothing recorded yet, and every transition out of Armed/Capturing is a CAS so a GUI
 cancel always wins (`cancel_capture` tries ARMED→IDLE first — the phase only moves forward,
 so that order can't drop a cancel). The buffers live in an `AtomicRefCell`; the audio thread
@@ -994,7 +1003,11 @@ main checkout, plain `cargo xtask bundle` is fine.
   in the **Side Chain** menu at the top right of the plugin header — if the track is not
   listed, send it to a bus and pick the bus. Works on both mono and stereo tracks — if it
   is missing from the Audio FX menu, that is the first symptom of the channel-layout
-  problem the `deps/` patch fixes; see the AudioUnit v2 section.
+  problem the `deps/` patch fixes; see the AudioUnit v2 section. Logic runs a stopped audio
+  track's `process()` only while it is input-monitoring (the `I` button) or record-enabled,
+  so with the transport stopped a Capture click shows `● Armed — waiting for playback` and
+  the capture arms for real on Play — expected, not a dropped click (and the reason the
+  phase machine can freeze mid-capture when Logic is stopped; Cancel is the escape hatch).
 - Null test recipe: duplicate a track, nudge the copy by a known amount (track delay or clip
   nudge), sidechain the original into ConjureAlign on the copy, click Capture (or toggle the
   Capture parameter) and play — recording accumulates only while both inputs clear the Gate

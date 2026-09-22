@@ -58,6 +58,11 @@ pub struct CaptureState {
     /// a request that races a non-idle phase is simply dropped. `reset()`
     /// and `initialize()` also clear it, so a click made while the host
     /// wasn't processing can't fire a surprise capture when playback resumes.
+    /// While it is set the editor renders the capture as armed
+    /// ([`CaptureHandle::request_pending`]): Logic Pro does not run a
+    /// stopped audio track's `process()` unless the track is
+    /// input-monitoring, so without that the click showed nothing at all
+    /// until Play — the "Capture needs two clicks" report.
     pub request: AtomicBool,
     /// GUI stop request ("analyze what was recorded"); consumed by
     /// `process()` every block like `request`. Unlike cancel it cannot be
@@ -114,6 +119,15 @@ impl CaptureHandle {
 
     pub fn request_capture(&self) {
         self.0.request.store(true, Ordering::Release);
+    }
+
+    /// Whether a capture request is still waiting for the audio thread to
+    /// consume it. In a host that is processing that is a window of one
+    /// block; in one that is not (Logic with the transport stopped) it lasts
+    /// until playback starts, and the editor shows it as armed rather than
+    /// idle so the click is visibly honored.
+    pub fn request_pending(&self) -> bool {
+        self.0.request.load(Ordering::Acquire)
     }
 
     /// Requests a stop-and-analyze of the running capture; consumed by the

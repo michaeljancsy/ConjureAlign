@@ -327,7 +327,10 @@ pub fn create(
                 // is on that list for the same reason: its result arrives on
                 // the network worker, and without this the "Checking…" line
                 // would sit there until the user happened to move the mouse.
-                if capture.phase() != PHASE_IDLE || update::status() == update::Status::Checking {
+                if capture.phase() != PHASE_IDLE
+                    || capture.request_pending()
+                    || update::status() == update::Status::Checking
+                {
                     ctx.request_repaint();
                 }
             });
@@ -592,6 +595,7 @@ fn graphs(
                     .then(|| quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)),
             }
         }
+        PHASE_IDLE if capture.request_pending() => CaptureOverlay::Pending,
         _ => CaptureOverlay::Idle,
     };
     let flip_main = params.align_on.value()
@@ -743,6 +747,29 @@ fn capture_button(ui: &mut egui::Ui, capture: &CaptureHandle, phase: u8) {
                 false,
                 capture_toggle("⏺ Capture…", CAPTURE_GREEN, Color32::BLACK),
             );
+        }
+        // The click landed but the audio thread has not run since: the host
+        // is not processing (Logic leaves a stopped audio track alone unless
+        // it is input-monitoring). Show the same pair as Armed so the click
+        // is visibly honored. Stop cancels outright here — nothing is
+        // recorded, which is also what process() does with a Stop while
+        // Armed — because a `stop_request` would only be consumed AFTER the
+        // very request it was meant to stop.
+        PHASE_IDLE if capture.request_pending() => {
+            if ui
+                .add(capture_toggle("⏹ Stop", CAPTURE_RED, Color32::WHITE))
+                .on_hover_text("Nothing recorded yet — back to idle")
+                .clicked()
+            {
+                capture.cancel_capture();
+            }
+            if ui
+                .button("✕ Cancel")
+                .on_hover_text("Discard the pending capture")
+                .clicked()
+            {
+                capture.cancel_capture();
+            }
         }
         _ => {
             if ui
@@ -1122,6 +1149,14 @@ fn status_strip(
                     PHASE_ANALYZING => {
                         status_label(ui, egui::RichText::new("● Analyzing…").color(ACCENT_LIVE));
                         ui.spinner();
+                    }
+                    // Arming happens in process(); until the host runs it the
+                    // click would otherwise be invisible (see capture_button).
+                    PHASE_IDLE if capture.request_pending() => {
+                        status_label(
+                            ui,
+                            egui::RichText::new("● Armed — waiting for playback").color(ACCENT_LIVE),
+                        );
                     }
                     _ => {
                         status_label(ui, egui::RichText::new("● Idle").color(TEXT_DIM));
