@@ -55,7 +55,8 @@ stripped) for exactly that, so a glyph the fonts lack fails `cargo test`, not a 
   renderer: the panels alone (`gui_preview.png`, `_zoom`, `_spectrum`, `_spectrum_trim`)
   and — via a stub `GuiContext` behind a `ParamSetter` — the WHOLE editor at its 600×460
   minimum window (`_full.png`), which is the only scene that shows the vertical budget
-  (dead space under the control bar, a clipped bar); the same window mid-capture
+  (dead space under the control bar, a clipped bar); the same window with a Capture click
+  the audio thread has not consumed yet (`_pending.png`) and mid-capture
   (`_capturing.png`, `_capturing_paused.png`), which is the status strip at its tightest —
   Stop+Cancel up and the longest messages, where every label must elide at the button edge
   rather than paint through it; plus the floating surfaces that
@@ -254,7 +255,26 @@ edge, when 4 s of accumulated signal fills the buffer, or automatically once sig
 recorded and the gate has stayed closed for `CAPTURE_AUTO_FINISH_SECONDS` (2 s; ≈2.8 s of
 real silence including the gate's release+hold) — so playing a short clip once analyzes by
 itself instead of pausing forever. Armed never times out (an off-edge after any auto-stop is
-a no-op). Phase machine: Idle → Armed → Capturing → Analyzing → Idle, an `AtomicU8`; Armed
+a no-op). The editor renders an unconsumed `request` exactly like Armed (`⏺ Armed — waiting
+for playback`, Stop/Cancel up): `CaptureHandle::display_phase` folds it in as the
+display-only `PHASE_PENDING`, read ONCE per frame in `draw_ui` and threaded to the strip,
+the button and the overlay so no frame can show them disagreeing. Arming happens on the
+audio thread, and **in a freshly opened session Logic does not call `process()` on a
+stopped audio track until it has played once** (afterwards it kept processing for at least
+a minute; input-monitoring or record-enabled tracks always process), so a Capture click
+made before Play showed nothing at all until playback — which users read as "Capture needs
+two clicks" (issue #42, diagnosed with a real trackpad 2026-09-21; synthetic clicks kept
+arming because that Logic session had already played). Two consequences. `reset()` and
+`initialize()` KEEP the request, and `reset()` turns an Armed (nothing recorded) capture
+back into one: nih-plug runs `reset()` from VST3 `setProcessing(true)` / CLAP
+`start_processing`, which is how a host that suspends processing while idle (Cubase-style)
+reaches its first block after Play — clearing there would drop the capture the editor had
+just promised (AU never passes through it: clap-wrapper's `Start()`/`Stop()` are no-ops).
+And Stop while pending cancels outright — a `stop_request` would be consumed only AFTER
+the `request` it was meant to stop, since `process()` resolves stops before starts. The
+pending display covers the GUI request only: a `capture` param edge from the host's generic
+UI while stopped still reads Idle until the first block (the edge lives in `process()`'s
+`prev_capture`, and a session saved with Capture on must not show as pending). Phase machine: Idle → Armed → Capturing → Analyzing → Idle, an `AtomicU8`; Armed
 means nothing recorded yet, and every transition out of Armed/Capturing is a CAS so a GUI
 cancel always wins (`cancel_capture` tries ARMED→IDLE first — the phase only moves forward,
 so that order can't drop a cancel). The buffers live in an `AtomicRefCell`; the audio thread
@@ -293,8 +313,8 @@ are logged via `nih_log!` and shown in the editor's status strip.
 The editor NEVER touches `CaptureState::data` — the `AtomicRefCell` borrow discipline covers
 only the audio thread (Idle/Armed/Capturing) and the background task (Analyzing); a GUI
 borrow would panic the audio thread. Enforced by construction: the editor only receives a
-`CaptureHandle` (phase/progress/gate-state reads + capture/stop requests + cancel; cannot
-reach `data`). Waveform and correlation data reach the GUI exclusively through
+`CaptureHandle` (phase/display-phase/progress/gate-state reads + capture/stop requests +
+cancel; cannot reach `data`). Waveform and correlation data reach the GUI exclusively through
 `shared::AnalysisSnapshot` — full raw copies of the captures (un-zeroed; splice seam
 positions ride along for the waveform markers) plus the normalized correlation curve per
 integer lag, built by the
@@ -1002,7 +1022,13 @@ main checkout, plain `cargo xtask bundle` is fine.
   in the **Side Chain** menu at the top right of the plugin header — if the track is not
   listed, send it to a bus and pick the bus. Works on both mono and stereo tracks — if it
   is missing from the Audio FX menu, that is the first symptom of the channel-layout
-  problem the `deps/` patch fixes; see the AudioUnit v2 section.
+  problem the `deps/` patch fixes; see the AudioUnit v2 section. In a freshly opened session
+  Logic does not run a stopped audio track's `process()` until it has played once
+  (input-monitoring — the `I` button — or record-enabled tracks always process; after one
+  playback it kept processing for at least a minute), so a Capture click made before Play
+  shows `⏺ Armed — waiting for playback` and arms for real on Play — expected, not a
+  dropped click (and the reason the phase machine can freeze mid-capture when Logic is
+  stopped; Cancel is the escape hatch).
 - Null test recipe: duplicate a track, nudge the copy by a known amount (track delay or clip
   nudge), sidechain the original into ConjureAlign on the copy, click Capture (or toggle the
   Capture parameter) and play — recording accumulates only while both inputs clear the Gate

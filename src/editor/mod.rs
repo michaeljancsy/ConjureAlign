@@ -32,7 +32,7 @@ use crate::analysis::{RejectReason, CONFIDENCE_THRESHOLD};
 use crate::analytics;
 use crate::capture::{
     CaptureHandle, GATE_MAIN_QUIET, GATE_OPEN, GATE_REF_QUIET, PHASE_ANALYZING, PHASE_ARMED,
-    PHASE_CAPTURING, PHASE_IDLE,
+    PHASE_CAPTURING, PHASE_IDLE, PHASE_PENDING,
 };
 use crate::config;
 use crate::crash;
@@ -43,7 +43,7 @@ use crate::update;
 
 use correlation_view::{CorrArgs, CorrCache, CorrViewState};
 use spectrum_view::{SpecViewState, SpectrumArgs, SpectrumCache};
-use waveform_view::{quiet_label, CaptureOverlay, WaveArgs, WaveViewState};
+use waveform_view::{quiet_label, CaptureOverlay, WaveArgs, WaveViewState, PENDING_LABEL};
 
 use egui::Color32;
 
@@ -327,7 +327,15 @@ pub fn create(
                 // is on that list for the same reason: its result arrives on
                 // the network worker, and without this the "Checking…" line
                 // would sit there until the user happened to move the mouse.
-                if capture.phase() != PHASE_IDLE || update::status() == update::Status::Checking {
+                // A pending request is the exception: nothing on screen moves
+                // while it waits — for as long as a stopped Logic session stays
+                // stopped — so a 10 Hz poll catches the hand-over to Armed (or
+                // a host-side clear) without a permanent 60 Hz repaint.
+                let display = capture.display_phase();
+                let checking = update::status() == update::Status::Checking;
+                if display == PHASE_PENDING && !checking {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                } else if display != PHASE_IDLE || checking {
                     ctx.request_repaint();
                 }
             });
@@ -503,7 +511,10 @@ pub fn draw_ui(
     updates: &update::UpdateHandle,
 ) {
     let (net_ms, net_clamped) = net_shift(params, shared);
-    let phase = capture.phase();
+    // The display phase (Idle with a click still waiting reads as Pending),
+    // read once and threaded to the strip, the button and the overlay so no
+    // frame can show them disagreeing — see CaptureHandle::display_phase.
+    let phase = capture.display_phase();
 
     // Once the host has applied our queued trim edit, the parameter is
     // authoritative again (also lets external automation take over).
@@ -517,6 +528,7 @@ pub fn draw_ui(
         ui,
         params,
         capture,
+        phase,
         shared,
         state.snapshot.as_deref(),
         net_ms,
@@ -592,6 +604,7 @@ fn graphs(
                     .then(|| quiet_label(gate & GATE_MAIN_QUIET != 0, gate & GATE_REF_QUIET != 0)),
             }
         }
+        PHASE_PENDING => CaptureOverlay::Pending,
         _ => CaptureOverlay::Idle,
     };
     let flip_main = params.align_on.value()
@@ -715,27 +728,43 @@ fn status_label(ui: &mut egui::Ui, text: impl Into<egui::RichText>) {
 
 /// The capture control, top right of the status strip. Its buttons are
 /// egui's default height, which is also the strip's minimum row height, so
-/// it rides along without making that section any taller.
+/// it rides along without making that section any taller. `phase` is the
+/// display phase (see `CaptureHandle::display_phase`).
 fn capture_button(ui: &mut egui::Ui, capture: &CaptureHandle, phase: u8) {
     match phase {
         // Stop analyzes what was recorded; Cancel discards. A host that
         // stops processing mid-capture freezes the phase machine, and a
         // Stop stays pending until playback resumes — Cancel, which acts
-        // directly from the GUI thread, is the escape hatch.
-        PHASE_ARMED | PHASE_CAPTURING => {
+        // directly from the GUI thread, is the escape hatch. A request the
+        // audio thread has not consumed yet (see `CaptureState::request`)
+        // shows the same pair, so the click is visibly honored, but its Stop
+        // cancels outright: nothing is recorded — the outcome process()
+        // gives a Stop while Armed — and a `stop_request` would be consumed
+        // only AFTER the request it was meant to stop, since process()
+        // resolves stops before starts.
+        PHASE_PENDING | PHASE_ARMED | PHASE_CAPTURING => {
+            let stop_hover = if phase == PHASE_CAPTURING {
+                "Stop and analyze what was recorded"
+            } else {
+                "Nothing recorded yet — back to idle"
+            };
             if ui
                 .add(capture_toggle("⏹ Stop", CAPTURE_RED, Color32::WHITE))
-                .on_hover_text("Stop and analyze what was recorded")
+                .on_hover_text(stop_hover)
                 .clicked()
             {
-                capture.request_stop();
+                if phase == PHASE_PENDING {
+                    capture.cancel_capture();
+                } else {
+                    capture.request_stop();
+                }
             }
             // "✖" rather than "✕": the plain multiplication X has no glyph in
             // egui's bundled fonts and paints as the ◻ replacement box (see
             // `tests::label_glyphs_exist_in_egui_default_fonts`).
             if ui
                 .button("✖ Cancel")
-                .on_hover_text("Discard the capture in progress")
+                .on_hover_text("Discard the capture")
                 .clicked()
             {
                 capture.cancel_capture();
@@ -1067,10 +1096,12 @@ fn privacy_section(ui: &mut egui::Ui) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn status_strip(
     ui: &mut egui::Ui,
     params: &ConjureAlignParams,
     capture: &CaptureHandle,
+    phase: u8,
     shared: &GuiShared,
     snapshot: Option<&AnalysisSnapshot>,
     net_ms: f32,
@@ -1081,7 +1112,7 @@ fn status_strip(
         // edge first, so a long status line crowds itself rather than
         // squeezing the one control a new user has to find.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            capture_button(ui, capture, capture.phase());
+            capture_button(ui, capture, phase);
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 // Backstop for status_label's truncation: once the width is
                 // exhausted, whatever still gets placed (a separator, the
@@ -1091,7 +1122,7 @@ fn status_strip(
                 // The phase marker is "⏺" (a filled circle from egui's icon font),
                 // not "●", which no bundled font carries — it shipped as a ◻ box
                 // in 1.3.0. Pinned by `tests::label_glyphs_exist_in_egui_default_fonts`.
-                match capture.phase() {
+                match phase {
                     PHASE_ARMED => {
                         let gate = capture.gate_state();
                         status_label(
@@ -1128,6 +1159,12 @@ fn status_strip(
                     PHASE_ANALYZING => {
                         status_label(ui, egui::RichText::new("⏺ Analyzing…").color(ACCENT_LIVE));
                         ui.spinner();
+                    }
+                    PHASE_PENDING => {
+                        status_label(
+                            ui,
+                            egui::RichText::new(format!("⏺ {PENDING_LABEL}")).color(ACCENT_LIVE),
+                        );
                     }
                     _ => {
                         status_label(ui, egui::RichText::new("⏺ Idle").color(TEXT_DIM));
