@@ -596,11 +596,11 @@ impl Plugin for ConjureAlign {
             };
         }
 
-        // Drop any stale GUI capture/stop request and progress so a click
-        // made while the host wasn't processing can't fire a surprise
-        // capture on the first block, and the editor can't show a stale
-        // percentage or gate state.
-        self.capture.request.store(false, Ordering::Relaxed);
+        // Drop a stale stop request and the progress/gate readouts so the
+        // editor can't show a stale percentage or gate state. A capture
+        // REQUEST is left alone on purpose: the editor shows it as armed
+        // (see `CaptureState::request`), so it must arm on the first block
+        // that runs, whichever activation that turns out to be.
         self.capture.stop_request.store(false, Ordering::Relaxed);
         self.capture.gate_state.store(0, Ordering::Relaxed);
         self.capture.progress.store(0, Ordering::Relaxed);
@@ -657,22 +657,32 @@ impl Plugin for ConjureAlign {
         let _scope = crash::scope();
 
         self.delay.reset();
-        // Abort a capture in flight and drop any queued GUI requests:
-        // reset() fires when processing resumes, and a click made while the
-        // host wasn't processing must not start a surprise capture now. A
-        // running analysis keeps its buffers and finishes on its own.
-        // ARMED first — the phase only moves Armed→Capturing, so this order
-        // can't miss (see CaptureHandle::cancel_capture).
-        self.capture.request.store(false, Ordering::Relaxed);
+        // reset() fires when processing resumes (nih-plug runs it from VST3
+        // `setProcessing(true)` and CLAP `start_processing`, so a host that
+        // suspends processing while idle passes through here on Play). A
+        // pending capture request is deliberately kept — the editor shows it
+        // as armed (see `CaptureState::request`) — and an Armed capture,
+        // which has recorded nothing, becomes one again so it re-arms with a
+        // fresh gate and buffers on the first block. A capture mid-recording
+        // is aborted: its buffer would be discontinuous across the gap. A
+        // running analysis keeps its buffers and finishes on its own. ARMED
+        // first — the phase only moves Armed→Capturing, so this order can't
+        // miss (see CaptureHandle::cancel_capture).
         self.capture.stop_request.store(false, Ordering::Relaxed);
-        for phase in [PHASE_ARMED, PHASE_CAPTURING] {
-            let _ = self.capture.phase.compare_exchange(
-                phase,
-                PHASE_IDLE,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
+        if self
+            .capture
+            .phase
+            .compare_exchange(PHASE_ARMED, PHASE_IDLE, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.capture.request.store(true, Ordering::Release);
         }
+        let _ = self.capture.phase.compare_exchange(
+            PHASE_CAPTURING,
+            PHASE_IDLE,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
     }
 
     fn process(
@@ -903,3 +913,37 @@ nih_export_vst3!(ConjureAlign);
 // `.component`'s Info.plist, which xtask generates from `bundler.toml`.
 #[cfg(target_os = "macos")]
 clap_wrapper::export_auv2!();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use capture::PHASE_PENDING;
+
+    /// `reset()` runs when a suspended host resumes: it must keep a pending
+    /// request, turn an Armed (nothing recorded) capture back into one, and
+    /// still abort a capture mid-recording.
+    #[test]
+    fn reset_keeps_the_capture_the_editor_promised() {
+        let mut plugin = ConjureAlign::default();
+        let handle = plugin.capture.handle();
+
+        handle.request_capture();
+        plugin.reset();
+        assert_eq!(handle.display_phase(), PHASE_PENDING);
+
+        plugin.capture.request.store(false, Ordering::Relaxed);
+        plugin.capture.phase.store(PHASE_ARMED, Ordering::Relaxed);
+        plugin.reset();
+        assert_eq!(handle.phase(), PHASE_IDLE);
+        assert_eq!(
+            handle.display_phase(),
+            PHASE_PENDING,
+            "an Armed capture re-arms on the first block after the reset"
+        );
+
+        plugin.capture.request.store(false, Ordering::Relaxed);
+        plugin.capture.phase.store(PHASE_CAPTURING, Ordering::Relaxed);
+        plugin.reset();
+        assert_eq!(handle.display_phase(), PHASE_IDLE, "mid-recording is aborted");
+    }
+}

@@ -33,6 +33,10 @@ pub const PHASE_IDLE: u8 = 0;
 pub const PHASE_CAPTURING: u8 = 1;
 pub const PHASE_ANALYZING: u8 = 2;
 pub const PHASE_ARMED: u8 = 3;
+/// Display-only pseudo-phase returned by [`CaptureHandle::display_phase`] for
+/// an Idle phase with an unconsumed [`CaptureState::request`]. Never stored
+/// in `phase`: the audio thread alone leaves Idle.
+pub const PHASE_PENDING: u8 = 4;
 
 /// Bits of [`CaptureState::gate_state`] — the display protocol between the
 /// audio thread (writer, once per block) and the editor.
@@ -55,9 +59,22 @@ pub struct CaptureState {
     pub generation: AtomicU64,
     /// GUI capture request. `process()` consumes (swaps to false) this every
     /// block and treats a `true` like a rising edge on the `capture` param;
-    /// a request that races a non-idle phase is simply dropped. `reset()`
-    /// and `initialize()` also clear it, so a click made while the host
-    /// wasn't processing can't fire a surprise capture when playback resumes.
+    /// a request that races a non-idle phase is simply dropped.
+    ///
+    /// It deliberately survives `reset()` and `initialize()`, and `reset()`
+    /// turns an Armed capture (nothing recorded) back into one: the editor
+    /// renders an unconsumed request as armed ([`CaptureHandle::display_phase`]
+    /// → [`PHASE_PENDING`]), so it is standing, cancelable intent, not a
+    /// stale click. Two kinds of host make that matter. Logic Pro does not
+    /// run a stopped audio track's `process()` in a freshly opened session
+    /// until the track has played once (input-monitoring or record-enabled
+    /// tracks always process; after one playback it kept processing for at
+    /// least a minute), so a click made before Play sat invisible until
+    /// playback — the "Capture needs two clicks" report (#42). And a
+    /// VST3/CLAP host that suspends processing while idle (Cubase-style)
+    /// reaches its first block after Play through `setProcessing(true)` /
+    /// `start_processing`, from which nih-plug calls `reset()` — clearing the
+    /// request there would drop the capture the editor had just promised.
     pub request: AtomicBool,
     /// GUI stop request ("analyze what was recorded"); consumed by
     /// `process()` every block like `request`. Unlike cancel it cannot be
@@ -114,6 +131,22 @@ impl CaptureHandle {
 
     pub fn request_capture(&self) {
         self.0.request.store(true, Ordering::Release);
+    }
+
+    /// The phase as the editor should show it: the real phase, except that
+    /// an Idle phase with an unconsumed request reads as [`PHASE_PENDING`] —
+    /// armed, waiting for the host to process audio (see
+    /// [`CaptureState::request`]). Read it ONCE per frame and pass it down:
+    /// the audio thread can consume the request and leave Idle between two
+    /// loads, and a strip, button and overlay drawn from different loads
+    /// would disagree within one frame.
+    pub fn display_phase(&self) -> u8 {
+        let phase = self.0.phase.load(Ordering::Acquire);
+        if phase == PHASE_IDLE && self.0.request.load(Ordering::Acquire) {
+            PHASE_PENDING
+        } else {
+            phase
+        }
     }
 
     /// Requests a stop-and-analyze of the running capture; consumed by the
@@ -201,5 +234,35 @@ impl CaptureState {
 impl Default for CaptureState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The contract the editor's pending display rests on.
+    #[test]
+    fn a_request_reads_as_pending_until_consumed_or_cancelled() {
+        let state = Arc::new(CaptureState::new());
+        let handle = state.handle();
+        assert_eq!(handle.display_phase(), PHASE_IDLE);
+
+        handle.request_capture();
+        assert_eq!(handle.display_phase(), PHASE_PENDING);
+        assert_eq!(handle.phase(), PHASE_IDLE, "the GUI never leaves Idle itself");
+
+        // Stop/Cancel while pending drop the request and move nothing else.
+        handle.cancel_capture();
+        assert_eq!(handle.display_phase(), PHASE_IDLE);
+        assert!(!state.request.load(Ordering::Relaxed));
+
+        // Once the audio thread has left Idle the real phase wins, whatever
+        // the flag says.
+        handle.request_capture();
+        state.phase.store(PHASE_ARMED, Ordering::Relaxed);
+        assert_eq!(handle.display_phase(), PHASE_ARMED);
+        state.request.store(false, Ordering::Relaxed);
+        assert_eq!(handle.display_phase(), PHASE_ARMED);
     }
 }
