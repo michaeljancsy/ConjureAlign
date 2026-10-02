@@ -301,6 +301,11 @@ this one, and every format on this Mac is now $VERSION.</p>
 </body></html>
 EOF
 
+# Unquoted heredoc: $VERSION and $PKG_ID_BASE interpolate into the XML. That also
+# means backticks and $(...) are command substitutions, even inside the XML
+# comments — so keep the body free of both. (1.4.0 shipped with two backticked
+# words in the uninstaller comment: bash ran "visible" as a command, printed
+# "visible: command not found" in the release log, and dropped both words.)
 cat > "$WORK/distribution.xml" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="1">
@@ -338,9 +343,9 @@ cat > "$WORK/distribution.xml" <<EOF
     </choice>
     <!-- Hidden and always installed. Not a customer-facing option: an
          uninstaller that only exists when someone remembered to tick it is an
-         uninstaller that is missing exactly when it is needed. `visible` is the
+         uninstaller that is missing exactly when it is needed. "visible" is the
          dynamic attribute (re-evaluated as choices change), so nothing
-         downstream can flip it back on; `start_enabled="false"` leaves no
+         downstream can flip it back on; start_enabled="false" leaves no
          checkbox state to toggle. It must still appear in choices-outline — a
          choice the outline does not reference is inert, and the package would
          silently never install. It carries no scripts, so its position there is
