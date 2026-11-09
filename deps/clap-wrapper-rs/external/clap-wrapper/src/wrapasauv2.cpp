@@ -4,6 +4,8 @@
 #include <limits>
 #include <cassert>
 #include <vector>
+#include <pthread.h>
+#include <time.h>
 
 extern bool fillAudioUnitCocoaView(AudioUnitCocoaViewInfo *viewInfo, std::shared_ptr<Clap::Plugin>);
 
@@ -447,6 +449,10 @@ void WrapAsAUV2::setupParameters(const clap_plugin_t *plugin, const clap_plugin_
 OSStatus WrapAsAUV2::GetParameterList(AudioUnitScope inScope, AudioUnitParameterID *outParameterList,
                                       UInt32 &outNumParameters)
 {
+  // ConjureAlign patch (see deps/PATCHES.md): upstream's order, sorted by ID, which every
+  // released ConjureAlign has shown in Logic. ConjureWidth reports the plugin's own order here
+  // instead; for this plugin that would put Max Shift second to last, where Logic replaces the
+  // names of values 0, 1 and 2 with its MIDI Mono Mode words.
   if (inScope != kAudioUnitScope_Global || !_paramOrderingProvided)
   {
     return AUBase::GetParameterList(inScope, outParameterList, outNumParameters);
@@ -526,6 +532,7 @@ OSStatus WrapAsAUV2::GetParameterInfo(AudioUnitScope inScope, AudioUnitParameter
       const auto &info = f->info();
 
       outParameterInfo.flags = f->AudioUnitFlags();
+      outParameterInfo.unit = f->AudioUnitUnit();
 
       // according to the documentation, the name field should be zeroed. In fact, AULab does display anything then.
       // strcpy(outParameterInfo.name, info.name);
@@ -549,21 +556,75 @@ OSStatus WrapAsAUV2::GetParameterInfo(AudioUnitScope inScope, AudioUnitParameter
   return AUBase::GetParameterInfo(inScope, inParameterID, outParameterInfo);
 }
 
+// ConjureWidth patch (see deps/PATCHES.md): the name of each step of a multi-way control. The host
+// owns the array it gets, and passes a null pointer to ask only whether there is one.
+OSStatus WrapAsAUV2::GetParameterValueStrings(AudioUnitScope inScope, AudioUnitParameterID inParameterID,
+                                              CFArrayRef *outStrings)
+{
+  if (inScope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope;
+  auto pi = _parametertree.find(inParameterID);
+  if (pi == _parametertree.end() || pi->second->AudioUnitUnit() != kAudioUnitParameterUnit_Indexed)
+    return kAudioUnitErr_InvalidProperty;
+  if (outStrings)
+  {
+    const auto &info = pi->second->info();
+    auto strings = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    for (auto value = info.min_value; value <= info.max_value; value += 1.0)
+    {
+      char buf[200] = "";
+      _plugin->_ext._params->value_to_text(_plugin->_plugin, info.id, value, buf, sizeof(buf));
+      auto text = CFStringCreateWithCString(NULL, buf, kCFStringEncodingUTF8);
+      CFArrayAppendValue(strings, text);
+      CFRelease(text);
+    }
+    *outStrings = strings;
+  }
+  return noErr;
+}
+
+// ConjureWidth patch (see deps/PATCHES.md).
+static clap_event_param_value_t hostParamEvent(const clap_param_info_t &param, double value)
+{
+  clap_event_param_value_t ev = {};
+  ev.header.size = sizeof(ev);
+  ev.header.type = CLAP_EVENT_PARAM_VALUE;
+  ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+  ev.param_id = param.id;
+  ev.cookie = param.cookie;
+  ev.note_id = -1;
+  ev.port_index = -1;
+  ev.channel = -1;
+  ev.key = -1;
+  ev.value = value;
+  return ev;
+}
+
 OSStatus WrapAsAUV2::SetParameter(AudioUnitParameterID inID, AudioUnitScope inScope,
                                   AudioUnitElement inElement, AudioUnitParameterValue inValue,
                                   UInt32 inBufferOffsetInFrames)
 {
   if (inScope == kAudioUnitScope_Global)
   {
-    if (_processAdapter)
+    auto p = _parametertree.find(inID);
+    if (p != _parametertree.end())
     {
-      // a parameter has been set.
-      // _processAdapter->addParameterEvent(inID,inValue,inBufferOffsetInFrames);
-      auto p = _parametertree.find(inID);
-      if (p != _parametertree.end())
+      auto *param = p->second.get();
+      // ConjureWidth patch (see deps/PATCHES.md): a change from the main thread is handed over
+      // now, because the next Render may be a long way off. Any other thread can't touch the
+      // plugin or the process adapter safely, and Logic uses one even with no audio running, so
+      // the change waits for the next Render or, with audio stopped, the next onIdle().
+      if (pthread_main_np())
       {
-        auto &param = p->second.get()->info();
-        _processAdapter->addParameterEvent(param, inValue, inBufferOffsetInFrames);
+        param->isPending.store(false, std::memory_order_relaxed);
+        auto ev = hostParamEvent(param->info(), inValue);
+        flushParams(&ev);
+      }
+      else
+      {
+        param->pendingValue.store(inValue, std::memory_order_relaxed);
+        param->pendingOffset.store(inBufferOffsetInFrames, std::memory_order_relaxed);  // ConjureAlign patch
+        param->isPending.store(true, std::memory_order_release);
+        _hostParamsPending.store(true, std::memory_order_release);
       }
     }
   }
@@ -1028,6 +1089,8 @@ OSStatus WrapAsAUV2::Render(AudioUnitRenderActionFlags &inFlags, const AudioTime
   assert(inFlags == 0);
   if (_initialized && (inFlags == 0))
   {
+    _lastRenderNanos.store(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), std::memory_order_relaxed);
+
     // do the render dance
     Clap::AUv2::ProcessData data{inFlags, inTimeStamp, inFrames, this};
 
@@ -1062,6 +1125,27 @@ OSStatus WrapAsAUV2::Render(AudioUnitRenderActionFlags &inFlags, const AudioTime
     // continuous array of float buffers for the VST process function
 
     auto it_is = _plugin->AlwaysAudioThread();
+
+    // ConjureWidth patch (see deps/PATCHES.md): changes from the host that arrived since the last
+    // block. Only the latest value of each is kept, which is all a plugin without sample accurate
+    // automation would use anyway.
+    if (_hostParamsPending.exchange(false, std::memory_order_acquire))
+    {
+      for (auto &entry : _parametertree)
+      {
+        auto *param = entry.second.get();
+        if (param->isPending.exchange(false, std::memory_order_acquire))
+        {
+          // ConjureAlign patch (see deps/PATCHES.md): this plugin uses sample accurate automation,
+          // so the change keeps its place in the block, as upstream kept it. A place past the end
+          // made nih-plug process past the block's buffers, so it lands on the last sample.
+          uint32_t offset = param->pendingOffset.load(std::memory_order_relaxed);
+          if (offset >= inFrames) offset = inFrames ? inFrames - 1 : 0;
+          _processAdapter->addParameterEvent(param->info(),
+                                             param->pendingValue.load(std::memory_order_relaxed), offset);
+        }
+      }
+    }
 
     _processAdapter->process(data);
 
@@ -1147,9 +1231,113 @@ void WrapAsAUV2::onEndEdit(clap_id id)
 #endif
 }
 
+// ConjureWidth patch (see deps/PATCHES.md). Longer than any block a host renders with.
+bool WrapAsAUV2::hostStoppedRendering() const
+{
+  const uint64_t kQuietNanos = 200'000'000;
+  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - _lastRenderNanos.load(std::memory_order_relaxed) >
+         kQuietNanos;
+}
+
+// ConjureWidth patch (see deps/PATCHES.md). Main thread only. Hands the plugin a change from the
+// host, if there is one, and when audio has stopped also passes the editor's waiting changes to the
+// host, since no Render is coming to do it. The vendored nih-plug makes this safe even if the audio
+// thread starts a block meanwhile: its flush only touches atomics and a lock-free queue.
+void WrapAsAUV2::flushParams(const clap_event_param_value_t *fromHost)
+{
+  auto *params = _plugin ? _plugin->_ext._params : nullptr;
+  if (!params) return;
+
+  auto guarantee_mainthread = _plugin->AlwaysMainThread();
+
+  clap_input_events_t in = {};
+  in.ctx = const_cast<clap_event_param_value_t *>(fromHost);
+  in.size = [](const clap_input_events_t *list) -> uint32_t { return list->ctx ? 1 : 0; };
+  in.get = [](const clap_input_events_t *list, uint32_t index) -> const clap_event_header_t *
+  {
+    auto *ev = static_cast<const clap_event_param_value_t *>(list->ctx);
+    return (ev && index == 0) ? &ev->header : nullptr;
+  };
+
+  clap_output_events_t out = {};
+  out.ctx = this;
+  out.try_push = [](const clap_output_events_t *list, const clap_event_header_t *event) -> bool
+  {
+    auto *self = static_cast<WrapAsAUV2 *>(list->ctx);
+    switch (event->type)
+    {
+      case CLAP_EVENT_PARAM_GESTURE_BEGIN:
+        self->onBeginEdit(reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
+        break;
+      case CLAP_EVENT_PARAM_VALUE:
+        self->onPerformEdit(reinterpret_cast<const clap_event_param_value_t *>(event));
+        break;
+      case CLAP_EVENT_PARAM_GESTURE_END:
+        self->onEndEdit(reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
+        break;
+      default:
+        break;
+    }
+    return true;
+  };
+
+  params->flush(_plugin->_plugin, &in, hostStoppedRendering() ? &out : nullptr);
+}
+
+// ConjureWidth patch (see deps/PATCHES.md). Main thread only, for when no Render is coming to pick
+// these up.
+void WrapAsAUV2::deliverHostParamChanges()
+{
+  if (!_hostParamsPending.exchange(false, std::memory_order_acquire)) return;
+
+  for (auto &entry : _parametertree)
+  {
+    auto *param = entry.second.get();
+    if (param->isPending.exchange(false, std::memory_order_acquire))
+    {
+      auto ev = hostParamEvent(param->info(), param->pendingValue.load(std::memory_order_relaxed));
+      flushParams(&ev);
+    }
+  }
+}
+
+// ConjureWidth patch (see deps/PATCHES.md). Loading state changes the plugin's values without
+// passing through the AU's own copies, which the host reads.
+void WrapAsAUV2::tellHostAllParamValues()
+{
+  auto *params = _plugin->_ext._params;
+  if (!params) return;
+
+  for (const auto &entry : _parametertree)
+  {
+    double value = 0;
+    if (!params->get_value(_plugin->_plugin, entry.first, &value)) continue;
+
+    Globals()->SetParameter(entry.first, value);
+
+    AudioUnitEvent myEvent;
+    myEvent.mEventType = kAudioUnitEvent_ParameterValueChange;
+    myEvent.mArgument.mParameter.mAudioUnit = GetComponentInstance();
+    myEvent.mArgument.mParameter.mParameterID = (AudioUnitParameterID)entry.first;
+    myEvent.mArgument.mParameter.mScope = kAudioUnitScope_Global;
+    myEvent.mArgument.mParameter.mElement = 0;
+    AUEventListenerNotify(NULL, NULL, &myEvent);
+  }
+}
+
 void WrapAsAUV2::onIdle()
 {
   if (!_plugin) return;
+
+  // ConjureWidth patch (see deps/PATCHES.md): while audio runs, Render hands over the host's
+  // changes and process() empties the editor's queue.
+  if (hostStoppedRendering()) deliverHostParamChanges();
+  if (_paramFlushRequested.load(std::memory_order_acquire) && hostStoppedRendering())
+  {
+    _paramFlushRequested.store(false, std::memory_order_release);
+    flushParams(nullptr);
+  }
+
   // run queue stuff
   queueEvent e;
   while (this->_queueToUI.pop(e))
@@ -1278,6 +1466,13 @@ OSStatus WrapAsAUV2::RestoreState(CFPropertyListRef plist)
 
   if (!IsInitialized()) return kAudioUnitErr_Uninitialized;
 
+  // ConjureWidth patch (see deps/PATCHES.md): these settings replace any change still waiting.
+  _hostParamsPending.store(false, std::memory_order_release);
+  for (auto &entry : _parametertree)
+  {
+    entry.second->isPending.store(false, std::memory_order_release);
+  }
+
   CFDictionaryRef tDict = CFDictionaryRef(plist);
 
   // Find 'data' key
@@ -1334,6 +1529,7 @@ OSStatus WrapAsAUV2::RestoreState(CFPropertyListRef plist)
       Clap::StateMemento chunk;
       chunk.setData(pData, lLen);
       _plugin->_ext._state->load(_plugin->_plugin, chunk);
+      tellHostAllParamValues();
     }
   }
   return noErr;

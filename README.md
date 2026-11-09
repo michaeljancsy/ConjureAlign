@@ -215,6 +215,17 @@ Run the DSP test suite with `cargo test --release`. To eyeball the GUI panels wi
 prompt (`_consent`) and the ⚙ popover with and without an update waiting
 (`_settings_update`, `_settings`).
 
+On macOS, `tests/au_host_test.m` checks the Audio Unit the way a host uses it, with nothing
+installed and no audio device: it opens the plugin's real window in a small program of its
+own, clicks and drags the controls, and checks that changes reach both the plugin and the host
+with audio stopped, running, and switching between the two. That matters because Logic Pro
+doesn't run a stopped track's plugins in a new project and sends its own changes on a
+background thread, and neither `auval` nor the test suite would notice if controls stopped
+working there. It also checks undo gestures, what kind of control each parameter is, restoring
+saved settings, and resizing. The build and run commands are at the top of the file; run it
+with `HOME` pointing at a scratch folder as shown there, so the test never touches your own
+settings or sends analytics. It exits with 0 only if every check passes.
+
 ## License
 
 GPL-3.0-or-later. Third-party components and their licenses are listed in

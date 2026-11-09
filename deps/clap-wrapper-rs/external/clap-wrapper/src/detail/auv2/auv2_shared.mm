@@ -12,8 +12,14 @@ bool auv2shared_mm_request_resize(const clap_window_t* win, uint32_t w, uint32_t
   if (!win) return false;
 
   auto* nsv = (NSView*)win;
-  [nsv setFrame:NSMakeRect(0, 0, w, h)];
+  // ConjureWidth patch (see deps/PATCHES.md): report success, or the editor never resizes its own
+  // contents and never records the new size. Keep the origin the host chose.
+  NSRect frame = nsv.frame;
+  if (frame.size.width != w || frame.size.height != h)
+  {
+    [nsv setFrame:NSMakeRect(frame.origin.x, frame.origin.y, w, h)];
+  }
 
-  return false;
+  return true;
 }
 }  // namespace free_audio::auv2_wrapper

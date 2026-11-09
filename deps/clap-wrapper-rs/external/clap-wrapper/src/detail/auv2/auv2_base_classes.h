@@ -17,6 +17,8 @@
 #include <AudioUnitSDK/AUBase.h>
 #include <CoreMIDI/CoreMIDI.h>
 #include "auv2_shared.h"
+#include <atomic>
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <map>
@@ -360,6 +362,8 @@ class WrapAsAUV2 : public ausdk::AUBase,
   // outParameterList may be a null pointer
   OSStatus GetParameterInfo(AudioUnitScope inScope, AudioUnitParameterID inParameterID,
                             AudioUnitParameterInfo &outParameterInfo) override;
+  OSStatus GetParameterValueStrings(AudioUnitScope inScope, AudioUnitParameterID inParameterID,
+                                    CFArrayRef *outStrings) override;
 
   OSStatus SetParameter(AudioUnitParameterID inID, AudioUnitScope inScope, AudioUnitElement inElement,
                         AudioUnitParameterValue inValue, UInt32 /*inBufferOffsetInFrames*/) override;
@@ -395,8 +399,10 @@ class WrapAsAUV2 : public ausdk::AUBase,
   void param_clear(clap_id param, clap_param_clear_flags flags) override
   {
   }
+  // ConjureWidth patch (see deps/PATCHES.md): acted on from onIdle().
   void param_request_flush() override
   {
+    _paramFlushRequested.store(true, std::memory_order_release);
   }
 
   void latency_changed() override;
@@ -530,6 +536,13 @@ class WrapAsAUV2 : public ausdk::AUBase,
 
   void activateCLAP();
   void deactivateCLAP();
+
+  // ConjureWidth patch (see deps/PATCHES.md): keep the plugin and the host in step while the host
+  // is not rendering, which is how Logic treats a stopped track in a new project.
+  bool hostStoppedRendering() const;
+  void flushParams(const clap_event_param_value_t *fromHost);
+  void deliverHostParamChanges();
+  void tellHostAllParamValues();
   bool IsBypassEffect()
   {
     return false;
@@ -572,6 +585,9 @@ class WrapAsAUV2 : public ausdk::AUBase,
   AUMIDIOutputCallbackStruct _midioutput_hostcallback = {nullptr, nullptr};
 
   std::atomic_bool _requestUICallback = false;
+  std::atomic_bool _paramFlushRequested = false;
+  std::atomic_bool _hostParamsPending = false;
+  std::atomic<uint64_t> _lastRenderNanos = 0;
 
   // the queue from audiothread to UI thread
   ClapWrapper::detail::shared::fixedqueue<queueEvent, 8192> _queueToUI;

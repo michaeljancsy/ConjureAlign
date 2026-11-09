@@ -408,9 +408,11 @@ bool ProcessAdapter::enqueueOutputEvent(const clap_event_header_t *event)
     {
       auto ev = (clap_event_param_gesture *)event;
       auto n = std::remove(_gesturedParameters.begin(), _gesturedParameters.end(), ev->param_id);
-      if (n != _gesturedParameters.end())
+      _gesturedParameters.erase(n, _gesturedParameters.end());
+      // ConjureWidth patch (see deps/PATCHES.md): a drag can start while audio is stopped and end
+      // while it runs, so the end reaches the host even if this adapter did not see the start.
+      if (_parameters->find(ev->param_id) != _parameters->end())
       {
-        _gesturedParameters.erase(n, _gesturedParameters.end());
         _automation->onEndEdit(ev->param_id);
       }
     }
