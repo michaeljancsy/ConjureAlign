@@ -1,6 +1,8 @@
 
 #include "parameter.h"
 
+#include <cstring>
+
 namespace Clap::AUv2
 {
 
@@ -33,12 +35,19 @@ void Parameter::updateInfo(const clap_plugin_t *plugin, const clap_plugin_params
     else
       flags |= kAudioUnitParameterFlag_IsReadable | kAudioUnitParameterFlag_IsWritable;
   }
+  // ConjureWidth patch (see deps/PATCHES.md): upstream added the unit to the flags, where those
+  // numbers mean something else, so a host saw every control as continuous. Anything with two
+  // steps isn't an on/off control: Mode's are Linked and Independent.
+  _unit = kAudioUnitParameterUnit_Generic;
   if (info.flags & CLAP_PARAM_IS_STEPPED)
   {
-    if (info.max_value == 1 && info.min_value == 0)
-      flags |= kAudioUnitParameterUnit_Boolean;
+    char first[200] = "", last[200] = "";
+    clap_param_ext->value_to_text(plugin, info.id, info.min_value, first, sizeof(first));
+    clap_param_ext->value_to_text(plugin, info.id, info.max_value, last, sizeof(last));
+    if (info.max_value == 1 && info.min_value == 0 && !strcmp(first, "Off") && !strcmp(last, "On"))
+      _unit = kAudioUnitParameterUnit_Boolean;
     else
-      flags |= kAudioUnitParameterUnit_Indexed;
+      _unit = kAudioUnitParameterUnit_Indexed;
   }
 
   // we need this, otherwise hosts may quantize the parameter to 100 steps
@@ -49,6 +58,10 @@ void Parameter::updateInfo(const clap_plugin_t *plugin, const clap_plugin_params
   // we can't get the value since we are not in the audio thread
   // auto guarantee_mainthread = _plugin->AlwaysMainThread();
 
+  // ConjureWidth patch (see deps/PATCHES.md): an on/off control doesn't name its values, so the
+  // host shows its own checkbox. Logic replaces the names of the second-to-last control with its
+  // MIDI Mono Mode words, and an on/off control there is safe only without names.
+  if (_unit != kAudioUnitParameterUnit_Boolean)
   {
     char buf[200];
     if (clap_param_ext->value_to_text(plugin, info.id, info.default_value, buf, sizeof(buf)))

@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "conjure_align"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "atomic_float",
  "atomic_refcell",
@@ -2554,7 +2554,6 @@ dependencies = [
 [[package]]
 name = "nih_plug_egui"
 version = "0.0.0"
-source = "git+https://github.com/robbert-vdh/nih-plug.git#f36931f7af4646065488a9845d8f8c2f95252c23"
 dependencies = [
  "baseview",
  "crossbeam",

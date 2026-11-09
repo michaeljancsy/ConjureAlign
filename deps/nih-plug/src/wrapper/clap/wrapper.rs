@@ -3034,8 +3034,27 @@ impl<P: ClapPlugin> Wrapper<P> {
         check_null_ptr!((), plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
 
+        // LOCAL PATCH (ConjureWidth, see deps/PATCHES.md): the AU wrapper calls this from the main thread at moments
+        // when the audio thread may be starting a block. `handle_in_events()` takes a borrow that
+        // the audio thread also takes, and losing that race panics inside the host. Parameter
+        // values are the only events this path is used for, and they only touch atomics.
         if !in_.is_null() {
-            wrapper.handle_in_events(&*in_, 0, 0);
+            let in_ = &*in_;
+            let num_events = clap_call! { in_=>size(in_) };
+            for event_idx in 0..num_events {
+                let event = clap_call! { in_=>get(in_, event_idx) };
+                if !event.is_null()
+                    && (*event).space_id == CLAP_CORE_EVENT_SPACE_ID
+                    && (*event).type_ == CLAP_EVENT_PARAM_VALUE
+                {
+                    let event = &*(event as *const clap_event_param_value);
+                    wrapper.update_plain_value_by_hash(
+                        event.param_id,
+                        ClapParamUpdate::PlainValueSet(event.value),
+                        wrapper.current_buffer_config.load().map(|c| c.sample_rate),
+                    );
+                }
+            }
         }
 
         if !out.is_null() {

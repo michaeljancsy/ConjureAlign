@@ -109,6 +109,17 @@ stripped) for exactly that, so a glyph the fonts lack fails `cargo test`, not a 
   sidechain, and it loads the plugin in-process without building the Cocoa view — a green
   `auval` says nothing about the editor or about AU sandboxing. Logic's Plug-in Manager is
   the real test.
+- AU host test, no install needed: `tests/au_host_test.m` loads the built `.component` into
+  its own process, opens the real editor, clicks and drags its controls, and checks that
+  changes from the editor, the host's main thread, a background thread and the audio thread
+  all reach both sides with audio stopped, running and switching between the two, plus gesture
+  messages, parameter units and choice names, restoring settings, and resizing. Build and run
+  commands are at the top of the file. Always run it with `HOME` set to a scratch folder whose
+  settings decline analytics and updates, as shown there — it refuses the real `HOME`, because
+  loading the plugin with this Mac's consent answers sends real analytics, crash-reporting and
+  update-check traffic. Its click positions are measured from the editor's layout (Align and
+  Polarity centred in the bottom panel, Trim at its left), so moving those controls means
+  re-measuring the constants near `align_x()`.
 - Release: `./scripts/release.sh` — universal build, sign, notarize, and package into
   `dist/ConjureAlign-<version>-macOS.pkg`, a signed installer whose component packages
   target `/Library/Audio/Plug-Ins/{VST3,CLAP,Components}` (AU postinstall clears the
@@ -197,9 +208,11 @@ stripped) for exactly that, so a glyph the fonts lack fails `cargo test`, not a 
     `release.sh` and the uninstall GUID duplicated into `windows.yml`.
 - Toolchain: stable Rust. nih_plug is a git dependency (not on crates.io); Cargo.lock pins the
   rev — but the `nih_plug` crate itself is `[patch]`ed onto the vendored copy at
-  `deps/nih-plug` (teardown fixes for the shared background worker; see Known upstream issues
-  and deps/PATCHES.md). `nih_plug_egui`/`nih_plug_xtask` still resolve from the git source, so
-  the vendored tree must move in lockstep with the pinned rev. `atomic_float` in Cargo.toml
+  `deps/nih-plug` (teardown fixes for the shared background worker, and a `flush()` the AU
+  wrapper can call from the main thread; see Known upstream issues and deps/PATCHES.md), and
+  so is `nih_plug_egui`, at `deps/nih_plug_egui` (editor resize and slider gestures).
+  `nih_plug_xtask` still resolves from the git source, so the vendored trees must move in
+  lockstep with the pinned rev. `atomic_float` in Cargo.toml
   must stay on the same version nih_plug uses, because its `AtomicF32` implements nih_plug's
   `PersistentField`.
 - `build.rs` exists for exactly one thing: on a Windows host it stamps a `VS_VERSION_INFO`
@@ -873,6 +886,22 @@ renders. Its load-bearing assertion is that the "Reference" sidechain bus follow
 bus down to 1 channel — if it does not, `select()` never reached the plugin and the AU is
 feeding mono buffers to a plugin that believes it is stereo.
 
+**Parameters reach the plugin with no audio running only because of a second local patch**
+(the stopped-host patch in `deps/PATCHES.md`, found in ConjureWidth and ported 2026-11-08 as
+1.4.1). Stock clap-wrapper relies on `Render` for every parameter change in both directions,
+and Logic doesn't render a stopped track in a new project, so the editor's buttons and sliders,
+Logic's Controls view and Logic's Undo all did nothing until Play. Logic also calls
+`SetParameter` on a background thread of its out-of-process host, with or without audio. The
+patch hands changes over from the main thread's idle timer while `Render` is quiet, keeps
+background-thread changes in atomics until the next block or idle tick, reports restored
+settings to the host, makes the editor resizable in AU hosts, and gives the host real units
+(Capture and Alignment On are on/off, Polarity is a named list of three). It leans on the
+`nih_plug` flush patch and the vendored `nih_plug_egui`. ConjureAlign differs from ConjureWidth
+in two places: it keeps each host change's position within the block, because this plugin has
+`SAMPLE_ACCURATE_AUTOMATION = true`, and it keeps upstream's AU parameter order (sorted by ID,
+as every release had) where ConjureWidth reports declaration order — see deps/PATCHES.md for
+why the order decides which control Logic mislabels. `tests/au_host_test.m` covers all of it.
+
 The generated `AudioComponents` entry deliberately carries `resourceUsage` and NO
 `sandboxSafe` key, matching what clap-wrapper's own CMake build-helper emits — claiming
 untested sandbox-safety only buys a stricter hosting path that can fail silently, and
@@ -991,7 +1020,9 @@ all verified against the vendored sources, none worth patching for us:
 - AUv2 offline rendering is unsupported upstream.
 - nih-plug's `ext_gui_can_resize`/`get_resize_hints` return `false`, so an AU host cannot
   resize the editor; the plugin-driven path (`ResizableWindow` → `gui_request_resize`)
-  works.
+  works, but in an AU host only since 1.4.1: the wrapper's `request_resize` reported failure
+  and `nih_plug_egui`'s resize was broken on Retina screens (both patched, see
+  `deps/PATCHES.md`).
 - The AU wrapper is compiled into the one dylib behind all three bundles, so its ObjC
   classes register even in a CLAP/VST3 host. Loading two of our own bundles in one process
   can log an ObjC "implemented in both" warning — harmless, both copies are the same code
@@ -1028,7 +1059,15 @@ main checkout, plain `cargo xtask bundle` is fine.
   playback it kept processing for at least a minute), so a Capture click made before Play
   shows `⏺ Armed — waiting for playback` and arms for real on Play — expected, not a
   dropped click (and the reason the phase machine can freeze mid-capture when Logic is
-  stopped; Cancel is the escape hatch).
+  stopped; Cancel is the escape hatch). Parameters are different since 1.4.1: Align,
+  Polarity, the sliders, Logic's Controls view and Logic's Undo all take effect on a stopped
+  track (see the AudioUnit v2 section). Logic's Controls view replaces the value names of the
+  SECOND-TO-LAST AU parameter with "Off" / "On (Base Channel 1)" / "On (Base Channel 16)" (a
+  Logic bug, found in ConjureWidth). ConjureAlign's AU order is sorted by parameter ID, which
+  puts Alignment On there, and on/off controls no longer advertise value names, so it is safe —
+  but adding a parameter can move a different control into that slot; `tests/au_host_test.m`
+  fails when that happens. Not yet checked in Logic itself: Polarity's names and Alignment On's
+  checkbox.
 - Null test recipe: duplicate a track, nudge the copy by a known amount (track delay or clip
   nudge), sidechain the original into ConjureAlign on the copy, click Capture (or toggle the
   Capture parameter) and play — recording accumulates only while both inputs clear the Gate

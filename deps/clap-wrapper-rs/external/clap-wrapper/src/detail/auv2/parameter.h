@@ -14,6 +14,7 @@
  
  */
 
+#include <atomic>
 #include <clap/clap.h>
 
 #ifdef __GNUC__
@@ -49,14 +50,26 @@ class Parameter
   {
     return _flags;
   }
+  AudioUnitParameterUnit AudioUnitUnit() const
+  {
+    return _unit;
+  }
 
   void updateInfo(const clap_plugin_t *plugin, const clap_plugin_params_t *clap_param_ext,
                   const clap_param_info_t &i);
+
+  // ConjureWidth patch (see deps/PATCHES.md): the latest change the host made on a thread other
+  // than the main one, until it is handed to the plugin.
+  std::atomic<float> pendingValue = 0.f;
+  std::atomic_bool isPending = false;
+  // ConjureAlign patch (see deps/PATCHES.md): where in the next block that change belongs.
+  std::atomic<uint32_t> pendingOffset = 0;
 
  private:
   clap_param_info_t _info;
   CFStringRef _cfstring = nullptr;
   AudioUnitParameterOptions _flags;
+  AudioUnitParameterUnit _unit = kAudioUnitParameterUnit_Generic;
 };
 
 }  // namespace Clap::AUv2
