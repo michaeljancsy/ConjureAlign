@@ -178,7 +178,9 @@ pub struct EventContext<'a> {
     /// AudioUnit reports as CLAP, and there is no fixing that here:
     /// clap-wrapper translates AU calls into calls on our own `clap_entry`, so
     /// nih-plug genuinely never sees an AU. The `daw` property is what
-    /// separates them in practice — Logic and GarageBand load only the AU.
+    /// separates them in practice: Logic and GarageBand load only the AU, and
+    /// on current macOS they do it through Apple's helper, which reports as
+    /// [`crate::host::APPLE_AU_HOST`].
     pub plugin_format: Option<&'static str>,
     pub host: &'a HostInfo,
 }

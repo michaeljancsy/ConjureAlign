@@ -28,12 +28,28 @@
 //! would also be *wrong* for AudioUnit — on that path clap-wrapper is the CLAP
 //! host, so `clap_host.name` names the wrapper, not Logic. The host process's
 //! own executable is the same answer in all three formats.
+//!
+//! With one exception that this module has to name honestly: Logic does not
+//! load an Audio Unit into its own process. It asks macOS to, and macOS puts
+//! the AU in a helper of its own (verified with Logic Pro 12.3.1 on macOS
+//! 26.3, 2026-11-10: `AudioToolbox.framework/XPCServices/
+//! AUHostingServiceXPC_arrow.xpc`). So for those loads `current_exe()` is
+//! Apple's helper, and nothing the plugin can see says which app asked for
+//! it — GarageBand, MainStage and Final Cut Pro go through the same helper.
+//! Those loads report [`APPLE_AU_HOST`], with no version.
 
 use std::sync::OnceLock;
 
 /// Reported when the executable is not one we recognize. Deliberately not
 /// "unknown": this is a bucket, not a missing value.
 pub const UNKNOWN_DAW: &str = "other";
+
+/// Reported when the plugin was loaded into Apple's own Audio Unit hosting
+/// helper rather than into a DAW's process. That is how Logic Pro loads every
+/// AU on current macOS, but GarageBand, MainStage, Final Cut Pro and any other
+/// app that asks macOS to host an AU land here too, and the helper cannot tell
+/// them apart — so the label names the helper, not a DAW.
+pub const APPLE_AU_HOST: &str = "Apple AU host";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HostInfo {
@@ -66,13 +82,24 @@ fn resolve() -> HostInfo {
 
     HostInfo {
         daw,
-        daw_version: if daw == UNKNOWN_DAW {
-            None
-        } else {
+        daw_version: if reports_version(daw) {
             daw_version()
+        } else {
+            None
         },
         os_version: os_version(),
     }
+}
+
+/// Whether the host process's own version is worth sending alongside `label`.
+///
+/// Not for an unrecognized host (rule 2). And not for [`APPLE_AU_HOST`]: there
+/// the process's bundle is Apple's helper itself, whose
+/// `CFBundleShortVersionString` is a constant "1.0" (on both the Apple silicon
+/// and the Intel helper, macOS 26.3) — it is not Logic's version, and sending
+/// it would look like one.
+fn reports_version(label: &str) -> bool {
+    label != UNKNOWN_DAW && label != APPLE_AU_HOST
 }
 
 /// Maps an executable's file stem to a stable label. Pure, so the whole
@@ -98,6 +125,16 @@ pub fn daw_label(stem: &str) -> &'static str {
         "pluginval" => return "pluginval",
         "clap-validator" => return "clap-validator",
         "standalone" | "gui_preview" => return "ConjureAlign dev",
+        // Apple's Audio Unit hosting helpers (see the module docs). Matched
+        // exactly: they are Apple's own names, and a substring rule has
+        // nothing to gain here. `_arrow` is the Apple silicon helper and the
+        // bare name the Intel one (used under Rosetta); both ship in
+        // AudioToolbox.framework/XPCServices on macOS 26.3. The compatibility
+        // service is not on macOS 26.3, but users and Ableton's support pages
+        // name it as the helper that hosted Intel AUs on earlier macOS.
+        "auhostingservicexpc_arrow" | "auhostingservicexpc" | "auhostingcompatibilityservice" => {
+            return APPLE_AU_HOST
+        }
         _ => {}
     }
 
@@ -415,6 +452,47 @@ mod tests {
         assert_eq!(daw_label("pluginval"), "pluginval");
         assert_eq!(daw_label("clap-validator"), "clap-validator");
         assert_eq!(daw_label("standalone"), "ConjureAlign dev");
+    }
+
+    /// Logic on current macOS loads the AU into Apple's helper, not into its
+    /// own process. Those loads must land on their own label rather than in
+    /// "other" next to every unrecognized VST3 host — which is where every
+    /// Logic user was counted up to 1.4.1.
+    #[test]
+    fn apple_au_hosting_helpers_get_their_own_label() {
+        for stem in [
+            // The full paths these come from, on macOS 26.3, are
+            // /System/Library/Frameworks/AudioToolbox.framework/XPCServices/
+            // <name>.xpc/Contents/MacOS/<name>.
+            "AUHostingServiceXPC_arrow",
+            "AUHostingServiceXPC",
+            "AUHostingCompatibilityService",
+            "auhostingservicexpc_arrow",
+        ] {
+            assert_eq!(daw_label(stem), APPLE_AU_HOST, "for {stem:?}");
+        }
+        // Exact matches only: something merely containing the name is not
+        // Apple's helper and stays in the unknown bucket.
+        for stem in [
+            "AUHostingServiceXPC_arrow2",
+            "MyAUHostingServiceXPC",
+            "AUHostingServiceXPC copy",
+        ] {
+            assert_eq!(daw_label(stem), UNKNOWN_DAW, "for {stem:?}");
+        }
+    }
+
+    /// Rule 2 decides the unknown case; the helper is the other one. Its own
+    /// bundle version is Apple's "1.0", not Logic's, and sending it as
+    /// `daw_version` would read as a Logic version that does not exist.
+    #[test]
+    fn only_recognized_daws_report_a_version() {
+        assert!(!reports_version(UNKNOWN_DAW));
+        assert!(!reports_version(APPLE_AU_HOST));
+        assert!(!reports_version(daw_label("AUHostingServiceXPC_arrow")));
+        assert!(reports_version(daw_label("Logic Pro")));
+        assert!(reports_version(daw_label("REAPER")));
+        assert!(reports_version(daw_label("auval")));
     }
 
     /// Rule 2 again, at the level `resolve` enforces it: no version may ride
