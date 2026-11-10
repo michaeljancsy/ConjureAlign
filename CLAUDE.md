@@ -1002,8 +1002,10 @@ THE HOST when the editor window opens: AppKit now attaches the view before it ha
 and `msg_send![nil, isKeyWindow]` trips rustc's inserted null check. Fixed upstream one
 commit after `9a0b42c` (RustAudio/baseview#204, rev `3e12973`); Cargo.toml carries a
 `[patch."https://github.com/RustAudio/baseview.git"]` pointing at the
-`michaeljancsy/baseview` fork's `magnify-as-ctrl-scroll` branch, which is that fix PLUS THREE
-LOCAL COMMITS. (1) Stock baseview registers no `magnifyWithEvent:` handler, so macOS
+`michaeljancsy/baseview` fork's `fix-gl-view-leak` branch (rev `75aad1d`), which is that fix
+PLUS THREE LOCAL COMMITS. (The fork's `magnify-as-ctrl-scroll` branch holds the first two plus
+`ee92660`, a second, equivalent fix for the same leak that nothing pins; rebase from
+`fix-gl-view-leak`.) (1) Stock baseview registers no `magnifyWithEvent:` handler, so macOS
 trackpad pinches produce no events at all in the editor — the commit re-encodes them
 as ctrl-scroll `WheelScrolled` events (K = 200 calibrates to egui's default scroll-zoom
 speed of 1/200, giving exp(magnification) — the native AppKit convention). That is what
