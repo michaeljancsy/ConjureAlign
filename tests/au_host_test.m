@@ -22,6 +22,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <AudioUnit/AUCocoaUIView.h>
 #import <Cocoa/Cocoa.h>
+#include <mach/mach.h>
 #include <pthread.h>
 #include <pwd.h>
 #include <stdatomic.h>
@@ -84,6 +85,12 @@ static void *render_loop(void *x) {
 }
 
 static void pump(double seconds) { [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:seconds]]; }
+// What Activity Monitor calls Memory: it includes the graphics memory a leaked drawing surface holds.
+static double footprint_mb(void) {
+    task_vm_info_data_t i; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&i, &n);
+    return i.phys_footprint / 1048576.0;
+}
 static void start_audio(void) { atomic_store(&render_on, 1); pump(0.3); }
 // Long enough for the wrapper to decide the host has stopped running the plug-in.
 static void stop_audio(void) { atomic_store(&render_on, 0); while (atomic_load(&in_render)) usleep(100); pump(0.5); }
@@ -429,6 +436,20 @@ int main(int ac, char **av) { @autoreleasepool {
     close_view(); open_view();
     check("reopening keeps the size", near(view.frame.size.width, kept.width, 1) && near(view.frame.size.height, kept.height, 1), "reopened at %.0f by %.0f", view.frame.size.width, view.frame.size.height);
     shot("6_reopened");
+
+    // Every close used to leave the editor's whole OpenGL view alive, with its window-sized drawing
+    // surface: about 50 MB per open/close, growing in a straight line. Fixed in the baseview fork
+    // (see deps/PATCHES.md); the idle timer the AU wrapper leaked per open is fixed too, but at 320
+    // bytes it is far below what this can see. The two first rounds are not counted. Each round
+    // gets its own autorelease pool, as each turn of a real host's event loop does: the wrapper
+    // hands its view over autoreleased, and this program never runs that loop, so without the
+    // pool no view would ever be freed and the check would fail with or without the fix.
+    puts("--- opening and closing the editor");
+    for (int i = 0; i < 2; i++) { @autoreleasepool { close_view(); open_view(); } }
+    double mb_before = footprint_mb();
+    for (int i = 0; i < 10; i++) { @autoreleasepool { close_view(); open_view(); } }
+    double mb_kept = (footprint_mb() - mb_before) / 10;
+    check("opening and closing the editor keeps no memory", mb_kept < 2, "%.2f MB kept per open/close, wanted under %.0f", mb_kept, 2);
 
     puts("--- stress: audio starting and stopping while controls move");
     srand48(7);

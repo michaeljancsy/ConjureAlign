@@ -156,6 +156,9 @@ void CLAP_WRAPPER_TIMER_CALLBACK(CFRunLoopTimerRef timer, void *info)
     if (idleTimer)
     {
       CFRunLoopTimerInvalidate(idleTimer);
+      // ConjureAlign patch (see deps/PATCHES.md): invalidating takes the run loop's reference
+      // away, not ours from CFRunLoopTimerCreate, so every editor open leaked one timer.
+      CFRelease(idleTimer);
       idleTimer = 0;
     }
     if (canary)
@@ -174,6 +177,8 @@ void CLAP_WRAPPER_TIMER_CALLBACK(CFRunLoopTimerRef timer, void *info)
   if (idleTimer)
   {
     CFRunLoopTimerInvalidate(idleTimer);
+    CFRelease(idleTimer);  // ConjureAlign patch: as in viewDidMoveToWindow above
+    idleTimer = 0;
   }
   if (canary)
   {

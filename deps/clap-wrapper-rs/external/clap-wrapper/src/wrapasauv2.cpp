@@ -131,8 +131,10 @@ WrapAsAUV2::WrapAsAUV2(AUV2_Type type, const std::string &clapname, const std::s
   {
     if (initializeClapDesc())
     {
+#if CLAP_WRAPPER_LOGLEVEL > 0  // ConjureAlign patch (see deps/PATCHES.md): trace, not an error
       std::cout << "[clap-wrapper] auv2: Initialized '" << _desc->id << "' / '" << _desc->name << "' / '"
                 << _desc->version << "'" << std::endl;
+#endif
       /*
        * ToDo: Stand up the host, create the plugin instance here
        */

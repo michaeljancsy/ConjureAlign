@@ -232,6 +232,13 @@ impl BufferManager {
                     let output_channel_pointer =
                         *output_channel_pointers.ptrs.as_ptr().add(channel_idx);
 
+                    // LOCAL PATCH (ConjureAlign): a null channel pointer is silence, not memory
+                    // to read. See the aux input loop below for the hosts that send one.
+                    if input_channel_pointer.is_null() {
+                        output_slice.fill(0.0);
+                        continue;
+                    }
+
                     // If the host processes the main IO out of place then the inputs need to be
                     // copied to the output buffers. Otherwise the input should already be there.
                     if input_channel_pointer != output_channel_pointer {
@@ -265,8 +272,14 @@ impl BufferManager {
             )
         {
             // Since these buffers are backed by our own storage, we can fill them with zeroes if
-            // the pointers are missing for whatever reason that might be
-            nih_debug_assert!(input_channel_pointers.is_some());
+            // the pointers are missing for whatever reason that might be.
+            //
+            // LOCAL PATCH (ConjureAlign): the `nih_debug_assert!(is_some())` that stood here is
+            // gone. A missing pointer set is no longer a wrapper bug: the VST3 wrapper now
+            // leaves it `None` when the host omits a trailing deactivated input bus, which the
+            // VST3 spec permits, and the zero-fill below is exactly the right outcome for it.
+            // Under `cfg(test)` that assert is a hard `debug_assert!`, which is also what
+            // would have failed the regression test in `wrapper/vst3/wrapper.rs`.
             match input_channel_pointers {
                 Some(input_channel_pointers) => {
                     nih_debug_assert_eq!(input_channel_pointers.num_channels, input_storage.len());
@@ -276,27 +289,50 @@ impl BufferManager {
                         .take(input_channel_pointers.num_channels)
                     {
                         let input_channel_pointer =
-                            input_channel_pointers.ptrs.as_ptr().add(channel_idx);
+                            *input_channel_pointers.ptrs.as_ptr().add(channel_idx);
 
                         nih_debug_assert!(num_samples <= channel.capacity());
                         channel.resize(num_samples, 0.0);
+
+                        // LOCAL PATCH (ConjureAlign): a host may hand over a deactivated bus
+                        // with its channel count intact and every channel pointer null. JUCE's
+                        // VST3 hosting does exactly that (numChannels = the layout's,
+                        // silenceFlags all set), and nih-plug ignores `activateBus`, so the
+                        // sidechain arrives that way whenever such a host switches it off.
+                        // Upstream read through the null pointer and took the host down
+                        // (Plug-in Bench's "Bus layouts" check, 2026-11-09). It is silence.
+                        if input_channel_pointer.is_null() {
+                            channel.fill(0.0);
+                            continue;
+                        }
+
                         channel.copy_from_slice(std::slice::from_raw_parts_mut(
-                            (*input_channel_pointer).add(sample_offset),
+                            input_channel_pointer.add(sample_offset),
                             num_samples,
                         ))
                     }
 
                     // In case we were provided too few channels we'll fill the rest with zeroes to
                     // avoid unexpected situations
+                    //
+                    // LOCAL PATCH (ConjureAlign): and make them one block long, like every other
+                    // channel. Upstream only zeroed them, so they kept whatever length they had
+                    // (`max_buffer_size` at first), which breaks `Buffer`'s rule that every
+                    // channel is `num_samples` long. `resize` stays within the capacity reserved
+                    // up front, so this does not allocate on the audio thread.
                     for channel in input_storage
                         .iter_mut()
                         .skip(input_channel_pointers.num_channels)
                     {
+                        channel.resize(num_samples, 0.0);
                         channel.fill(0.0);
                     }
                 }
                 None => {
+                    // LOCAL PATCH (ConjureAlign): resized for the same reason as just above. This
+                    // arm is reached on every block whose host omits the bus.
                     for channel in input_storage.iter_mut() {
+                        channel.resize(num_samples, 0.0);
                         channel.fill(0.0);
                     }
                 }
@@ -323,42 +359,42 @@ impl BufferManager {
             .iter()
             .zip(self.aux_output_buffers.iter_mut())
         {
+            // LOCAL PATCH (ConjureAlign): a bus the host did not hand over becomes a
+            // ZERO-length buffer. Upstream kept `num_samples` and emptied the channel slices
+            // inside the same `set_slices` call, which breaks the `Buffer` invariant that every
+            // channel is `num_samples` long (its per-sample iterators index into those
+            // slices), and asserted `output_slices.len() == 0` first — a condition that can
+            // never hold, since the slice count is the port's declared channel count. Both
+            // fired on every block in which a host omitted a trailing aux output bus, which
+            // the VST3 spec allows, and the assert hard-fails under `cfg(test)`.
+            let Some(output_channel_pointers) = output_channel_pointers else {
+                output_buffer.set_slices(0, |output_slices| output_slices.fill_with(|| &mut []));
+                continue;
+            };
+
             output_buffer.set_slices(num_samples, |output_slices| {
-                match output_channel_pointers {
-                    Some(output_channel_pointers) => {
-                        nih_debug_assert_eq!(
-                            output_slices.len(),
-                            output_channel_pointers.num_channels
-                        );
-                        for (channel_idx, output_slice) in output_slices
-                            .iter_mut()
-                            .enumerate()
-                            .take(output_channel_pointers.num_channels)
-                        {
-                            let output_channel_pointer =
-                                output_channel_pointers.ptrs.as_ptr().add(channel_idx);
+                nih_debug_assert_eq!(output_slices.len(), output_channel_pointers.num_channels);
+                for (channel_idx, output_slice) in output_slices
+                    .iter_mut()
+                    .enumerate()
+                    .take(output_channel_pointers.num_channels)
+                {
+                    let output_channel_pointer =
+                        output_channel_pointers.ptrs.as_ptr().add(channel_idx);
 
-                            *output_slice = std::slice::from_raw_parts_mut(
-                                (*output_channel_pointer).add(sample_offset),
-                                num_samples,
-                            );
+                    *output_slice = std::slice::from_raw_parts_mut(
+                        (*output_channel_pointer).add(sample_offset),
+                        num_samples,
+                    );
 
-                            // The host may not zero out the buffers, and assume the plugin always
-                            // write something there
-                            output_slice.fill(0.0);
-                        }
-
-                        // If the caller/host should have provided buffer pointers but didn't then
-                        // we must get rid of any dangling slices
-                        output_slices[output_channel_pointers.num_channels..].fill_with(|| &mut [])
-                    }
-                    None => {
-                        nih_debug_assert_eq!(output_slices.len(), 0);
-
-                        // Same as above
-                        output_slices.fill_with(|| &mut [])
-                    }
+                    // The host may not zero out the buffers, and assume the plugin always
+                    // write something there
+                    output_slice.fill(0.0);
                 }
+
+                // If the caller/host should have provided buffer pointers but didn't then
+                // we must get rid of any dangling slices
+                output_slices[output_channel_pointers.num_channels..].fill_with(|| &mut [])
             });
         }
 

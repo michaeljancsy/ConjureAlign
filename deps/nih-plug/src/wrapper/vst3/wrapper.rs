@@ -1266,7 +1266,12 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                                     .enumerate()
                                 {
                                     let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                    if aux_input_idx > data.num_outputs as usize {
+                                    // LOCAL PATCH (ConjureAlign): upstream compared against `num_outputs`, with `>`.
+                                    // A host that omits a trailing deactivated input bus (the VST3 spec allows it:
+                                    // "the plug-in should check numInputs and numOutputs") therefore made this
+                                    // read one `AudioBusBuffers` PAST the host's array and dereference whatever
+                                    // pointer it found there. See deps/PATCHES.md.
+                                    if aux_input_idx >= data.num_inputs.max(0) as usize {
                                         break;
                                     }
 
@@ -1290,7 +1295,8 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                                     .enumerate()
                                 {
                                     let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                    if aux_output_idx > data.num_outputs as usize {
+                                    // LOCAL PATCH (ConjureAlign): same off-by-one as the input loop above.
+                                    if aux_output_idx >= data.num_outputs.max(0) as usize {
                                         break;
                                     }
 
@@ -1318,6 +1324,10 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
                             buffers
                                 .aux_outputs
                                 .iter()
+                                // LOCAL PATCH (ConjureAlign): an aux output bus the host omitted is a
+                                // zero-length buffer (see `buffer_management.rs`), not a host that failed
+                                // to provide buffers, so it must not veto processing the block.
+                                .filter(|buffer| buffer.samples() > 0)
                                 .flat_map(|buffer| buffer.as_slice_immutable().iter()),
                         )
                     {
@@ -1891,5 +1901,363 @@ impl<P: Vst3Plugin> IUnitInfo for Wrapper<P> {
         _data: SharedVstPtr<dyn IBStream>,
     ) -> tresult {
         kInvalidArgument
+    }
+}
+
+// LOCAL PATCH (ConjureAlign): regression test for the aux-bus bounds fix in `process()` above.
+// Run with
+//
+//     cargo test --manifest-path deps/nih-plug/Cargo.toml -p nih_plug --lib vst3::wrapper::tests
+//
+// Against the unpatched `>`/`num_outputs` guards it fails on both the sidechain input and the
+// aux output assertion. See deps/PATCHES.md in the plugin repository.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicU32, AtomicUsize};
+    use vst3_sys::vst::{AudioBusBuffers, ProcessData, ProcessSetup, SymbolicSampleSizes};
+
+    use crate::prelude::*;
+
+    /// The first sample of the sidechain input's channel 0 as the plug-in saw it in its last
+    /// `process()` call, as `f32` bits. `u32::MAX` means `process()` never ran.
+    static AUX_IN_FIRST_SAMPLE_BITS: AtomicU32 = AtomicU32::new(u32::MAX);
+    /// `Buffer::samples()` of that sidechain input.
+    static AUX_IN_SAMPLES: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    /// What sits in the bus descriptors the host did NOT hand over. If the wrapper reads past
+    /// `numInputs`/`numOutputs`, these are what it finds.
+    const POISON_IN: f32 = 12345.0;
+    const POISON_OUT: f32 = 777.0;
+    /// What the plug-in writes into whatever aux output buffer it is given.
+    const MARKER: f32 = -1.0;
+
+    /// The statics above are shared, and cargo runs tests on parallel threads.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct NoParams;
+
+    unsafe impl Params for NoParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            Vec::new()
+        }
+    }
+
+    /// Stereo in/out plus one stereo sidechain input and one stereo aux output — the same
+    /// bus shape as a plug-in with a reference input, plus an aux output so the mirror
+    /// guard is exercised too.
+    struct SidechainPlugin {
+        params: Arc<NoParams>,
+    }
+
+    impl Default for SidechainPlugin {
+        fn default() -> Self {
+            Self {
+                params: Arc::new(NoParams),
+            }
+        }
+    }
+
+    impl Plugin for SidechainPlugin {
+        const NAME: &'static str = "aux-bus bounds test";
+        const VENDOR: &'static str = "ConjureAlign";
+        const URL: &'static str = "";
+        const EMAIL: &'static str = "";
+        const VERSION: &'static str = "0.0.0";
+
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            aux_input_ports: &[new_nonzero_u32(2)],
+            aux_output_ports: &[new_nonzero_u32(2)],
+            ..AudioIOLayout::const_default()
+        }];
+
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            self.params.clone()
+        }
+
+        fn process(
+            &mut self,
+            _buffer: &mut Buffer,
+            aux: &mut AuxiliaryBuffers,
+            _context: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            let aux_in = &aux.inputs[0];
+            AUX_IN_SAMPLES.store(aux_in.samples(), Ordering::SeqCst);
+            let first = aux_in
+                .as_slice_immutable()
+                .first()
+                .and_then(|channel| channel.first().copied())
+                .unwrap_or(f32::NAN);
+            AUX_IN_FIRST_SAMPLE_BITS.store(first.to_bits(), Ordering::SeqCst);
+
+            for channel in aux.outputs[0].as_slice() {
+                channel.fill(MARKER);
+            }
+
+            ProcessStatus::Normal
+        }
+    }
+
+    impl Vst3Plugin for SidechainPlugin {
+        const VST3_CLASS_ID: [u8; 16] = *b"CnjrAlignAuxBus!";
+        const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx];
+    }
+
+    fn channel_pointers(channels: &mut [Vec<f32>]) -> Vec<*mut c_void> {
+        channels
+            .iter_mut()
+            .map(|channel| channel.as_mut_ptr() as *mut c_void)
+            .collect()
+    }
+
+    /// The VST3 spec lets a host leave out trailing deactivated busses: "the plug-in should
+    /// check numInputs and numOutputs and doesn't process these busses". So the host here
+    /// passes `numInputs == numOutputs == 1` — main busses only — while the memory right
+    /// behind each one-element array holds a fully formed poison bus, exactly where the old
+    /// guard (`idx > num_outputs`, and `num_outputs` for the *input* loop) read. The plug-in
+    /// must see silence on its sidechain and must not be handed the poison output.
+    #[test]
+    fn omitted_trailing_aux_busses_are_silence_not_the_memory_behind_the_array() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        const N: usize = 16;
+
+        let mut main_in = vec![vec![0.25f32; N]; 2];
+        let mut poison_in = vec![vec![POISON_IN; N]; 2];
+        let mut main_out = vec![vec![0.0f32; N]; 2];
+        let mut poison_out = vec![vec![POISON_OUT; N]; 2];
+        let mut main_in_ptrs = channel_pointers(&mut main_in);
+        let mut poison_in_ptrs = channel_pointers(&mut poison_in);
+        let mut main_out_ptrs = channel_pointers(&mut main_out);
+        let mut poison_out_ptrs = channel_pointers(&mut poison_out);
+
+        let mut inputs = [
+            AudioBusBuffers {
+                num_channels: 2,
+                silence_flags: 0,
+                buffers: main_in_ptrs.as_mut_ptr(),
+            },
+            AudioBusBuffers {
+                num_channels: 2,
+                silence_flags: 0,
+                buffers: poison_in_ptrs.as_mut_ptr(),
+            },
+        ];
+        let mut outputs = [
+            AudioBusBuffers {
+                num_channels: 2,
+                silence_flags: 0,
+                buffers: main_out_ptrs.as_mut_ptr(),
+            },
+            AudioBusBuffers {
+                num_channels: 2,
+                silence_flags: 0,
+                buffers: poison_out_ptrs.as_mut_ptr(),
+            },
+        ];
+
+        let wrapper = Wrapper::<SidechainPlugin>::new();
+        unsafe {
+            assert_eq!(wrapper.initialize(std::ptr::null_mut()), kResultOk);
+            let setup = ProcessSetup {
+                process_mode: ProcessModes::kRealtime as i32,
+                symbolic_sample_size: SymbolicSampleSizes::kSample32 as i32,
+                max_samples_per_block: N as i32,
+                sample_rate: 48_000.0,
+            };
+            assert_eq!(wrapper.setup_processing(&setup), kResultOk);
+            assert_eq!(wrapper.set_active(1), kResultOk);
+            assert_eq!(wrapper.set_processing(1), kResultOk);
+
+            // All-zero is a valid `ProcessData`: null event/parameter queues and context.
+            let mut data: ProcessData = MaybeUninit::zeroed().assume_init();
+            data.process_mode = ProcessModes::kRealtime as i32;
+            data.symbolic_sample_size = SymbolicSampleSizes::kSample32 as i32;
+            data.num_samples = N as i32;
+            data.num_inputs = 1;
+            data.num_outputs = 1;
+            data.inputs = inputs.as_mut_ptr();
+            data.outputs = outputs.as_mut_ptr();
+            assert_eq!(wrapper.process(&mut data), kResultOk);
+
+            assert_eq!(wrapper.set_processing(0), kResultOk);
+            assert_eq!(wrapper.set_active(0), kResultOk);
+        }
+
+        // The main path ran: the wrapper copied the main input through to the main output.
+        assert!(main_out.iter().flatten().all(|&s| s == 0.25));
+        assert_eq!(AUX_IN_SAMPLES.load(Ordering::SeqCst), N);
+        // The omitted sidechain arrived as silence — not as the bus behind the host's array.
+        assert_eq!(
+            f32::from_bits(AUX_IN_FIRST_SAMPLE_BITS.load(Ordering::SeqCst)),
+            0.0,
+            "the plug-in's sidechain input was read from past the end of the host's inputs"
+        );
+        assert!(poison_in.iter().flatten().all(|&s| s == POISON_IN));
+        // And the omitted aux output was not written through to that memory either.
+        assert!(
+            poison_out.iter().flatten().all(|&s| s == POISON_OUT),
+            "the plug-in's aux output was aimed past the end of the host's outputs"
+        );
+    }
+
+    /// Runs one block through a fresh wrapper with the given busses and returns once it is
+    /// torn down again. `max_block` is what `setupProcessing` announces, `n` the block length.
+    unsafe fn run_one_block(
+        inputs: &mut [AudioBusBuffers],
+        outputs: &mut [AudioBusBuffers],
+        max_block: usize,
+        n: usize,
+    ) {
+        let wrapper = Wrapper::<SidechainPlugin>::new();
+        assert_eq!(wrapper.initialize(std::ptr::null_mut()), kResultOk);
+        let setup = ProcessSetup {
+            process_mode: ProcessModes::kRealtime as i32,
+            symbolic_sample_size: SymbolicSampleSizes::kSample32 as i32,
+            max_samples_per_block: max_block as i32,
+            sample_rate: 48_000.0,
+        };
+        assert_eq!(wrapper.setup_processing(&setup), kResultOk);
+        assert_eq!(wrapper.set_active(1), kResultOk);
+        assert_eq!(wrapper.set_processing(1), kResultOk);
+
+        let mut data: ProcessData = MaybeUninit::zeroed().assume_init();
+        data.process_mode = ProcessModes::kRealtime as i32;
+        data.symbolic_sample_size = SymbolicSampleSizes::kSample32 as i32;
+        data.num_samples = n as i32;
+        data.num_inputs = inputs.len() as i32;
+        data.num_outputs = outputs.len() as i32;
+        data.inputs = inputs.as_mut_ptr();
+        data.outputs = outputs.as_mut_ptr();
+        assert_eq!(wrapper.process(&mut data), kResultOk);
+
+        assert_eq!(wrapper.set_processing(0), kResultOk);
+        assert_eq!(wrapper.set_active(0), kResultOk);
+    }
+
+    /// JUCE's VST3 hosting hands over a deactivated bus with its channel count intact, every
+    /// channel pointer null and every silence flag set. nih-plug ignores `activateBus`, so a
+    /// switched-off sidechain arrives exactly like this, and the wrapper used to read straight
+    /// through the null pointer: Plug-in Bench's "Bus layouts" check crashed on every run.
+    #[test]
+    fn a_deactivated_aux_bus_with_null_channel_pointers_is_silence() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        const N: usize = 16;
+
+        let mut main_in = vec![vec![0.25f32; N]; 2];
+        let mut main_out = vec![vec![0.0f32; N]; 2];
+        let mut aux_out = vec![vec![0.0f32; N]; 2];
+        let mut main_in_ptrs = channel_pointers(&mut main_in);
+        let mut main_out_ptrs = channel_pointers(&mut main_out);
+        let mut aux_out_ptrs = channel_pointers(&mut aux_out);
+        let mut null_ptrs: Vec<*mut c_void> = vec![std::ptr::null_mut(); 2];
+
+        let mut inputs = [
+            AudioBusBuffers {
+                num_channels: 2,
+                silence_flags: 0,
+                buffers: main_in_ptrs.as_mut_ptr(),
+            },
+            AudioBusBuffers {
+                num_channels: 2,
+                silence_flags: u64::MAX,
+                buffers: null_ptrs.as_mut_ptr(),
+            },
+        ];
+        let mut outputs = [
+            AudioBusBuffers {
+                num_channels: 2,
+                silence_flags: 0,
+                buffers: main_out_ptrs.as_mut_ptr(),
+            },
+            AudioBusBuffers {
+                num_channels: 2,
+                silence_flags: 0,
+                buffers: aux_out_ptrs.as_mut_ptr(),
+            },
+        ];
+
+        AUX_IN_FIRST_SAMPLE_BITS.store(u32::MAX, Ordering::SeqCst);
+        unsafe { run_one_block(&mut inputs, &mut outputs, N, N) };
+
+        assert!(main_out.iter().flatten().all(|&s| s == 0.25));
+        assert_eq!(AUX_IN_SAMPLES.load(Ordering::SeqCst), N);
+        assert_eq!(
+            f32::from_bits(AUX_IN_FIRST_SAMPLE_BITS.load(Ordering::SeqCst)),
+            0.0,
+            "a sidechain with null channel pointers did not arrive as silence"
+        );
+        assert!(aux_out.iter().flatten().all(|&s| s == MARKER));
+    }
+
+    /// An omitted sidechain in a block shorter than the maximum must still be exactly one block
+    /// long. The zero-fill used to keep the storage's previous length, `max_buffer_size` at
+    /// first, which breaks `Buffer`'s rule that every channel is `num_samples` long.
+    #[test]
+    fn an_omitted_aux_bus_is_one_block_long() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        const MAX: usize = 64;
+        const N: usize = 16;
+
+        let mut main_in = vec![vec![0.25f32; N]; 2];
+        let mut main_out = vec![vec![0.0f32; N]; 2];
+        let mut main_in_ptrs = channel_pointers(&mut main_in);
+        let mut main_out_ptrs = channel_pointers(&mut main_out);
+
+        let mut inputs = [AudioBusBuffers {
+            num_channels: 2,
+            silence_flags: 0,
+            buffers: main_in_ptrs.as_mut_ptr(),
+        }];
+        let mut outputs = [AudioBusBuffers {
+            num_channels: 2,
+            silence_flags: 0,
+            buffers: main_out_ptrs.as_mut_ptr(),
+        }];
+
+        AUX_IN_SAMPLES.store(usize::MAX, Ordering::SeqCst);
+        unsafe { run_one_block(&mut inputs, &mut outputs, MAX, N) };
+
+        assert_eq!(
+            AUX_IN_SAMPLES.load(Ordering::SeqCst),
+            N,
+            "the omitted sidechain was not as long as the block"
+        );
+        assert_eq!(f32::from_bits(AUX_IN_FIRST_SAMPLE_BITS.load(Ordering::SeqCst)), 0.0);
+    }
+
+    /// Same as the sidechain case, on the main input: a null channel pointer copies silence to
+    /// the output instead of reading address zero.
+    #[test]
+    fn a_main_input_with_null_channel_pointers_is_silence() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        const N: usize = 16;
+
+        let mut main_out = vec![vec![9.0f32; N]; 2];
+        let mut main_out_ptrs = channel_pointers(&mut main_out);
+        let mut null_ptrs: Vec<*mut c_void> = vec![std::ptr::null_mut(); 2];
+
+        let mut inputs = [AudioBusBuffers {
+            num_channels: 2,
+            silence_flags: u64::MAX,
+            buffers: null_ptrs.as_mut_ptr(),
+        }];
+        let mut outputs = [AudioBusBuffers {
+            num_channels: 2,
+            silence_flags: 0,
+            buffers: main_out_ptrs.as_mut_ptr(),
+        }];
+
+        unsafe { run_one_block(&mut inputs, &mut outputs, N, N) };
+
+        assert!(
+            main_out.iter().flatten().all(|&s| s == 0.0),
+            "a main input with null channel pointers was not copied through as silence"
+        );
     }
 }

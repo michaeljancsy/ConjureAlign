@@ -1,7 +1,7 @@
 # Vendored `clap-wrapper-rs`
 
 `deps/clap-wrapper-rs` is [blepfx/clap-wrapper-rs](https://github.com/blepfx/clap-wrapper-rs)
-**0.3.1**, exactly as published to crates.io, with four deliberate differences:
+**0.3.1**, exactly as published to crates.io, with five deliberate differences:
 
 1. `external/vst3sdk/` is deleted. We never compile it — the crate's `vst3` feature is off
    (see `Cargo.toml`: enabling it would export `GetPluginFactory`, `bundleEntry` and
@@ -19,6 +19,8 @@
 3. The AUv2 mono patch, below.
 4. The stopped-host patch, below. Its hunks are marked `ConjureWidth patch` (taken unchanged
    from ConjureWidth, which found the faults) or `ConjureAlign patch` (only here).
+5. Two small fixes, below: the editor's idle timer is released, and release builds no longer
+   print the wrapper's trace. Marked `ConjureAlign patch`.
 
 It is a path dependency rather than a crates.io one because upstream's
 `CLAP_WRAPPER_CPP_DIR` escape hatch — which exists precisely so you can build against your
@@ -230,6 +232,25 @@ Alignment On shows as a plain checkbox with no "Base Channel" wording.
 `tests/au_host_test.m` checks all of this, including changes from a background thread and
 from the audio thread part-way into a block. See "Verifying" below.
 
+## Two small fixes: the idle timer, and quiet release builds
+
+Both found on 2026-11-09 by testing with Plug-in Bench and macOS's `leaks` tool.
+
+- **The idle timer.** `wrappedview.asinclude.mm` creates a 50 ms run-loop timer for every
+  editor it opens (`CFRunLoopTimerCreate`, so we own a reference) and on close only
+  invalidates it, which takes away the run loop's reference and leaves ours. One 320-byte
+  timer leaked per open. Both places that invalidate it now `CFRelease` it as well.
+- **Quiet release builds.** `build.rs` never defines `NDEBUG`, and `detail/os/log.h` turns
+  full logging on whenever `NDEBUG` is missing, so every AU build, release included, printed
+  the wrapper's trace (`Setup Busses: …`, `PostConstructor: …`) onto the host's standard
+  output. That spammed host logs and broke any tool that reads the host's output as data:
+  Plug-in Bench's `--json` output for the AU started with those lines. `build.rs` now defines
+  `CLAP_WRAPPER_LOGLEVEL=0` when Cargo's `PROFILE` is `release` (not `DEBUG`, which is "true"
+  in release too, because the release profile keeps limited debug info). One trace line in
+  `wrapasauv2.cpp` printed with `std::cout` directly, so it sits behind the same switch. The
+  `[ERROR]` lines still print. `NDEBUG` stays undefined on purpose, so the C++ `assert`s
+  behave as before.
+
 ## Verifying the patch after a change
 
 ```bash
@@ -266,7 +287,9 @@ the plugin, so with the real settings it would send a "Plugin Loaded" event, sta
 crash-reporting session and check for updates (it refuses to start with the real `HOME`). It
 prints one line per check and exits with 0 only if all pass. Against 1.4.0, the last build
 without these patches, 38 checks fail and its final section crashes the program; 1.4.1 passes
-all of them.
+all of them. It also checks that opening and closing the editor keeps no memory, which is the
+baseview fork's third commit (below): against a build without that commit the check fails with
+about 46 MB kept per open/close, and with it 0.06 MB.
 
 ## Upstream
 
@@ -353,7 +376,8 @@ context's drawable and takes the view out of its parent before releasing both.
 warm-up cycles: ConjureAlign kept about 53 MB per open and close before, 0.04 MB after. (Not run through Plug-in Bench: its installed copy is the release
 build in /Library.)
 The plugin's own tests and host test pass unchanged. The same fix, found first, is in
-ConjureGroove's vendored copy of the fork.
+ConjureGroove's vendored copy of the fork. `tests/au_host_test.m` now measures the per-cycle
+growth directly, so a regression fails the host test rather than a manual run.
 
 **Maintenance.** When nih-plug/egui-baseview move past `3e12973`, rebase all three commits
 onto the new upstream rev and update the `[patch]` rev — do not drop the fork. Note the
@@ -364,7 +388,7 @@ fork network), so pushing any branch based on modern upstream uploads history to
 
 ---
 
-# Vendored `nih_plug` (shared-background-worker teardown patch, flush patch)
+# Vendored `nih_plug` (three patches: worker teardown, flush, aux-bus bounds)
 
 `deps/nih-plug` is [robbert-vdh/nih-plug](https://github.com/robbert-vdh/nih-plug) at
 `f36931f7af4646065488a9845d8f8c2f95252c23` — the exact rev Cargo.lock pins — applied through
@@ -385,8 +409,10 @@ Deliberate differences from upstream, in full:
    `Cargo.lock` is upstream's, pruned by cargo to the trimmed workspace on the first
    vendored-test run (the surviving entries keep upstream's versions); it governs only the
    vendored test runs below — the plugin itself builds against the root workspace's lock.
-2. **The teardown patch and its regression tests** in `src/event_loop/background_thread.rs`.
-   Every hunk is marked `LOCAL PATCH (ConjureAlign)`.
+2. **The teardown patch and the aux-bus bounds patch, each with a regression test.** The
+   teardown patch lives in `src/event_loop/background_thread.rs`; the aux-bus bounds patch
+   touches `src/wrapper/vst3/wrapper.rs`, `src/wrapper/clap/wrapper.rs` and
+   `src/wrapper/util/buffer_management.rs`. Their hunks are marked `LOCAL PATCH (ConjureAlign)`.
 3. **The flush patch** in `ext_params_flush()` in `src/wrapper/clap/wrapper.rs`, marked
    `LOCAL PATCH (ConjureWidth)` because it was written there and copied unchanged.
    `grep -rn "LOCAL PATCH" deps/nih-plug` is the complete diff map.
@@ -440,6 +466,71 @@ inside plugin code when `destroy` returns, by definition of the scenario — and
 needs an upstream design change (destroy synchronizing with in-flight tasks); the issue draft
 says so. The patch makes teardown non-fatal and keeps surviving instances working.
 
+## The second patch: an omitted trailing bus must not be read past the host's array
+
+Found 2026-09-09 while chasing a LUNA/Windows crash-on-insert (issues #18 and #37): the
+plug-in dies the instant it is inserted, on mono and stereo tracks alike, on every release,
+while Studio One is fine. Nothing in Sentry — the reporter never reached the editor, so they
+were never asked for consent — so this came from reading the wrapper.
+
+**The bug.** In the VST3 wrapper's `process()`, the loop that picks up the auxiliary
+*input* busses from `ProcessData` guarded with
+
+```rust
+if aux_input_idx > data.num_outputs as usize { break; }
+let audio_input = &*data.inputs.add(aux_input_idx);
+```
+
+— the *output* bus count, and `>` rather than `>=`. ConjureAlign's "Reference" sidechain is
+input bus 1 and it has one output bus, so a host that passes `numInputs == 1` (main bus
+only) sails through the guard and the wrapper reads `inputs[1]`: one `AudioBusBuffers`
+past the end of the host's array. Whatever `buffers` pointer sits in that memory is then
+dereferenced as channel data by `buffer_management.rs` — an access violation inside our
+DLL on the very first process call. The aux *output* loop has the same off-by-one (`>` on
+the right count), and the CLAP wrapper mirrors both (`>` on `audio_inputs_count` /
+`audio_outputs_count`), though CLAP hosts must pass every port so that half is defensive.
+
+**Why a host does that.** Steinberg's VST 3 FAQ on processing, verbatim: "When these
+deactivated busses are the last busses (for input or output), the host do not need to
+provide associated AudioBusBuffers, in this case the plug-in should check numInputs and
+numOutputs and doesn't process these busses." An unrouted sidechain at insert time is
+exactly a trailing deactivated input bus. A host that honours that sentence crashes every
+nih-plug plug-in with a sidechain; a host that passes all busses with null pointers (REAPER,
+Ableton, Studio One, Bitwig — everything the plug-in was tested in) never trips it. LUNA
+processes continuously even with the transport stopped, so insert means an immediate
+process call. All of that fits the report; none of it is confirmed by a LUNA crash dump.
+
+**The fix.** Four one-token guards — `>= num_inputs` for the input loops, `>= num_outputs`
+for the output loops (the VST3 ones clamp a negative count to zero, since `as usize` on a
+negative `i32` would otherwise defeat the comparison) — so an omitted bus leaves its
+`ChannelPointers` as `None`. The buffer manager then had to be taught what `None` means,
+because upstream's handling of it was broken in both directions: on the aux *input* side a
+`nih_debug_assert!(is_some())` contradicted the zero-fill right under it; on the aux *output*
+side the `None` arm asserted `output_slices.len() == 0`, which can never hold (the slice
+count is the port's declared channel count), and then emptied the channel slices while still
+declaring the full block length — a `Buffer` whose `samples()` says 16 over channels of
+length 0, which the type documents as a panic waiting to happen in its per-sample iterators.
+Now an omitted input bus is silence of the block length and an omitted output bus is a
+zero-length buffer, both asserts are gone, and the "every output slice must be non-empty"
+validity scan in each wrapper's `process()` — which would otherwise have vetoed the whole
+block for that zero-length aux output, silently stopping the plug-in — skips zero-length aux
+outputs. Every hunk is marked `LOCAL PATCH`. (Both
+asserts were also hard `debug_assert!`s under `cfg(test)`, where the regression test died on
+each of them in turn before this was sorted out.)
+
+**A second way in: a switched-off bus sent with null channel pointers** (found 2026-11-09).
+The fix above was not enough for Plug-in Bench, whose VST3 "Bus layouts" check switches the
+sidechain off: the patched build still crashed on every run, at the same line of
+`buffer_management.rs`. That host (built on JUCE) does not omit the bus. It sends it with its
+channel count intact, every channel pointer null and every silence flag set. nih-plug ignores
+`activateBus`, so the wrapper took that as a live sidechain and copied from address zero. The
+buffer manager now reads a null channel pointer as silence, on the aux inputs and also on the
+main input. While there: a zero-filled aux input channel (an omitted bus, or a bus with fewer
+channels than the port) kept whatever length it had before, `max_buffer_size` at first, so the
+sidechain could be longer than the block. Such channels are now resized to the block length.
+That stays within the capacity reserved up front, so nothing allocates on the audio thread.
+After this, Plug-in Bench passed every check on three runs out of three.
+
 ## Verifying the patch after a change
 
 ```bash
@@ -452,9 +543,25 @@ fail via its panic-hook counter — it counts panics on the `bg-worker` thread, 
 the EDEADLK join panic lands, invisible to the harness otherwise — and makes
 `dead_executor_does_not_kill_the_shared_worker` **abort the entire test process**: the
 `.expect` in `Drop` fires while the failed assertion is already unwinding, "thread caused
-non-unwinding panic. aborting." — the host-abort mechanism reproduced in miniature. The usual
-gates (`cargo test --release`, `cargo clippy --all-targets`, a bundle build) cover
-integration.
+non-unwinding panic. aborting." — the host-abort mechanism reproduced in miniature.
+
+```bash
+cargo test --manifest-path deps/nih-plug/Cargo.toml -p nih_plug --lib vst3::wrapper::tests
+```
+
+That is the aux-bus test: a real `Wrapper<P>` around a test plug-in with one sidechain input
+and one aux output, driven through `initialize` → `setup_processing` → `set_active` →
+`set_processing` → `process` with `numInputs == numOutputs == 1`, where a fully formed poison
+bus sits in the memory right behind each one-element array — i.e. exactly where the old
+guards read. It asserts that the plug-in saw silence on its sidechain and that the poison
+output bus was never written to. Verified by mutation (2026-10-02): revert only the input
+guard and it fails on the sidechain assertion with the poison value (12345); revert only the
+output guard and it fails on the poison-output assertion. Three more tests in the same module
+(2026-11-09) send a sidechain with null channel pointers, a main input with null channel
+pointers, and an omitted sidechain in a block shorter than the maximum. Verified the same way:
+without either null check the test program aborts, which is the fault Plug-in Bench hit, and
+without the resize the length test fails. The usual gates
+(`cargo test --release`, `cargo clippy --all-targets`, a bundle build) cover integration.
 
 Cargo does not `--cap-lints allow` path dependencies the way it does git dependencies, so the
 vendored crate surfaces three of upstream's own warnings in our builds (an unused import in
@@ -472,14 +579,20 @@ and silent behavior skew at worst. To bump nih-plug:
 2. Re-vendor: copy the new checkout (`~/.cargo/git/checkouts/nih-plug-*/<rev>/`) over
    `deps/nih-plug` with the same trim — keep the root files, `src/` and `nih_plug_derive/`,
    delete the rest — and re-trim the `[workspace]` members list.
-3. Check whether upstream fixed the bugs: they are present while `WorkerThread::drop` still
-   `.expect`s on send/join and the worker loop's upgrade-failure arm still `return`s. If both
-   are fixed, drop the teardown hunks in step 4.
-4. Re-apply the patches: every hunk is marked `LOCAL PATCH (ConjureAlign)` in
+3. Check whether upstream fixed the bugs: the teardown ones are present while
+   `WorkerThread::drop` still `.expect`s on send/join and the worker loop's upgrade-failure
+   arm still `return`s; the aux-bus one is present while the VST3 `process()` aux-input loop
+   still compares against `data.num_outputs` (upstream master still did on 2026-10-02). Drop
+   the hunks of any bug upstream fixed in step 4; if upstream fixed all three, including the
+   flush, drop the vendor and the `[patch]` entry instead of steps 4–6.
+4. Re-apply the patches: every hunk is marked `LOCAL PATCH (ConjureAlign)` or
+   `LOCAL PATCH (ConjureWidth)` —
    `src/event_loop/background_thread.rs` (three hunks: the `Drop` impl, the worker loop's
-   `None` arm, the `tests` module), plus the `LOCAL PATCH (ConjureWidth)` hunk in
-   `ext_params_flush()` in `src/wrapper/clap/wrapper.rs`. If upstream fixed the teardown bugs
-   but not the flush, keep the vendor for the flush patch alone.
+   `None` arm, the `tests` module), `src/wrapper/vst3/wrapper.rs` (the two guards, the
+   validity-scan filter and the `tests` module), `src/wrapper/clap/wrapper.rs` (the two
+   guards, the validity-scan filter, and the `LOCAL PATCH (ConjureWidth)` hunk in
+   `ext_params_flush()`) and `src/wrapper/util/buffer_management.rs` (the aux-input assert,
+   the aux-output `None` arm, the two null-channel-pointer checks and the two resizes).
 5. Re-copy and re-patch `deps/nih_plug_egui` from the same checkout (see its section below).
 6. Re-run the verify commands above, and `tests/au_host_test.m`.
 
@@ -489,7 +602,9 @@ Not reported as of 2026-08-28. The complete issue draft — mechanism, permalink
 reproduction tests, suggested diff — is
 [`docs/upstream/nih-plug-worker-teardown.md`](../docs/upstream/nih-plug-worker-teardown.md),
 written to be pasted into a robbert-vdh/nih-plug issue after review. File it manually;
-nothing in this repo posts it anywhere.
+nothing in this repo posts it anywhere. The aux-bus patch has its own draft,
+[`docs/upstream/nih-plug-vst3-aux-bus-oob.md`](../docs/upstream/nih-plug-vst3-aux-bus-oob.md),
+same arrangement, not filed as of 2026-10-02.
 
 The nearest existing upstream report is
 [nih-plug#222](https://github.com/robbert-vdh/nih-plug/issues/222) with open PR
