@@ -162,6 +162,14 @@ fn build_auv2(debug: bool) {
     cc.define("CLAP_WRAPPER_BUILD_AUV2", Some("1"));
     cc.define("STATICALLY_LINKED_CLAP_ENTRY", Some("1"));
     cc.define("DICTIONARY_STREAM_FORMAT_WRAPPER", Some("1"));
+    // ConjureAlign patch (see deps/PATCHES.md): nothing here defines NDEBUG, and
+    // `detail/os/log.h` turns full logging on whenever NDEBUG is missing, so every AU build,
+    // release included, printed the wrapper's trace onto the host's standard output. Silence it
+    // in release builds only. `DEBUG` cannot tell them apart: the release profile keeps limited
+    // debug info, so Cargo sets it to "true" there too.
+    if std::env::var("PROFILE").as_deref() == Ok("release") {
+        cc.define("CLAP_WRAPPER_LOGLEVEL", Some("0"));
+    }
     cc.define(
         "CLAP_WRAPPER_COCOA_CLASS_NSVIEW",
         Some(format!("wrapAsAUV2_cocoaUI_nsview_{}", time).as_str()),

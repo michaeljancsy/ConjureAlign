@@ -2080,7 +2080,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                if aux_input_idx > process.audio_inputs_count as usize {
+                                // LOCAL PATCH (ConjureAlign): `>` let `aux_input_idx == audio_inputs_count`
+                                // through, one port past the end. CLAP hosts must pass every port, so this is
+                                // defensive; the VST3 wrapper carries the live version. See deps/PATCHES.md.
+                                if aux_input_idx >= process.audio_inputs_count as usize {
                                     break;
                                 }
 
@@ -2104,7 +2107,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                if aux_output_idx > process.audio_outputs_count as usize {
+                                // LOCAL PATCH (ConjureAlign): same off-by-one as the input loop above.
+                                if aux_output_idx >= process.audio_outputs_count as usize {
                                     break;
                                 }
 
@@ -2133,6 +2137,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                     buffers
                         .aux_outputs
                         .iter()
+                        // LOCAL PATCH (ConjureAlign): an aux output bus the host omitted is a
+                        // zero-length buffer (see `buffer_management.rs`), not a host that failed
+                        // to provide buffers, so it must not veto processing the block.
+                        .filter(|buffer| buffer.samples() > 0)
                         .flat_map(|buffer| buffer.as_slice_immutable().iter()),
                 ) {
                     if output_buffer_slice.is_empty() {

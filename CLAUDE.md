@@ -113,13 +113,26 @@ stripped) for exactly that, so a glyph the fonts lack fails `cargo test`, not a 
   its own process, opens the real editor, clicks and drags its controls, and checks that
   changes from the editor, the host's main thread, a background thread and the audio thread
   all reach both sides with audio stopped, running and switching between the two, plus gesture
-  messages, parameter units and choice names, restoring settings, and resizing. Build and run
+  messages, parameter units and choice names, restoring settings, resizing, and that opening
+  and closing the editor keeps no memory. That last check gives each open/close its own
+  autorelease pool, as each turn of a host's event loop does: the test program runs no event
+  loop, and the wrapper hands its view over autoreleased, so without the pools no view would
+  ever be freed and the check could not tell a leak from a fix. Build and run
   commands are at the top of the file. Always run it with `HOME` set to a scratch folder whose
   settings decline analytics and updates, as shown there — it refuses the real `HOME`, because
   loading the plugin with this Mac's consent answers sends real analytics, crash-reporting and
   update-check traffic. Its click positions are measured from the editor's layout (Align and
   Polarity centred in the bottom panel, Trim at its left), so moving those controls means
   re-measuring the constants near `align_x()`.
+- Plug-in Bench (`~/.local/bin/plugin-bench`, a third-party host that stress-tests a VST3/AU and
+  reports pass/warn/fail with numbers): run it with `HOME` pointing at a scratch folder whose
+  settings decline analytics and updates, plus the three addresses pointing nowhere, exactly as
+  for `tests/au_host_test.m`. Plug-in Bench finds its own catalog without `HOME`, and the
+  processes it starts inherit it. Never run `plugin-bench scan` without asking, not even with
+  `--folder`: it also retries every Audio Unit it has not catalogued, which loads third-party
+  plug-ins (a PACE-protected one, on this Mac). `test` takes only catalogued plug-ins, by name
+  or identifier, never a path. Its "Bus layouts" check is what found the VST3 sidechain crash,
+  and "Editor open / close cycles" found the baseview leak.
 - Release: `./scripts/release.sh` — universal build, sign, notarize, and package into
   `dist/ConjureAlign-<version>-macOS.pkg`, a signed installer whose component packages
   target `/Library/Audio/Plug-Ins/{VST3,CLAP,Components}` (AU postinstall clears the
@@ -902,6 +915,11 @@ in two places: it keeps each host change's position within the block, because th
 as every release had) where ConjureWidth reports declaration order — see deps/PATCHES.md for
 why the order decides which control Logic mislabels. `tests/au_host_test.m` covers all of it.
 
+Two smaller local fixes ride in the same vendored tree (deps/PATCHES.md, "Two small fixes"):
+the editor's 50 ms idle timer is released when the editor closes (one leaked per open), and
+release builds define `CLAP_WRAPPER_LOGLEVEL=0`. Upstream's build defines no `NDEBUG`, so every
+AU build printed the wrapper's trace onto the host's standard output.
+
 The generated `AudioComponents` entry deliberately carries `resourceUsage` and NO
 `sandboxSafe` key, matching what clap-wrapper's own CMake build-helper emits — claiming
 untested sandbox-safety only buys a stricter hosting path that can fail silently, and
@@ -954,13 +972,37 @@ plugins that retain the `AsyncExecutor` from `Plugin::editor()`, and ours ignore
 reachable here, and equally what keeps our own Drop-chain invariants (joined analytics/Sentry
 threads) working.
 
+The same vendored tree carries another local patch, unrelated to teardown (and to the AU
+flush patch): the VST3
+wrapper's `process()` picked up auxiliary input busses behind the guard
+`aux_input_idx > data.num_outputs` — the wrong count and the wrong operator — so a host that
+hands over only the main input bus made it read one `AudioBusBuffers` past the end of the
+host's array and dereference the pointer it found there. The VST3 spec explicitly lets a
+host omit trailing deactivated busses ("the plug-in should check numInputs and numOutputs"),
+and an unrouted sidechain at insert time is exactly that, which is the leading explanation
+for the LUNA/Windows crash-on-insert (issues #18/#37; unconfirmed — no dump). It reproduces
+on macOS too: Plug-in Bench's VST3 "Bus layouts" check, which disables the optional
+sidechain, segfaulted at address 0 in `BufferManager::create_buffers` on every run of 1.3.0
+and 1.4.1 (2026-11-09). It took a second fix in the same patch to stop it: that host does not
+omit the switched-off bus but sends it with null channel pointers, and nih-plug ignores
+`activateBus`, so the buffer manager now reads a null channel pointer as silence. The aux
+output loop and both CLAP loops had the mirror off-by-one, and `buffer_management.rs`
+mishandled an absent bus (a soft assert that could never hold, and an aux output buffer
+declaring the block length over empty channels, which the wrappers' output validity scan then
+turned into a silently skipped block). All patched and marked `LOCAL PATCH`, pinned
+by `cargo test --manifest-path deps/nih-plug/Cargo.toml -p nih_plug --lib
+vst3::wrapper::tests`, which drives a real wrapper with `numInputs == 1` and a poison bus
+behind the array; upstream master still has the bug (2026-10-02), and
+docs/upstream/nih-plug-vst3-aux-bus-oob.md is the issue draft. deps/PATCHES.md has the full
+account.
+
 baseview (both the rev egui-baseview pins, `9a0b42c`, and the older one nih-plug's
 `standalone` feature pins) null-derefs in `becomeFirstResponder` on recent macOS and ABORTS
 THE HOST when the editor window opens: AppKit now attaches the view before it has a window,
 and `msg_send![nil, isKeyWindow]` trips rustc's inserted null check. Fixed upstream one
 commit after `9a0b42c` (RustAudio/baseview#204, rev `3e12973`); Cargo.toml carries a
 `[patch."https://github.com/RustAudio/baseview.git"]` pointing at the
-`michaeljancsy/baseview` fork's `magnify-as-ctrl-scroll` branch, which is that fix PLUS TWO
+`michaeljancsy/baseview` fork's `magnify-as-ctrl-scroll` branch, which is that fix PLUS THREE
 LOCAL COMMITS. (1) Stock baseview registers no `magnifyWithEvent:` handler, so macOS
 trackpad pinches produce no events at all in the editor — the commit re-encodes them
 as ctrl-scroll `WheelScrolled` events (K = 200 calibrates to egui's default scroll-zoom
@@ -970,10 +1012,14 @@ makes pinch-zoom work in every host. (2) The view claims first responder on `mou
 delivers every key but hands all of them EXCEPT ←/→ up the responder chain as well —
 egui-baseview answers every event `Captured`, so without that the host would lose its own
 key commands — and never delivers Cmd at all, which is what pins zoom to Ctrl/pinch.
+(3) The OpenGL view is released when the editor closes: stock baseview took an extra
+`retain` on it, so every close leaked the view, its OpenGL context and its window-sized
+drawing surface — about 50 MB per open/close in a host, in every release up to 1.4.1.
 See deps/PATCHES.md. Do NOT remove the patch when
-nih-plug/egui-baseview advance past the #204 fix — REBASE both commits onto the new
+nih-plug/egui-baseview advance past the #204 fix — REBASE all three commits onto the new
 rev instead (without #204 the editor crashes every host on current macOS; without the
-magnify commit pinch silently dies; without the focus commit ←/→ are dead in Logic). Beware when pushing to the fork: its GitHub refs
+magnify commit pinch silently dies; without the focus commit ←/→ are dead in Logic; without
+the release commit every editor close leaks about 50 MB). Beware when pushing to the fork: its GitHub refs
 predate the pinned revs (objects resolve via the fork network), so pushing a branch uploads
 upstream history that touches `.github/workflows/` and needs a gh token with the `workflow`
 scope. The AU path is the likeliest of the three to trip the null-deref: clap-wrapper's
