@@ -305,9 +305,10 @@ element format is stereo and matches our layout-0 ports).
 # Patched `baseview` fork (not vendored — a `[patch]` in the root Cargo.toml)
 
 `[patch."https://github.com/RustAudio/baseview.git"]` points at
-`michaeljancsy/baseview`, branch `magnify-as-ctrl-scroll`. That branch is
+`michaeljancsy/baseview` rev `75aad1d`, the tip of branch `fix-gl-view-leak`. That branch is
 upstream's RustAudio/baseview#204 null-deref fix (`3e12973`, the rev the fork originally
-pinned unmodified) **plus three commits**:
+pinned unmodified) **plus three commits**: the two on branch `magnify-as-ctrl-scroll`
+(`a8d4bba`, the rev pinned before), and a fix for windows that never freed their OpenGL view:
 
 ## The patch: deliver macOS trackpad pinches at all
 
@@ -360,22 +361,23 @@ the symptom is host-dependent and modifier-dependent at once.
 Both 2 and 3 are policy this plugin gets to set because it owns the fork; neither belongs
 upstream as an unconditional default.
 
-## The third patch: release the OpenGL view when the editor closes
+## The third patch: free the OpenGL view when a window closes
 
-**Problem.** `GlContext::create` in `src/gl/macos.rs` took an extra `retain` on the
-`NSOpenGLView` it had just allocated: +1 from `alloc`, +1 from that `retain`, +1 from
-`addSubview:`, against only the parent view's release and the one release in `Drop`. So every
-closed editor left its OpenGL view alive, with the OpenGL context and the window-sized
-drawing surface the view owns. Plug-in Bench's "Editor open / close cycles" check reported
-about 4.3 MB per open/close (it counts resident memory only). A host that opens and closes the
-AU editor 24 times grew 52.6 MB per open/close in total memory (1.26 GB in all, a straight
-line), since most of the loss is graphics memory. It was there in every release.
+**Problem.** `src/gl/macos.rs` created the `NSOpenGLView` with `alloc` (one reference), sent it
+an extra `retain` (two), then added it to the parent view (three). Dropping the `GlContext`
+released one and the parent's teardown another, so one was always left: every closed editor
+kept its `NSOpenGLView`, its `NSOpenGLContext` and its screen-sized drawing buffers for the life
+of the host process. Hosts open and close editors constantly, so memory only ever grew.
 
-**Fix.** Keep only the `alloc` reference, and have `Drop` take the view out of its parent
-before releasing it, so that release is the last one even if the parent outlives the context.
-Measured the same way afterwards: 0.14 MB per open/close, and macOS's `leaks` finds nothing
-left per cycle. Upstream's later objc2 rewrite holds the view in a `Retained<>` and does not
-have this bug. `tests/au_host_test.m` guards it.
+**Fix.** Commit `75aad1d`: the extra `retain` is gone, and `GlContext`'s `Drop` clears the
+context's drawable and takes the view out of its parent before releasing both.
+
+**Measured.** An 800 x 600 editor on a Retina screen, opened and closed 16 times after 24
+warm-up cycles: ConjureAlign kept about 53 MB per open and close before, 0.04 MB after. (Not run through Plug-in Bench: its installed copy is the release
+build in /Library.)
+The plugin's own tests and host test pass unchanged. The same fix, found first, is in
+ConjureGroove's vendored copy of the fork. `tests/au_host_test.m` now measures the per-cycle
+growth directly, so a regression fails the host test rather than a manual run.
 
 **Maintenance.** When nih-plug/egui-baseview move past `3e12973`, rebase all three commits
 onto the new upstream rev and update the `[patch]` rev — do not drop the fork. Note the
