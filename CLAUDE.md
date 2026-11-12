@@ -1114,8 +1114,10 @@ main checkout, plain `cargo xtask bundle` is fine.
   Logic bug, found in ConjureWidth). ConjureAlign's AU order is sorted by parameter ID, which
   puts Alignment On there, and on/off controls no longer advertise value names, so it is safe —
   but adding a parameter can move a different control into that slot; `tests/au_host_test.m`
-  fails when that happens. Not yet checked in Logic itself: Polarity's names and Alignment On's
-  checkbox.
+  fails when that happens. Checked in Logic Pro 12.3.1 on 2026-11-11 with 1.4.1 in the Controls
+  view: Polarity steps through Auto / Normal / Inverted, Capture and Alignment On are plain
+  checkboxes with no "Base Channel" names, Alignment On is listed second-to-last, and changes
+  made there on a stopped track reach the editor.
 - Null test recipe: duplicate a track, nudge the copy by a known amount (track delay or clip
   nudge), sidechain the original into ConjureAlign on the copy, click Capture (or toggle the
   Capture parameter) and play — recording accumulates only while both inputs clear the Gate
