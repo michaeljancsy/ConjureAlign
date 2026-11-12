@@ -466,10 +466,10 @@ Every event also carries the environment, assembled in `EventContext`: `plugin_v
 `src/host.rs`, and `plugin_format` from `context.plugin_api()` — CLAP, VST3 or standalone,
 with **AU folded into CLAP** because clap-wrapper translates AU calls onto our own
 `clap_entry` and nih-plug genuinely never sees an AU (`daw` is what separates them again:
-Logic and GarageBand load only the AU). `build_payload` takes that context as a parameter
-rather than reading globals, which is what keeps its assertions valid on any machine. An
-unresolved value is OMITTED, never sent as null — a null lands in Mixpanel's lexicon as a
-real value and pollutes every breakdown on the property.
+`"Apple AU host"`, below, is an AU load by construction). `build_payload` takes that
+context as a parameter rather than reading globals, which is what keeps its assertions valid
+on any machine. An unresolved value is OMITTED, never sent as null — a null lands in
+Mixpanel's lexicon as a real value and pollutes every breakdown on the property.
 
 `src/host.rs` resolves the environment once per process into a `OnceLock`, and three rules
 hold it together. **Nothing there may panic**: it runs inside `initialize()`, inside the
@@ -496,6 +496,25 @@ their targets before being declared — `os_info` is Windows-ONLY in this graph,
 The `daw` labels include `auval`, `pluginval` and `clap-validator`: they load the plugin on
 a machine that may well have consented, and labelling them is what lets them be filtered out
 of the real usage figures rather than silently inflating the "other" bucket.
+
+**Logic Pro never reports as `"Logic Pro"` on current macOS — it reports `"Apple AU host"`.**
+Logic does not load an AU into its own process: it asks macOS to, and macOS puts it in
+Apple's helper, `/System/Library/Frameworks/AudioToolbox.framework/XPCServices/
+AUHostingServiceXPC_arrow.xpc/Contents/MacOS/AUHostingServiceXPC_arrow` (verified with
+Logic Pro 12.3.1 on 2026-11-10). So `current_exe()` names Apple's helper, and up to 1.4.1
+every Logic user was counted as `"other"`, mixed in with unrecognized VST3 hosts; "Logic Pro"
+never appeared in the data at all. `daw_label` now maps three exact stems to that one label:
+`AUHostingServiceXPC_arrow` (Apple silicon) and `AUHostingServiceXPC` (Intel, used under
+Rosetta), both present on macOS 26.3, and `AUHostingCompatibilityService`, which is not on
+macOS 26.3 but which users and Ableton's support pages name as the helper that hosted Intel
+AUs on earlier macOS. Read the label as "some Apple-hosted AU load", NOT as "Logic": the
+helper cannot see which app asked for it, and GarageBand, MainStage and Final Cut Pro go
+through the same one. It carries **no `daw_version`**, like `"other"` (`host::reports_version`):
+the main bundle in that process is the helper's own, whose version is a constant "1.0", and
+sending it would read as a Logic version. The `"Logic Pro"` entry stays on the list for any
+setup where Logic does load the AU into itself. Data from before this change cannot be
+re-labelled: in it, Logic is part of macOS `"other"` with `plugin_format = "CLAP"` (AU folds
+into CLAP, above).
 
 The bundle lookup cannot be reached by a unit test — a test binary has no `.app` around it.
 `host::tests::print_resolved_host_info` (`#[ignore]`d) exists for that: copy the test binary
