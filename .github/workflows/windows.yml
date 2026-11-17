@@ -42,7 +42,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Hoisted out of the Package step so the pwsh verification below can use
       # it too. $GITHUB_ENV reaches subsequent steps only, never this one.
@@ -211,7 +211,7 @@ jobs:
           # so also confirm the file landed where the .iss said it would.
           test -f "dist/ConjureAlign-$VERSION-Windows-Setup.exe"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ConjureAlign-${{ env.VERSION }}-Windows-Setup
           path: dist/ConjureAlign-*-Windows-Setup.exe
