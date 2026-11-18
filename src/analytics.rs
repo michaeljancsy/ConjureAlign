@@ -28,6 +28,13 @@
 //! here because this module doc and CLAUDE.md are the only account of what
 //! leaves the machine. It exists because the cohort-level version breakdown
 //! cannot tell "nobody upgraded" from "nobody was told there was an upgrade".
+//!
+//! It also carries `update_checks` (`"on"` / `"off"` / `"unasked"`: the install's
+//! answer to the update-check question) and `update_notice` (whether the ⚙
+//! button says "Update" for this install right now). Both are always present.
+//! Together with `upgraded_from` they separate "said no to update checks" from
+//! "saw the notice and did not act on it" (issue #58). Each reveals less than
+//! `plugin_version`, so no disclosure changed; CLAUDE.md has the full account.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -82,6 +89,10 @@ pub enum AnalyticsEvent {
         /// after the first at a given version, so at most one event per
         /// upgrade carries it. See [`crate::config::pending_upgrade_from`].
         upgraded_from: Option<String>,
+        /// The install's answer to the update-check question.
+        update_checks: UpdateChecks,
+        /// Whether the ⚙ button says "Update" for this install right now.
+        update_notice: bool,
     },
     CaptureCompleted {
         confidence: f32,
@@ -99,6 +110,58 @@ pub enum AnalyticsEvent {
         capture_seconds: f32,
         splice_count: usize,
     },
+}
+
+/// An install's answer to the update-check question, as it goes on the wire.
+/// Three states, because "never asked" is not "said no": an install that was
+/// never asked cannot have ignored anything.
+///
+/// The strings are wire values, so they are never renamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateChecks {
+    On,
+    Off,
+    Unasked,
+}
+
+impl UpdateChecks {
+    /// From [`crate::config::Config::updates`].
+    pub fn from_answer(answer: Option<bool>) -> Self {
+        match answer {
+            Some(true) => Self::On,
+            Some(false) => Self::Off,
+            None => Self::Unasked,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Unasked => "unasked",
+        }
+    }
+}
+
+/// The `Plugin Loaded` event for an install in the given state. Takes the
+/// settings and the update status as arguments so the test can drive every
+/// combination without touching this machine's settings file.
+///
+/// `update_notice` is [`crate::update::notifies`] on the same two inputs that
+/// [`crate::update::pending_version`] feeds it, so it is the ⚙ button's own
+/// answer, not a second opinion on it.
+pub fn plugin_loaded(
+    sample_rate: f32,
+    upgraded_from: Option<String>,
+    cfg: &crate::config::Config,
+    status: &crate::update::Status,
+) -> AnalyticsEvent {
+    AnalyticsEvent::PluginLoaded {
+        sample_rate,
+        upgraded_from,
+        update_checks: UpdateChecks::from_answer(cfg.updates),
+        update_notice: crate::update::notifies(status, cfg.update_skipped.as_deref()),
+    }
 }
 
 /// Bucketed, never raw: a precise confidence figure would say more about the
@@ -211,8 +274,15 @@ pub fn build_payload(event: &AnalyticsEvent, ctx: &EventContext) -> serde_json::
         AnalyticsEvent::PluginLoaded {
             sample_rate,
             upgraded_from,
+            update_checks,
+            update_notice,
         } => {
             props.insert("sample_rate".into(), (*sample_rate as u64).into());
+            // Unlike `upgraded_from`, both are always present: each has a
+            // value on every install, so there is nothing to omit, and a
+            // missing key would read as "unknown" rather than "no".
+            props.insert("update_checks".into(), update_checks.as_str().into());
+            props.insert("update_notice".into(), (*update_notice).into());
             // Omitted rather than nulled, like every other optional property:
             // a null becomes a real value in Mixpanel's lexicon. Its absence
             // already means "not an upgrade, or not one we can prove".
@@ -350,10 +420,15 @@ impl AnalyticsHandle {
                 None
             };
             self.send(
-                AnalyticsEvent::PluginLoaded {
+                // Reads the cached settings and the in-process status seeded
+                // from them: no network, no file write, and not from
+                // `process()`.
+                plugin_loaded(
                     sample_rate,
                     upgraded_from,
-                },
+                    &crate::config::snapshot(),
+                    &crate::update::status(),
+                ),
                 claimed,
             );
         }
@@ -530,6 +605,8 @@ mod tests {
             &AnalyticsEvent::PluginLoaded {
                 sample_rate: 48_000.0,
                 upgraded_from: None,
+                update_checks: UpdateChecks::Unasked,
+                update_notice: false,
             },
             &ctx("d", 1, &host),
         );
@@ -554,6 +631,8 @@ mod tests {
             &AnalyticsEvent::PluginLoaded {
                 sample_rate: 48_000.0,
                 upgraded_from: Some("1.2.0".into()),
+                update_checks: UpdateChecks::Unasked,
+                update_notice: false,
             },
             &ctx("d", 1, &host),
         );
@@ -566,11 +645,67 @@ mod tests {
             &AnalyticsEvent::PluginLoaded {
                 sample_rate: 48_000.0,
                 upgraded_from: None,
+                update_checks: UpdateChecks::Unasked,
+                update_notice: false,
             },
             &ctx("d", 1, &host),
         );
         let props = v["properties"].as_object().unwrap();
         assert!(!props.contains_key("upgraded_from"), "{props:?}");
+    }
+
+    /// Each answer to the update-check question lands as its own string, and
+    /// "never asked" is not folded into either of the others. Always present.
+    #[test]
+    fn update_checks_reports_each_consent_state() {
+        let host = test_host();
+        let status = crate::update::Status::Unknown;
+        for (answer, expected) in [
+            (Some(true), "on"),
+            (Some(false), "off"),
+            (None, "unasked"),
+        ] {
+            let cfg = crate::config::Config {
+                updates: answer,
+                ..Default::default()
+            };
+            let v = build_payload(
+                &plugin_loaded(48_000.0, None, &cfg, &status),
+                &ctx("d", 1, &host),
+            );
+            assert_eq!(v["properties"]["update_checks"], expected, "{answer:?}");
+        }
+    }
+
+    /// `update_notice` follows the ⚙ button: on only for a newer release the
+    /// user has not skipped, and back on for anything newer than the skip.
+    /// Every other state sends `false`, never an absent key or a null.
+    #[test]
+    fn update_notice_follows_the_settings_button() {
+        use crate::update::Status;
+        let host = test_host();
+        let available = Status::Available {
+            version: "1.5.0".into(),
+        };
+        let notice = |status: &Status, skipped: Option<&str>| {
+            let cfg = crate::config::Config {
+                updates: Some(true),
+                update_skipped: skipped.map(String::from),
+                ..Default::default()
+            };
+            let v = build_payload(
+                &plugin_loaded(48_000.0, None, &cfg, status),
+                &ctx("d", 1, &host),
+            );
+            v["properties"]["update_notice"].clone()
+        };
+
+        assert_eq!(notice(&available, None), true, "notice on");
+        assert_eq!(notice(&Status::Unknown, None), false, "nothing known");
+        assert_eq!(notice(&Status::UpToDate, None), false, "up to date");
+        assert_eq!(notice(&available, Some("1.5.0")), false, "skipped");
+        assert_eq!(notice(&available, Some("1.6.0")), false, "skipped past");
+        assert_eq!(notice(&available, Some("1.4.1")), true, "newer than skip");
     }
 
     /// Absent values are left OUT of the payload rather than sent as null —
@@ -587,6 +722,8 @@ mod tests {
             &AnalyticsEvent::PluginLoaded {
                 sample_rate: 48_000.0,
                 upgraded_from: None,
+                update_checks: UpdateChecks::Unasked,
+                update_notice: false,
             },
             &EventContext {
                 device_id: "d",
@@ -658,6 +795,8 @@ mod tests {
             &AnalyticsEvent::PluginLoaded {
                 sample_rate: 48_000.0,
                 upgraded_from: None,
+                update_checks: UpdateChecks::Unasked,
+                update_notice: false,
             },
             &ctx("d", 1, &host),
         );
@@ -699,6 +838,8 @@ mod tests {
             &AnalyticsEvent::PluginLoaded {
                 sample_rate: 48_000.0,
                 upgraded_from: None,
+                update_checks: UpdateChecks::Unasked,
+                update_notice: false,
             },
             &EventContext {
                 device_id: "smoke-test",

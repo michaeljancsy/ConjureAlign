@@ -553,6 +553,28 @@ problems. Do not re-derive upgrade rates from disjoint version buckets; read
 `plugin_version`, already on every event, so this needed no change to the prompt or README —
 which is exactly why it has to be written down here.)
 
+`Plugin Loaded` also carries **`update_checks`** and **`update_notice`** (issue #58), and
+unlike `upgraded_from` both are ALWAYS present: every install has a value for each, so
+there is nothing to omit, and a missing key would read as "unknown" instead of "no".
+`update_checks` is the install's answer to the update-check question, `"on"` / `"off"` /
+`"unasked"` (from `config::Config::updates`: `Some(true)` / `Some(false)` / `None`), kept
+as three states because an install that was never asked cannot have ignored anything.
+`update_notice` is a bool: whether the ⚙ button says "Update" for this install right now,
+i.e. `update::notifies` over the cached `update_latest_seen` and `update_skipped`, the same
+two inputs `update::pending_version` uses. They are wire values; never rename them. The
+event is built by `analytics::plugin_loaded(cfg, status)` from a settings snapshot, so the
+tests drive every consent state and notice on / off / skipped without this machine's file.
+Both read cached settings on the `initialize()` path: no network, no file write, nothing on
+the audio thread.
+
+They exist because "installs stay on old versions" has two causes the data could not tell
+apart: the user said no to update checks, or the user saw "⚙ Update" and ignored it.
+Read them with `upgraded_from` per install: of the installs shown a notice, how many
+upgraded? Data arrives only from installs running the release that ships this, so an
+empty breakdown on an older version means nothing. Disclosure check (done): a yes or no to
+update checks, and whether an update is pending, reveal less than `plugin_version`, which
+every event already carries, so the prompt and README needed no change.
+
 UI: the first-run prompt (`editor::consent_modal`) and the ⚙ popover (`settings_menu`) are both
 drawn OUTSIDE `draw_ui` / from the control bar respectively, and both are `pub` so
 `examples/gui_preview.rs` can render them headless (`_consent.png`, `_settings.png`,
