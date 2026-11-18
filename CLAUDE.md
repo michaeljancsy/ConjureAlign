@@ -564,8 +564,9 @@ i.e. `update::notifies` over the cached `update_latest_seen` and `update_skipped
 two inputs `update::pending_version` uses. They are wire values; never rename them. The
 event is built by `analytics::plugin_loaded(cfg, status)` from a settings snapshot, so the
 tests drive every consent state and notice on / off / skipped without this machine's file.
-Both read cached settings on the `initialize()` path: no network, no file write, nothing on
-the audio thread.
+Both are read wherever `Plugin Loaded` is built: in `initialize()`, or, when consent arrives
+after it, in the first `track()` call, which runs on the background analysis task. Neither is
+the audio thread, and neither touches the network or writes a file.
 
 They exist because "installs stay on old versions" has two causes the data could not tell
 apart: the user said no to update checks, or the user saw "⚙ Update" and ignored it.
