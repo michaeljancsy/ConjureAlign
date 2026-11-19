@@ -1062,8 +1062,9 @@ drawing surface — about 50 MB per open/close in a host, in every release up to
 (4) The view makes ONE tracking area, in `create_view`, and never removes or releases one:
 on window close it used to release whichever tracking area came first in the view's list,
 and that list is added to by AppKit and by hosts too, so it could be one the view did not
-own. Pro Tools crashed on it while testing. The dead `update_tracking_areas` (registered
-without its colon, so AppKit never called it) is gone.
+own. Pro Tools crashed on it while testing. The dead `update_tracking_areas` (registered as
+`updateTrackingAreas:` with a colon, but AppKit's method takes no argument, so AppKit never
+called it) is gone.
 See deps/PATCHES.md. Do NOT remove the patch when
 nih-plug/egui-baseview advance past the #204 fix — REBASE all four commits onto the new
 rev instead (without #204 the editor crashes every host on current macOS; without the
