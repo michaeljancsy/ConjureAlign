@@ -262,6 +262,11 @@ fn set_bundle_versions(package: &str, config: &HashMap<String, PackageConfig>) -
         if rewritten != original {
             fs::write(&plist, &rewritten)
                 .with_context(|| format!("Could not write '{}'", plist.display()))?;
+            // nih_plug_xtask signed this bundle before we touched its Info.plist, and the
+            // ad-hoc signature seals the plist: without a re-sign `codesign --verify` reports
+            // "invalid Info.plist" and Ableton Live refuses the VST3 ("not a plugin").
+            // `release.sh` re-signs with the Developer ID, so only local builds were hit.
+            codesign(&bundled.join(format!("{bundle_name}.{ext}")));
             eprintln!(
                 "Set the {ext} bundle version to {version} in '{}'",
                 plist.display()
