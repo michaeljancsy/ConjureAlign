@@ -305,10 +305,11 @@ element format is stereo and matches our layout-0 ports).
 # Patched `baseview` fork (not vendored — a `[patch]` in the root Cargo.toml)
 
 `[patch."https://github.com/RustAudio/baseview.git"]` points at
-`michaeljancsy/baseview` rev `75aad1d`, the tip of branch `fix-gl-view-leak`. That branch is
+`michaeljancsy/baseview` rev `ce2f86d`, the tip of branch `fix-gl-view-leak`. That branch is
 upstream's RustAudio/baseview#204 null-deref fix (`3e12973`, the rev the fork originally
-pinned unmodified) **plus three commits**: the two on branch `magnify-as-ctrl-scroll`
-(`a8d4bba`, the rev pinned before), and a fix for windows that never freed their OpenGL view:
+pinned unmodified) **plus four commits**: the two on branch `magnify-as-ctrl-scroll`
+(`a8d4bba`, the rev pinned before), a fix for windows that never freed their OpenGL view
+(`75aad1d`), and a fix for the tracking area (`ce2f86d`, described last below):
 
 ## The patch: deliver macOS trackpad pinches at all
 
@@ -379,7 +380,15 @@ The plugin's own tests and host test pass unchanged. The same fix, found first, 
 ConjureGroove's vendored copy of the fork. `tests/au_host_test.m` now measures the per-cycle
 growth directly, so a regression fails the host test rather than a manual run.
 
-**Maintenance.** When nih-plug/egui-baseview move past `3e12973`, rebase all three commits
+**Tracking area.** Commit `ce2f86d`. On window close the view released whichever tracking area
+came first in its list. That list is not the view's alone: AppKit and hosts add areas to it too,
+so the one released could be someone else's, and Pro Tools crashed on it (found while testing
+there). Now the view makes one tracking area in `create_view`, hands it to AppKit, which holds
+it, and never removes or releases any area afterwards. The dead `update_tracking_areas` is
+deleted: it was registered as `updateTrackingAreas:` with a colon, so AppKit never called it.
+Only `src/macos/view.rs` changes.
+
+**Maintenance.** When nih-plug/egui-baseview move past `3e12973`, rebase all four commits
 onto the new upstream rev and update the `[patch]` rev — do not drop the fork. Note the
 fork's GitHub refs are years older than the pinned revs (the objects resolve via GitHub's
 fork network), so pushing any branch based on modern upstream uploads history touching

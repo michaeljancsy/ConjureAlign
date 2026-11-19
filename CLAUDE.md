@@ -1044,8 +1044,8 @@ THE HOST when the editor window opens: AppKit now attaches the view before it ha
 and `msg_send![nil, isKeyWindow]` trips rustc's inserted null check. Fixed upstream one
 commit after `9a0b42c` (RustAudio/baseview#204, rev `3e12973`); Cargo.toml carries a
 `[patch."https://github.com/RustAudio/baseview.git"]` pointing at the
-`michaeljancsy/baseview` fork's `fix-gl-view-leak` branch (rev `75aad1d`), which is that fix
-PLUS THREE LOCAL COMMITS. (The fork's `magnify-as-ctrl-scroll` branch holds the first two plus
+`michaeljancsy/baseview` fork's `fix-gl-view-leak` branch (rev `ce2f86d`), which is that fix
+PLUS FOUR LOCAL COMMITS. (The fork's `magnify-as-ctrl-scroll` branch holds the first two plus
 `ee92660`, a second, equivalent fix for the same leak that nothing pins; rebase from
 `fix-gl-view-leak`.) (1) Stock baseview registers no `magnifyWithEvent:` handler, so macOS
 trackpad pinches produce no events at all in the editor — the commit re-encodes them
@@ -1059,11 +1059,18 @@ key commands — and never delivers Cmd at all, which is what pins zoom to Ctrl/
 (3) The OpenGL view is released when the editor closes: stock baseview took an extra
 `retain` on it, so every close leaked the view, its OpenGL context and its window-sized
 drawing surface — about 50 MB per open/close in a host, in every release up to 1.4.1.
+(4) The view makes ONE tracking area, in `create_view`, and never removes or releases one:
+on window close it used to release whichever tracking area came first in the view's list,
+and that list is added to by AppKit and by hosts too, so it could be one the view did not
+own. Pro Tools crashed on it while testing. The dead `update_tracking_areas` (registered as
+`updateTrackingAreas:` with a colon, but AppKit's method takes no argument, so AppKit never
+called it) is gone.
 See deps/PATCHES.md. Do NOT remove the patch when
-nih-plug/egui-baseview advance past the #204 fix — REBASE all three commits onto the new
+nih-plug/egui-baseview advance past the #204 fix — REBASE all four commits onto the new
 rev instead (without #204 the editor crashes every host on current macOS; without the
 magnify commit pinch silently dies; without the focus commit ←/→ are dead in Logic; without
-the release commit every editor close leaks about 50 MB). Beware when pushing to the fork: its GitHub refs
+the release commit every editor close leaks about 50 MB; without the tracking-area commit a
+window close can crash the host, Pro Tools being the one seen). Beware when pushing to the fork: its GitHub refs
 predate the pinned revs (objects resolve via the fork network), so pushing a branch uploads
 upstream history that touches `.github/workflows/` and needs a gh token with the `workflow`
 scope. The AU path is the likeliest of the three to trip the null-deref: clap-wrapper's
