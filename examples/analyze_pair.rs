@@ -18,15 +18,17 @@
 //! leads the reference and is delayed by that amount to align.
 
 use conjure_align::analysis::{self, RejectReason};
+use conjure_align::capture::MAX_SPLICES;
 use conjure_align::dsp::delay::{AlignDelay, TapSpec};
 use conjure_align::dsp::fractional::FIR_CENTER;
 use conjure_align::dsp::gate::CaptureGate;
 use conjure_align::params::CAPTURE_MAX_SECS;
 
+// The `gate_threshold` parameter's default (params.rs) and `CAPTURE_AUTO_FINISH_SECONDS`
+// (lib.rs, private). Keep these in step with the plug-in.
 const GATE_THRESHOLD_DB: f32 = -60.0;
 const AUTO_FINISH_SECONDS: f32 = 2.0;
 const DEFAULT_MAX_SHIFT_MS: f64 = 50.0;
-const MAX_SPLICES: usize = 256;
 
 struct Wav {
     rate: u32,
