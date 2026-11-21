@@ -861,6 +861,7 @@ dependencies = [
  "core-foundation-sys",
  "egui_kittest",
  "getrandom 0.4.3",
+ "hound",
  "image",
  "libc",
  "native-tls",
@@ -1798,6 +1799,12 @@ dependencies = [
  "libc",
  "windows-link",
 ]
+
+[[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "http"
