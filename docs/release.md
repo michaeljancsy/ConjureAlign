@@ -116,10 +116,11 @@ Only after Michael's typed yes in this session for the release build and for pub
    - Copy that folder to a scratch location outside both repositories, and work from the copy;
      the folder itself stays as the record of its own release.
    - Before running anything, update the copy's `harness/decode.py`. It is written for one
-     version: it hard-codes the version, the commit, the capture date and its file and line
-     citations, so it needs updating with every release. If the release changes what is sent or
-     when, also update `harness/example_reports.rs` and `notes.md`, and check the README's Privacy
-     section.
+     version: it hard-codes the version, the commit, the capture date, its file and line
+     citations, and its description of each field (for example its note on how Logic is
+     reported), and those descriptions end up on the privacy page, so it needs updating with every
+     release. If the release changes what is sent or when, also update `harness/example_reports.rs`
+     and `notes.md`, and check the README's Privacy section.
    - Make a scratch worktree of the merge commit, outside the main checkout, and copy the updated
      `harness/example_reports.rs` into its `tests/` folder. Never copy it into the main checkout.
      Remove the worktree when the capture is done.
@@ -135,9 +136,9 @@ Only after Michael's typed yes in this session for the release build and for pub
      test-results repository. This step is what removes private details: it writes the example
      files and the raw capture with the project token, the scratch paths and this Mac's home
      folder replaced by placeholders. `captured.json` itself is never committed.
-   - Copy the updated harness into the new folder's `harness/`, and write its `notes.md`: every
+   - Copy the updated harness into the new folder's `harness/`, and write its `notes.md` (every
      event and when it is sent, with file and line, and every way the capture differs from a
-     release build.
+     release build) and its `README.md` listing the examples; `decode.py` writes neither.
 7. Push an annotated tag `v<x.y.z>` titled `ConjureAlign <x.y.z>` on the merge commit
    (`git cat-file -t v<x.y.z>` must print `tag`). The tag push starts the Windows workflow (about
    10 minutes).
