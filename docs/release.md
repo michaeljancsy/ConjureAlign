@@ -113,26 +113,28 @@ Only after Michael's typed yes in this session for the release build and for pub
    private test-results repository, in the `harness/` folder of the newest existing
    `conjurealign/*-example-reports/` folder (the previous release's; the first is
    `conjurealign/2026-11-22-v1.4.1-example-reports/`).
-   - Make a scratch worktree of the merge commit, outside the main checkout, and copy that
-     folder's `harness/example_reports.rs` into its `tests/` folder. Never copy it into the main
-     checkout. Remove the worktree when the capture is done.
-   - Run that folder's `harness/capture-all.sh <worktree> <output folder>`, with an output
-     folder in a scratch location outside both repositories. It builds the harness in debug,
-     does a dry run that prints the addresses the plug-in would use and stops unless all three
-     are this computer, then captures into `<output folder>/captured.json`. The run must never
-     reach the real services: a scratch `HOME`, all three override addresses
-     (`CONJURE_ALIGN_ANALYTICS_URL`, `CONJURE_ALIGN_SENTRY_DSN`, `CONJURE_ALIGN_UPDATE_URL`) on a
-     stand-in server on 127.0.0.1, and a sandbox that refuses every connection except to this
-     computer.
-   - Run that folder's `python3 -I harness/decode.py <output folder>/captured.json <new folder>`,
+   - Copy that folder to a scratch location outside both repositories, and work from the copy;
+     the folder itself stays as the record of its own release.
+   - Before running anything, update the copy's `harness/decode.py`. It is written for one
+     version: it hard-codes the version, the commit, the capture date and its file and line
+     citations, so it needs updating with every release. If the release changes what is sent or
+     when, also update `harness/example_reports.rs` and `notes.md`, and check the README's Privacy
+     section.
+   - Make a scratch worktree of the merge commit, outside the main checkout, and copy the updated
+     `harness/example_reports.rs` into its `tests/` folder. Never copy it into the main checkout.
+     Remove the worktree when the capture is done.
+   - Run the copy's `harness/capture-all.sh <worktree> <output folder>`, with an output folder in
+     a scratch location outside both repositories. It builds the harness in debug, does a dry run
+     that prints the addresses the plug-in would use and stops unless all three are this computer,
+     then captures into `<output folder>/captured.json`. The run must never reach the real
+     services: a scratch `HOME`, all three override addresses (`CONJURE_ALIGN_ANALYTICS_URL`,
+     `CONJURE_ALIGN_SENTRY_DSN`, `CONJURE_ALIGN_UPDATE_URL`) on a stand-in server on 127.0.0.1,
+     and a sandbox that refuses every connection except to this computer.
+   - Run the updated `python3 -I harness/decode.py <output folder>/captured.json <new folder>`,
      where the new folder is `conjurealign/<date>-v<new version>-example-reports/` in the
      test-results repository. This step is what removes private details: it writes the example
      files and the raw capture with the project token, the scratch paths and this Mac's home
      folder replaced by placeholders. `captured.json` itself is never committed.
-   - `decode.py` is written for one version: it hard-codes the version, the commit, the capture
-     date and its file and line citations. Update it together with the harness and `notes.md`,
-     and if the release changes what is sent or when, update all three before capturing and check
-     the README's Privacy section.
    - Copy the updated harness into the new folder's `harness/`, and write its `notes.md`: every
      event and when it is sent, with file and line, and every way the capture differs from a
      release build.
