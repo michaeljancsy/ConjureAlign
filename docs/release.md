@@ -108,15 +108,49 @@ Only after Michael's typed yes in this session for the release build and for pub
    `pkg-ref`s at the new version), the uninstall.pkg payload (0755, only the
    `com.apple.provenance` attribute; the `._` BOM entries are that attribute, not quarantine), the
    three bundles' `CFBundleShortVersionString`, and `spctl -a -t install` plus `stapler validate`.
-6. Push an annotated tag `v<x.y.z>` titled `ConjureAlign <x.y.z>` on the merge commit
+6. Capture this release's example reports: the usage event with the most fields, a crash report
+   and the unclean-shutdown report, exactly as this version sends them. The harness lives in the
+   private test-results repository, in the `harness/` folder of the newest existing
+   `conjurealign/*-example-reports/` folder (the previous release's; the first is
+   `conjurealign/2026-11-22-v1.4.1-example-reports/`).
+   - Copy that folder to a scratch location outside both repositories, and work from the copy;
+     the folder itself stays as the record of its own release.
+   - Before running anything, update the copy's `harness/decode.py`. It is written for one
+     version: it hard-codes the version, the commit, the capture date, its file and line
+     citations, and its description of each field (for example its note on how Logic is
+     reported), and those descriptions end up on the privacy page, so it needs updating with every
+     release. If the release changes what is sent or when, also update `harness/example_reports.rs`
+     and `notes.md`, and check the README's Privacy section.
+   - Make a scratch worktree of the merge commit, outside the main checkout, and copy the updated
+     `harness/example_reports.rs` into its `tests/` folder. Never copy it into the main checkout.
+     Remove the worktree when the capture is done.
+   - Run the copy's `harness/capture-all.sh <worktree> <output folder>`, with an output folder in
+     a scratch location outside both repositories. It builds the harness in debug, does a dry run
+     that prints the addresses the plug-in would use and stops unless all three are this computer,
+     then captures into `<output folder>/captured.json`. The run must never reach the real
+     services: a scratch `HOME`, all three override addresses (`CONJURE_ALIGN_ANALYTICS_URL`,
+     `CONJURE_ALIGN_SENTRY_DSN`, `CONJURE_ALIGN_UPDATE_URL`) on a stand-in server on 127.0.0.1,
+     and a sandbox that refuses every connection except to this computer.
+   - Run the updated `python3 -I harness/decode.py <output folder>/captured.json <new folder>`,
+     where the new folder is `conjurealign/<date>-v<new version>-example-reports/` in the
+     test-results repository. This step is what removes private details: it writes the example
+     files and the raw capture with the project token, the scratch paths and this Mac's home
+     folder replaced by placeholders. `captured.json` itself is never committed.
+   - Copy the updated harness into the new folder's `harness/`, and write its `notes.md` (every
+     event and when it is sent, with file and line, and every way the capture differs from a
+     release build) and its `README.md` listing the examples; `decode.py` writes neither.
+7. Push an annotated tag `v<x.y.z>` titled `ConjureAlign <x.y.z>` on the merge commit
    (`git cat-file -t v<x.y.z>` must print `tag`). The tag push starts the Windows workflow (about
    10 minutes).
-7. Soon after, `gh release create` with the notes and the pkg. The Windows job attaches
+8. Soon after, `gh release create` with the notes and the pkg. The Windows job attaches
    `ConjureAlign-<v>-Windows-Setup.exe` only if the Release exists by then; otherwise it warns and
    must be re-run.
-8. Tell the website PM if the release changes anything the /align page or the privacy policy says
+9. Tell the website PM if the release changes anything the /align page or the privacy policy says
    (features, formats, system requirements, the demo video, or what is sent). `/align/download`
    follows the latest GitHub release by itself.
+10. Send the website's maintainers the example reports from step 6 and their `notes.md`, for the
+    privacy page, with every release, even when nothing that is sent has changed: the page shows
+    the released version's own reports, so its examples must come from that version.
 
 Notes:
 - The tag name is load-bearing: the update check reads `/releases/latest` and parses `tag_name` to
