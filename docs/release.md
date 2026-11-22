@@ -108,15 +108,32 @@ Only after Michael's typed yes in this session for the release build and for pub
    `pkg-ref`s at the new version), the uninstall.pkg payload (0755, only the
    `com.apple.provenance` attribute; the `._` BOM entries are that attribute, not quarantine), the
    three bundles' `CFBundleShortVersionString`, and `spctl -a -t install` plus `stapler validate`.
-6. Push an annotated tag `v<x.y.z>` titled `ConjureAlign <x.y.z>` on the merge commit
+6. Capture this release's example reports: the usage event with the most fields, a crash report
+   and the unclean-shutdown report, exactly as this version sends them. Use the harness in the
+   private `conjure-test-results` repository, in the `harness/` folder of the newest
+   `conjurealign/<date>-v<x.y.z>-example-reports/` folder: copy `example_reports.rs` into the
+   `tests/` folder of a checkout of the merge commit, then run `capture-all.sh <checkout> <output
+   folder>`, which builds it in debug, does a dry run that prints the addresses the plug-in would
+   use and stops unless all three are this computer, then captures. The run must never reach the
+   real services: a scratch `HOME`, all three override addresses (`CONJURE_ALIGN_ANALYTICS_URL`,
+   `CONJURE_ALIGN_SENTRY_DSN`, `CONJURE_ALIGN_UPDATE_URL`) on a stand-in server on 127.0.0.1, and a
+   sandbox that refuses every connection except to this computer. If the release changes what is
+   sent or when, update the harness and the notes before capturing, and check the README's Privacy
+   section. Save the reports, the raw requests, the harness and `notes.md` (every event and when it
+   is sent, with file and line, and every way the capture differs from a release build) in a new
+   folder `conjurealign/<date>-v<x.y.z>-example-reports/` in that repository.
+7. Push an annotated tag `v<x.y.z>` titled `ConjureAlign <x.y.z>` on the merge commit
    (`git cat-file -t v<x.y.z>` must print `tag`). The tag push starts the Windows workflow (about
    10 minutes).
-7. Soon after, `gh release create` with the notes and the pkg. The Windows job attaches
+8. Soon after, `gh release create` with the notes and the pkg. The Windows job attaches
    `ConjureAlign-<v>-Windows-Setup.exe` only if the Release exists by then; otherwise it warns and
    must be re-run.
-8. Tell the website PM if the release changes anything the /align page or the privacy policy says
+9. Tell the website PM if the release changes anything the /align page or the privacy policy says
    (features, formats, system requirements, the demo video, or what is sent). `/align/download`
    follows the latest GitHub release by itself.
+10. Send the website's maintainers the example reports from step 6 and their `notes.md`, for the
+    privacy page, with every release, even when nothing that is sent has changed: the page shows
+    the released version's own reports, so its examples must come from that version.
 
 Notes:
 - The tag name is load-bearing: the update check reads `/releases/latest` and parses `tag_name` to
