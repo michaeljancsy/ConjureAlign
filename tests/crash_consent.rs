@@ -26,9 +26,9 @@ use sentry_sink::{collect_events, exactly_one_event, setup, wait_for_event};
 
 /// The only library a report may name is the one ConjureAlign runs in (here,
 /// this test binary), and only by file name; a DAW would otherwise contribute
-/// one per plugin the user has loaded. This binary is listed only when its
-/// folder is named after ConjureAlign, so in a checkout that isn't, there is
-/// nothing to check here. `crash_account_name.rs` checks the list in any
+/// one per plugin the user has loaded. This binary is listed only when a folder
+/// on its path is named after ConjureAlign, so in a checkout without one there
+/// is nothing to check here. `crash_account_name.rs` checks the list in any
 /// checkout.
 fn assert_only_our_binary_by_file_name(report: &serde_json::Value) {
     let exe = std::env::current_exe().unwrap();

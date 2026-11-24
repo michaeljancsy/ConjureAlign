@@ -6,8 +6,8 @@
 //!
 //! What it sends: an error report, a panic, the report of an unclean shutdown
 //! (which the next run makes), and the session messages of a run that crashes
-//! and one that ends normally. It does not exercise the Windows exception
-//! handler's fault records, request headers, or usage analytics.
+//! and one that ends normally. It does not exercise fault records, counts of
+//! dropped reports, request headers, or usage analytics.
 //!
 //! One `#[test]` per binary, for the reasons in `session_marker.rs`. The panic
 //! is deliberate, so its backtrace on stderr is expected.
@@ -33,7 +33,7 @@ fn no_crash_report_contains_the_account_name() {
     match std::env::var(ROLE).as_deref() {
         Ok("end normally") => end_normally(),
         Ok("die") => die_with_the_plugin_loaded(),
-        Ok("report") => send_every_kind_of_report(),
+        Ok("report") => send_the_reports(),
         _ => run_the_copy_and_look_for_the_account_name(),
     }
 }
@@ -53,7 +53,7 @@ fn die_with_the_plugin_loaded() {
     std::process::exit(0);
 }
 
-fn send_every_kind_of_report() {
+fn send_the_reports() {
     analytics::set_consent(true);
     let handle = CrashHandle::new();
     // Arming also reports the run that died, from a background thread.
