@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "conjure_align"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "atomic_float",
  "atomic_refcell",
