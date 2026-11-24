@@ -801,6 +801,45 @@ mod imp {
             assert_eq!(dsn.project_id().value(), "4511972827136000");
         }
 
+        /// What reaches Sentry is whatever `before_send` returns, so this is
+        /// the place to say a report must not carry: the folder ConjureAlign
+        /// is installed in, which for a per-user install contains the user's
+        /// account name.
+        #[test]
+        fn a_report_names_our_binary_without_the_folder_it_is_in() {
+            let image = |name: &str| {
+                DebugImage::from(sentry::protocol::SymbolicDebugImage {
+                    name: name.to_owned(),
+                    arch: None,
+                    image_addr: 0.into(),
+                    image_size: 0,
+                    image_vmaddr: 0.into(),
+                    id: sentry::types::DebugId::nil(),
+                    code_id: None,
+                    debug_file: None,
+                })
+            };
+            let mut event = Event::default();
+            event.debug_meta.to_mut().images = vec![
+                image("/Users/some-account/Library/Audio/Plug-Ins/VST3/ConjureAlign.vst3/Contents/MacOS/ConjureAlign"),
+                image(r"C:\Users\some-account\AppData\Local\Programs\Common\CLAP\ConjureAlign.clap"),
+                image("/Library/Audio/Plug-Ins/Components/ConjureAlign.component/Contents/MacOS/ConjureAlign"),
+                image("/Users/some-account/Library/Audio/Plug-Ins/VST3/Other.vst3/Contents/MacOS/Other"),
+            ];
+
+            let before_send = options().before_send.expect("no before_send");
+            let sent = before_send(event).expect("the report was dropped");
+
+            let images = serde_json::to_value(&sent.debug_meta.images).unwrap();
+            let names: Vec<_> = images
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| &i["name"])
+                .collect();
+            assert_eq!(names, ["ConjureAlign", "ConjureAlign.clap", "ConjureAlign"]);
+        }
+
         /// The panic hook skips Sentry's own worker threads by name prefix
         /// (`is_sentry_internal_thread`) — a convention owned by the sentry
         /// crate, not by us. Pin it the way the test above pins ureq's

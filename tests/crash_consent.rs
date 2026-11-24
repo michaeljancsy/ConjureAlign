@@ -24,6 +24,24 @@ use conjure_align::analytics;
 use conjure_align::crash::{self, CrashHandle};
 use sentry_sink::{collect_events, exactly_one_event, setup, wait_for_event};
 
+/// The only library a report may name is the one ConjureAlign runs in (here,
+/// this test binary), and only by file name. A DAW would otherwise contribute
+/// one per plugin the user has loaded, and the folder ours is installed in can
+/// be the user's own, which is named after their account.
+fn assert_only_our_binary_by_file_name(report: &serde_json::Value) {
+    let exe = std::env::current_exe().unwrap();
+    let own_name = exe.file_name().unwrap().to_str().unwrap();
+    let images = report["debug_meta"]["images"].as_array();
+    for image in images.into_iter().flatten() {
+        assert_eq!(image["name"], own_name);
+        let debug_file = image["debug_file"].as_str().unwrap_or("");
+        assert!(
+            !debug_file.contains(['/', '\\']),
+            "a report carries the path of a debug file: {debug_file}"
+        );
+    }
+}
+
 #[test]
 fn nothing_is_reported_until_consent_is_granted() {
     // Temp HOME and the local sink, before anything touches the consent
@@ -80,21 +98,7 @@ fn nothing_is_reported_until_consent_is_granted() {
         "an IP address leaked: {}",
         issue["user"]
     );
-    // Every image left standing must be ours; a DAW would otherwise contribute
-    // one per plugin the user has loaded.
-    if let Some(images) = issue["debug_meta"]["images"].as_array() {
-        for image in images {
-            let name = image["code_file"]
-                .as_str()
-                .or_else(|| image["name"].as_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            assert!(
-                name.contains("conjure"),
-                "a foreign debug image survived: {name}"
-            );
-        }
-    }
+    assert_only_our_binary_by_file_name(&issue);
     assert_eq!(
         issue["release"],
         concat!("conjure_align@", env!("CARGO_PKG_VERSION"))
@@ -132,6 +136,7 @@ fn nothing_is_reported_until_consent_is_granted() {
     );
     assert_eq!(reported["level"], "fatal");
     assert_eq!(reported["tags"]["in_scope"], "true");
+    assert_only_our_binary_by_file_name(&reported);
 
     // ---- a panic outside any scope is still ours — only this dylib's panics
     // ---- can reach the hook — but is tagged as unscoped ----
