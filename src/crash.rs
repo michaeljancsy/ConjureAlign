@@ -318,8 +318,19 @@ mod imp {
         // in a DAW is every other plugin the user owns. Ours is the only one we
         // have any business knowing about, and the only one we upload symbols
         // for.
+        //
+        // By file name only: the folder it is installed in can be the user's
+        // own, which is named after their account.
         let images = &mut event.debug_meta.to_mut().images;
-        images.retain(|image| image_name(image).is_some_and(is_ours));
+        images.retain_mut(|image| match image_name(image) {
+            Some(name) if is_ours(name) => {
+                if let Some(end) = name.rfind(['/', '\\']) {
+                    name.drain(..=end);
+                }
+                true
+            }
+            _ => false,
+        });
 
         // Same hazards as above: never block and never unwrap on the
         // panicking thread. On contention the report just goes out without
@@ -352,10 +363,10 @@ mod imp {
         Some(event)
     }
 
-    fn image_name(image: &DebugImage) -> Option<&str> {
+    fn image_name(image: &mut DebugImage) -> Option<&mut String> {
         match image {
-            DebugImage::Symbolic(i) => Some(i.name.as_str()),
-            DebugImage::Apple(i) => Some(i.name.as_str()),
+            DebugImage::Symbolic(i) => Some(&mut i.name),
+            DebugImage::Apple(i) => Some(&mut i.name),
             _ => None,
         }
     }
