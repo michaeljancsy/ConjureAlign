@@ -25,19 +25,19 @@ use conjure_align::crash::{self, CrashHandle};
 use sentry_sink::{collect_events, exactly_one_event, setup, wait_for_event};
 
 /// The only library a report may name is the one ConjureAlign runs in (here,
-/// this test binary), and only by file name. A DAW would otherwise contribute
-/// one per plugin the user has loaded, and the folder ours is installed in can
-/// be the user's own, which is named after their account.
+/// this test binary), and only by file name; a DAW would otherwise contribute
+/// one per plugin the user has loaded. This binary is listed only when its
+/// folder is named after ConjureAlign, so in a checkout that isn't, there is
+/// nothing to check here. `crash_account_name.rs` checks the list in any
+/// checkout.
 fn assert_only_our_binary_by_file_name(report: &serde_json::Value) {
     let exe = std::env::current_exe().unwrap();
     let own_name = exe.file_name().unwrap().to_str().unwrap();
     let images = report["debug_meta"]["images"].as_array();
     for image in images.into_iter().flatten() {
-        assert_eq!(image["name"], own_name);
-        let debug_file = image["debug_file"].as_str().unwrap_or("");
-        assert!(
-            !debug_file.contains(['/', '\\']),
-            "a report carries the path of a debug file: {debug_file}"
+        assert_eq!(
+            image["name"], own_name,
+            "a report names a library other than ours, or where ours is"
         );
     }
 }

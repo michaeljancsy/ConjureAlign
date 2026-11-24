@@ -319,8 +319,8 @@ mod imp {
         // have any business knowing about, and the only one we upload symbols
         // for.
         //
-        // By file name only: the folder it is installed in can be the user's
-        // own, which is named after their account.
+        // By file name only: a per-user install is inside the user's home
+        // folder, which is named after their account.
         let images = &mut event.debug_meta.to_mut().images;
         images.retain_mut(|image| match image_name(image) {
             Some(name) if is_ours(name) => {
@@ -810,45 +810,6 @@ mod imp {
             let opts = options();
             let dsn = opts.dsn.expect("options() produced no DSN");
             assert_eq!(dsn.project_id().value(), "4511972827136000");
-        }
-
-        /// What reaches Sentry is whatever `before_send` returns, so this is
-        /// the place to say a report must not carry: the folder ConjureAlign
-        /// is installed in, which for a per-user install contains the user's
-        /// account name.
-        #[test]
-        fn a_report_names_our_binary_without_the_folder_it_is_in() {
-            let image = |name: &str| {
-                DebugImage::from(sentry::protocol::SymbolicDebugImage {
-                    name: name.to_owned(),
-                    arch: None,
-                    image_addr: 0.into(),
-                    image_size: 0,
-                    image_vmaddr: 0.into(),
-                    id: sentry::types::DebugId::nil(),
-                    code_id: None,
-                    debug_file: None,
-                })
-            };
-            let mut event = Event::default();
-            event.debug_meta.to_mut().images = vec![
-                image("/Users/some-account/Library/Audio/Plug-Ins/VST3/ConjureAlign.vst3/Contents/MacOS/ConjureAlign"),
-                image(r"C:\Users\some-account\AppData\Local\Programs\Common\CLAP\ConjureAlign.clap"),
-                image("/Library/Audio/Plug-Ins/Components/ConjureAlign.component/Contents/MacOS/ConjureAlign"),
-                image("/Users/some-account/Library/Audio/Plug-Ins/VST3/Other.vst3/Contents/MacOS/Other"),
-            ];
-
-            let before_send = options().before_send.expect("no before_send");
-            let sent = before_send(event).expect("the report was dropped");
-
-            let images = serde_json::to_value(&sent.debug_meta.images).unwrap();
-            let names: Vec<_> = images
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|i| &i["name"])
-                .collect();
-            assert_eq!(names, ["ConjureAlign", "ConjureAlign.clap", "ConjureAlign"]);
         }
 
         /// The panic hook skips Sentry's own worker threads by name prefix
