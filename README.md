@@ -151,47 +151,6 @@ the residual is entirely above ~19 kHz, where fractional delay is mathematically
 any plugin. In the audible band the null is −70 dB or deeper (measured in
 `tests/null_depth.rs`). A lowpass at ~19 kHz on the null bus shows the true audible-band depth.
 
-## Privacy
-
-The first time you open its window, ConjureAlign asks you two questions, and does nothing
-until you answer either one. **Both are off unless you say yes.** There is no account, no
-login, and nothing tied to you.
-
-**1. Share anonymous usage and crash data?** Covers both usage analytics and crash reports —
-one question, one answer. Everything sent carries a random ID generated on the machine when
-you opt in.
-
-A crash report names code inside ConjureAlign's *own* binary — its functions and those of the
-open-source libraries compiled into it, with source paths as they were on the build machine,
-never yours. It carries nothing from your machine: the list of other plugins loaded
-alongside it is stripped before sending, and so is your computer's name.
-
-**2. Check for new versions?** A separate question, because it shares no data and creates no
-identifier. Once a day the plugin asks GitHub for the number of the latest release — nothing
-more. There is no ID, no usage information and no payload; GitHub sees the request the way it
-would see your browser opening the releases page. The reply is read for a version number and
-nothing else, and the link the plugin offers is a fixed address compiled into it, never one
-that arrived over the network.
-
-Change either answer at any time with the **⚙** button in the plugin's control bar. Both are
-stored in `~/Library/Application Support/ConjureDSP/ConjureAlign/analytics.json` on macOS and
-`%APPDATA%\ConjureDSP\ConjureAlign\analytics.json` on Windows; deleting that file makes the
-plugin ask again. Declining stores the "no" and nothing else — no ID is generated. If you
-never open the editor (running headless from the host's generic parameter UI), you are never
-asked, and nothing is sent or fetched. All three features are compiled out entirely on
-platforms other than macOS and Windows.
-
-The code is all in [`src/analytics.rs`](src/analytics.rs), [`src/crash.rs`](src/crash.rs) and
-[`src/update.rs`](src/update.rs). The usage payload is built in one function
-(`build_payload`), every crash report passes through one more (`scrub`) on its way out, and
-the update check reads exactly one field of one document (`parse_release`) — if you want to
-read precisely what leaves the machine.
-
-The Audio Unit build is produced by [clap-wrapper](https://github.com/free-audio/clap-wrapper),
-which re-exports the CLAP plugin behind an AU entry point. It carries a local patch so that
-both the mono and stereo layouts are reachable from AU hosts — without it Logic hides the
-plugin on mono tracks. See `deps/PATCHES.md`.
-
 ## Building
 
 Stable Rust required.
@@ -225,6 +184,11 @@ working there. It also checks undo gestures, what kind of control each parameter
 saved settings, and resizing. The build and run commands are at the top of the file; run it
 with `HOME` pointing at a scratch folder as shown there, so the test never touches your own
 settings or sends analytics. It exits with 0 only if every check passes.
+
+The Audio Unit build is produced by [clap-wrapper](https://github.com/free-audio/clap-wrapper),
+which re-exports the CLAP plugin behind an AU entry point. It carries a local patch so that
+both the mono and stereo layouts are reachable from AU hosts — without it Logic hides the
+plugin on mono tracks. See `deps/PATCHES.md`.
 
 ## License
 
