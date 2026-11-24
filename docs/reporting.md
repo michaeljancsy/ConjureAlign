@@ -281,9 +281,9 @@ macOS reports the Darwin version ("25.3.0"), not the one users and release notes
 
 `before_send` (`crash::scrub`) is the last gate before anything leaves: `server_name` is
 nulled (`sentry-contexts` fills it from the `hostname` crate), `user` is reduced to the device
-id, and `debug_meta.images` is trimmed to our own dylib — `debug-images` otherwise enumerates
-every shared library in the process, i.e. every other plugin the user owns. The README's crash
-paragraph still backs the last two of those; the rest of `scrub` is now an unstated guarantee.
+id, and `debug_meta.images` is trimmed to our own dylib, by file name — `debug-images` otherwise
+enumerates every shared library in the process, i.e. every other plugin the user owns, by full
+path. All of `scrub` is now an unstated guarantee.
 
 **The analytics prompt no longer enumerates what is collected.** `analytics_question` is a
 bare question and its `privacy_section` checkbox a bare checkbox, by an explicit product
